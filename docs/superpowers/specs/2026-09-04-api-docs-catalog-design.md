@@ -26,9 +26,9 @@ fmp-go 는 문서 사이트가 JS 렌더링 전용이라 Playwright 크롤러로
 | `https://openapi.tossinvest.com/openapi-docs/latest/api-reference/README.md` | openapi-generator 스타일. 엔드포인트 표(Class/Method/HTTP/설명) + 모델 목록 + 인증 요약. 하위 `Apis/*.md`(13) `Models/*.md`(124) 로 링크 | - |
 
 - 서버: REST `https://openapi.tossinvest.com`, WebSocket `wss://openapi-ws.tossinvest.com/ws/v1`.
-- 인증: OAuth 2.0 Client Credentials Grant 로 access token 발급. 계좌·자산·주문 API 는
+- 인증: OAuth 2.0 Client Credentials Grant 로 access token 발급. 계좌·자산·주문·조건주문 API 는
   `Authorization: Bearer` 에 더해 `X-Tossinvest-Account` 헤더 필요. WS 핸드셰이크도 같은
-  토큰을 `Authorization: Bearer` 헤더로 전달.
+  토큰을 `Authorization: Bearer` 헤더로 전달. (`GET /api/v1/accounts` 자체는 이 헤더가 필요 없음.)
 - 원본 JSON 포맷은 파일마다 다르다 — openapi.json(418KB)은 이미 pretty-print 되어 제공되고 asyncapi.json 은 한 줄(minified)이다. 우리는 둘 다 `jq .` 로 정규화해 저장한다.
 - `Apis/*.md` / `Models/*.md` 는 `openapi.json` 과 내용이 완전히 중복되고 응답 예시가 없다.
 

@@ -44,7 +44,7 @@ JSON 두 파일은 원본 포맷과 무관하게 항상 `jq .` 로 정규화(pre
 - 인증: OAuth 2.0 Client Credentials Grant 로 access token 발급(`POST /oauth2/token`). 토큰 발급을
   제외한 모든 API 는 `Authorization: Bearer {access_token}` 헤더 사용.
 - 계좌·자산·주문·조건주문 API 는 추가로 `X-Tossinvest-Account: {accountSeq}` 헤더 필요.
-  accountSeq 는 `GET /api/v1/accounts` 로 조회하며, 이 호출 자체는 헤더가 필요 없다.
+  accountSeq 는 `GET /api/v1/accounts` 로 조회하며, 이 호출 자체는 헤더가 필요 없음.
 - 웹소켓 핸드셰이크도 같은 access token 을 `Authorization: Bearer` 헤더로 전달.
 
 자세한 내용은 `overview.md` 와 `openapi.json` 의 `components.securitySchemes` 참고.
