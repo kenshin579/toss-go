@@ -169,6 +169,16 @@ jq . "$TMP/asyncapi.raw.json" > "$TMP/asyncapi.json"
 
 OPENAPI_VER="$(jq -r .info.version "$TMP/openapi.json")"
 ASYNCAPI_VER="$(jq -r .info.version "$TMP/asyncapi.json")"
+
+# info.version 은 README 표와 sed 치환문에 그대로 들어가므로 형식을 검증한다
+# (필드 누락 시 jq 가 돌려주는 "null", sed 특수문자 &/# 등을 차단)
+for v in "$OPENAPI_VER" "$ASYNCAPI_VER"; do
+  if [[ "$v" == "null" || ! "$v" =~ ^[0-9A-Za-z.+-]+$ ]]; then
+    echo "error: 예상 밖의 info.version 값: '$v'" >&2
+    exit 1
+  fi
+done
+
 TODAY="$(date +%Y-%m-%d)"
 
 mkdir -p "$OUT"
@@ -176,9 +186,15 @@ mkdir -p "$OUT"
 # update_readme_row <name> <version> — README 버전 표에서 해당 파일 행의 버전·날짜를 바꾼다
 update_readme_row() {
   local name="$1" ver="$2"
-  [[ -f "$README" ]] || return 0
+  if [[ ! -f "$README" ]]; then
+    echo "  warn: $README 가 없어 버전 표를 갱신하지 못함" >&2
+    return 0
+  fi
   sed -E "s#^\| \`$name\` \| [^|]* \| [^|]* \|#| \`$name\` | $ver | $TODAY |#" "$README" > "$TMP/README.md"
   mv "$TMP/README.md" "$README"
+  if ! grep -qF "| \`$name\` | $ver | $TODAY |" "$README"; then
+    echo "  warn: README 버전 표에서 $name 행을 찾지 못해 갱신되지 않음" >&2
+  fi
 }
 
 # install_doc <tmpfile> <name> <version> — 내용이 바뀐 경우에만 교체 + README 행 갱신
@@ -212,7 +228,7 @@ Expected: `SYNTAX_OK`
 cd /Users/user/src/workspace_moneyflow/toss-go && TOSS_DOCS_BASE=https://openapi.tossinvest.com/no-such-path ./scripts/fetch-docs.sh; echo "exit=$?"; ls docs/api
 ```
 
-Expected: `GET https://openapi.tossinvest.com/no-such-path/latest/openapi.json` 출력 후 curl 오류(`curl: (22) The requested URL returned error: 404`), `exit=22`(0 이 아님), `ls docs/api` 는 `README.md` 만 출력.
+Expected: `GET https://openapi.tossinvest.com/no-such-path/latest/openapi.json` 출력 후 curl 오류(현재 토스는 잘못된 경로에 403 을 돌려주므로 `curl: (56) The requested URL returned error: 403`), `exit=56`(0 이 아니면 됨), `ls docs/api` 는 `README.md` 만 출력.
 
 - [ ] **Step 3: 성공 경로 실행**
 
