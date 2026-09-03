@@ -29,7 +29,7 @@ fmp-go 는 문서 사이트가 JS 렌더링 전용이라 Playwright 크롤러로
 - 인증: OAuth 2.0 Client Credentials Grant 로 access token 발급. 계좌·자산·주문 API 는
   `Authorization: Bearer` 에 더해 `X-Tossinvest-Account` 헤더 필요. WS 핸드셰이크도 같은
   토큰을 `Authorization: Bearer` 헤더로 전달.
-- 원본 JSON 은 한 줄(minified, openapi.json 418KB)로 제공된다.
+- 원본 JSON 포맷은 파일마다 다르다 — openapi.json(418KB)은 이미 pretty-print 되어 제공되고 asyncapi.json 은 한 줄(minified)이다. 우리는 둘 다 `jq .` 로 정규화해 저장한다.
 - `Apis/*.md` / `Models/*.md` 는 `openapi.json` 과 내용이 완전히 중복되고 응답 예시가 없다.
 
 ## 결정 사항 (브레인스토밍)

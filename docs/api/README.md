@@ -30,20 +30,21 @@
 
 | 파일 | 무엇의 정본인가 |
 | --- | --- |
-| `openapi.json` | OpenAPI 3.1. REST 엔드포인트(36 operations, 13 tags, x-tagGroups 5개), 스키마, 요청/응답 예시, 인증, 에러, rate limit 의 정본 |
+| `openapi.json` | OpenAPI 3.1. REST 엔드포인트(1.2.14 기준 36 operations, 13 tags, x-tagGroups 5개), 스키마, 요청/응답 예시, 인증, 에러, rate limit 의 정본 |
 | `asyncapi.json` | AsyncAPI 3.0. 웹소켓 채널(connection, realtime-trade, realtime-orderbook, realtime-order), 구독 선언, 메시지 스키마, 연결 제한, keepalive, 재연결의 정본 |
 | `overview.md` | 사람이 읽는 개요와 운영 규칙 — 시작하기(curl 예시), Rate Limits(응답 헤더·429 대응), 에러 응답, 웹소켓 연동 절차 |
 | `api-reference.md` | 엔드포인트·모델 한눈에 보기 표(openapi-generator 스타일). 링크는 토스 서버의 `Apis/*.md`, `Models/*.md` 로 연결되며 그 파일들은 `openapi.json` 과 중복이라 보관하지 않음 |
 
-JSON 두 파일은 git diff 가 가능하도록 `jq .` 로 pretty-print 해 저장합니다(원본은 한 줄).
+JSON 두 파일은 원본 포맷과 무관하게 항상 `jq .` 로 정규화(pretty-print)해 저장합니다. git diff 가 가능하고 토스 측 포맷 변경에 영향받지 않도록 하기 위함입니다.
 
 ## 서버 / 인증 요약
 
 - REST: `https://openapi.tossinvest.com`
 - WebSocket: `wss://openapi-ws.tossinvest.com/ws/v1`
-- 인증: OAuth 2.0 Client Credentials Grant 로 access token 발급(`POST /oauth2/token`). 모든 API 는
-  `Authorization: Bearer {access_token}` 헤더 사용.
-- 계좌·자산·주문 API 는 추가로 `X-Tossinvest-Account` 헤더 필요.
+- 인증: OAuth 2.0 Client Credentials Grant 로 access token 발급(`POST /oauth2/token`). 토큰 발급을
+  제외한 모든 API 는 `Authorization: Bearer {access_token}` 헤더 사용.
+- 계좌·자산·주문·조건주문 API 는 추가로 `X-Tossinvest-Account: {accountSeq}` 헤더 필요.
+  accountSeq 는 `GET /api/v1/accounts` 로 조회하며, 이 호출 자체는 헤더가 필요 없다.
 - 웹소켓 핸드셰이크도 같은 access token 을 `Authorization: Bearer` 헤더로 전달.
 
 자세한 내용은 `overview.md` 와 `openapi.json` 의 `components.securitySchemes` 참고.
