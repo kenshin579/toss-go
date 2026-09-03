@@ -1,0 +1,20 @@
+{
+  "result": {
+    "nextUntil": "2026-09-02",
+    "records": [
+      {
+        "date": "2026-09-03",
+        "arbitrage": {
+          "buyVolume": "595814",
+          "sellVolume": "592408",
+          "netBuyVolume": "3406"
+        },
+        "nonArbitrage": {
+          "buyVolume": "2897005",
+          "sellVolume": "3201913",
+          "netBuyVolume": "-304908"
+        }
+      }
+    ]
+  }
+}
