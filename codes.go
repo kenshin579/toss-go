@@ -19,4 +19,12 @@ const (
 	CodeStockRestricted          = "stock-restricted"
 	CodeRateLimitExceeded        = "rate-limit-exceeded"
 	CodeIdempotencyKeyConflict   = "idempotency-key-conflict"
+	CodeStockNotFound            = "stock-not-found"
+	CodeRequestInProgress        = "request-in-progress"
+	CodeAlreadyModified          = "already-modified"
+	CodeAlreadyProcessing        = "already-processing"
+	CodeModifyRestricted         = "modify-restricted"
+	CodeCancelRestricted         = "cancel-restricted"
+	CodeMaxOrderAmountExceeded   = "max-order-amount-exceeded"
+	CodeConditionalOrderNotFound = "conditional-order-not-found"
 )

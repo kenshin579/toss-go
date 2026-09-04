@@ -4,7 +4,7 @@
 
 - OAuth2 Client Credentials 토큰 자동 발급·캐시(만료 60초 전 갱신, 401 토큰 오류 시 1회 재발급)
 - 수치는 [`shopspring/decimal`](https://github.com/shopspring/decimal), 시각은 `time.Time`(KST 오프셋), 날짜는 `tosstypes.Date`
-- 토스 에러 봉투를 `*toss.APIError`(StatusCode / Code / RequestID / Data / RetryAfter)로 매핑. `toss.IsCode(err, "stock-not-found")`
+- 토스 에러 봉투를 `*toss.APIError`(StatusCode / Code / RequestID / Data / RetryAfter)로 매핑. `toss.IsCode(err, toss.CodeStockNotFound)`
 - 429/5xx 재시도·스로틀링 없음(401 토큰 오류만 1회 재발급) — 429 는 `APIError.RetryAfter` 로 전달되며 속도 조절은 호출자 책임
 
 ## 설치
@@ -64,7 +64,7 @@ if err != nil {
     if errors.As(err, &ae) && ae.StatusCode == 429 {
         time.Sleep(ae.RetryAfter)
     }
-    if toss.IsCode(err, "stock-not-found") { /* ... */ }
+    if toss.IsCode(err, toss.CodeStockNotFound) { /* ... */ }
 }
 ```
 
@@ -91,7 +91,7 @@ res, err := a.Order.Place(ctx, order.PlaceRequest{
 - `ClientOrderID` 를 넣으면 10분간 멱등성이 적용되고(같은 값으로 재요청 시 이전 결과 반환),
   SDK 가 401 토큰 오류에 요청을 1회 재시도한다. **키가 없으면 쓰기 요청은 재시도하지 않는다** — 중복 주문을 만들지 않기 위해서다.
 - 1억원 이상 주문은 `ConfirmHighValue: true` 가 없으면 `400 confirm-high-value-required`.
-- 금액 주문(`PlaceAmount`)과 소수점 수량 주문은 **미국 주식 전용**이며 정규장 시작~종료 1시간 전에만 접수된다.
+- 금액 주문(`PlaceAmount`)은 **미국 주식 시장가 전용**이고, 소수점 수량은 **미국 주식 시장가 매도**에만 허용된다. 둘 다 정규장 시작~종료 1시간 전에만 접수된다.
 - SDK 는 요청 조립 오류(필수 누락·형식)만 검증한다. 호가단위·잔고·거래시간 같은 상태 의존 규칙은
   서버가 판단하며 `*toss.APIError` 로 돌아온다.
 

@@ -54,7 +54,7 @@ func main() {
 	}
 	fmt.Printf("진행 중 주문 %d건\n", len(page.Orders))
 	for _, o := range page.Orders {
-		fmt.Printf("  %s %s %s %s주 (%s)\n", o.OrderID[:8], o.Symbol, o.Side, o.Quantity, o.Status)
+		fmt.Printf("  %s %s %s %s주 (%s)\n", o.OrderID, o.Symbol, o.Side, o.Quantity, o.Status)
 	}
 
 	// 실제 주문 예시 — 실행하면 진짜 주문이 나간다. 필요할 때만 주석을 풀 것.

@@ -102,6 +102,10 @@ type PlaceResult struct {
 }
 
 // OperationResult 는 정정·취소 결과.
+//
+// OrderID 는 **정정/취소로 새로 발급된 주문 식별자**이며 원주문의 OrderID 와 다르다.
+// 이후 조회·정정·취소에는 반드시 이 값을 써야 한다 — 원주문 ID 로 다시 취소를 시도하면
+// 이미 처리된 주문을 다시 건드리게 된다.
 type OperationResult struct {
-	OrderID string `json:"orderId"`
+	OrderID string `json:"orderId"` // 새로 발급된 주문 id(원주문 id 와 다름)
 }

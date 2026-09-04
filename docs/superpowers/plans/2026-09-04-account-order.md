@@ -1011,7 +1011,9 @@ import (
 	"context"
 
 	"github.com/kenshin579/toss-go/asset"
+	"github.com/kenshin579/toss-go/conditionalorder"
 	"github.com/kenshin579/toss-go/internal/fetch"
+	"github.com/kenshin579/toss-go/order"
 )
 
 // AccountScope 는 특정 계좌(accountSeq)에 고정된 sub-client 묶음이다.
@@ -1020,7 +1022,9 @@ import (
 type AccountScope struct {
 	accountSeq int64
 
-	Asset *asset.Client // 자산: 보유 주식
+	Asset            *asset.Client            // 자산: 보유 주식
+	Order            *order.Client            // 주문: 생성·정정·취소·조회·주문 정보
+	ConditionalOrder *conditionalorder.Client // 조건주문: 생성·수정·취소·조회
 }
 
 // AccountSeq 는 이 스코프가 고정된 계좌 일련번호를 돌려준다. 생성 후 바뀌지 않는다.
@@ -1035,8 +1039,10 @@ func (a *AccountScope) AccountSeq() int64 { return a.accountSeq }
 //	h, _ := a.Asset.Holdings(ctx, asset.HoldingsParams{})
 func (c *Client) Account(accountSeq int64) *AccountScope {
 	return &AccountScope{
-		accountSeq: accountSeq,
-		Asset:      asset.New(c.http, accountSeq),
+		accountSeq:       accountSeq,
+		Asset:            asset.New(c.http, accountSeq),
+		Order:            order.New(c.http, accountSeq),
+		ConditionalOrder: conditionalorder.New(c.http, accountSeq),
 	}
 }
 
@@ -1073,6 +1079,14 @@ const (
 	CodeStockRestricted          = "stock-restricted"
 	CodeRateLimitExceeded        = "rate-limit-exceeded"
 	CodeIdempotencyKeyConflict   = "idempotency-key-conflict"
+	CodeStockNotFound            = "stock-not-found"
+	CodeRequestInProgress        = "request-in-progress"
+	CodeAlreadyModified          = "already-modified"
+	CodeAlreadyProcessing        = "already-processing"
+	CodeModifyRestricted         = "modify-restricted"
+	CodeCancelRestricted         = "cancel-restricted"
+	CodeMaxOrderAmountExceeded   = "max-order-amount-exceeded"
+	CodeConditionalOrderNotFound = "conditional-order-not-found"
 )
 EOF
 mkdir -p asset && cat > asset/client.go << 'EOF'
@@ -1186,10 +1200,11 @@ type Holdings struct {
 
 // HoldingsParams 는 Holdings 의 선택 인자.
 type HoldingsParams struct {
-	Symbol string // 특정 종목만 조회. 비우면 전체
+	Symbol string // 특정 종목만 조회. 비우면 전체. 지정하면 요약 필드도 그 종목 기준으로 재계산된다
 }
 
 // Holdings 는 보유 주식을 조회한다(GET /api/v1/holdings). 인자의 zero value 면 전체를 조회한다.
+// Symbol 을 지정하면 Items 뿐 아니라 TotalPurchaseAmount·MarketValue 등 요약 필드도 그 종목 기준으로 재계산된다.
 // 보유하지 않은 종목을 지정하면 Items 가 빈 슬라이스로 돌아온다.
 func (c *Client) Holdings(ctx context.Context, p HoldingsParams) (*Holdings, error) {
 	if err := params.AccountSeq(c.accountSeq); err != nil {
@@ -1605,7 +1620,8 @@ func TestPlace_Validation(t *testing.T) {
 }
 
 func TestModify(t *testing.T) {
-	c, body, done := captureBody(t, "/api/v1/orders/o-1/modify", "3", []byte(`{"result":{"orderId":"o-1"}}`))
+	// 정정 응답의 orderId 는 새로 발급된 id 다(원주문 id 와 다르다)
+	c, body, done := captureBody(t, "/api/v1/orders/o-1/modify", "3", []byte(`{"result":{"orderId":"o-1b"}}`))
 	defer done()
 	price, qty := d("71000"), d("5")
 	res, err := c.Modify(context.Background(), "o-1", ModifyRequest{OrderType: TypeLimit, Price: &price, Quantity: &qty})
@@ -1613,8 +1629,8 @@ func TestModify(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertJSON(t, *body, `{"orderType":"LIMIT","price":"71000","quantity":"5"}`)
-	if res.OrderID != "o-1" {
-		t.Errorf("res = %+v", res)
+	if res.OrderID != "o-1b" || res.OrderID == "o-1" {
+		t.Errorf("정정 결과는 새 주문 id 여야 한다: %+v", res)
 	}
 }
 
@@ -1647,15 +1663,16 @@ func TestModify_Validation(t *testing.T) {
 }
 
 func TestCancel(t *testing.T) {
-	c, body, done := captureBody(t, "/api/v1/orders/o-1/cancel", "3", []byte(`{"result":{"orderId":"o-1"}}`))
+	// 취소 응답의 orderId 도 새로 발급된 id 다
+	c, body, done := captureBody(t, "/api/v1/orders/o-1/cancel", "3", []byte(`{"result":{"orderId":"o-1c"}}`))
 	defer done()
 	res, err := c.Cancel(context.Background(), "o-1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertJSON(t, *body, `{}`) // 취소는 빈 바디
-	if res.OrderID != "o-1" {
-		t.Errorf("res = %+v", res)
+	if res.OrderID != "o-1c" || res.OrderID == "o-1" {
+		t.Errorf("취소 결과는 새 주문 id 여야 한다: %+v", res)
 	}
 }
 
@@ -1920,8 +1937,12 @@ type PlaceResult struct {
 }
 
 // OperationResult 는 정정·취소 결과.
+//
+// OrderID 는 **정정/취소로 새로 발급된 주문 식별자**이며 원주문의 OrderID 와 다르다.
+// 이후 조회·정정·취소에는 반드시 이 값을 써야 한다 — 원주문 ID 로 다시 취소를 시도하면
+// 이미 처리된 주문을 다시 건드리게 된다.
 type OperationResult struct {
-	OrderID string `json:"orderId"`
+	OrderID string `json:"orderId"` // 새로 발급된 주문 id(원주문 id 와 다름)
 }
 EOF
 cat > order/place.go << 'EOF'
@@ -2086,6 +2107,7 @@ type modifyBody struct {
 }
 
 // Modify 는 주문의 가격 또는 수량을 정정한다(POST /api/v1/orders/{orderId}/modify).
+// 성공 시 **새 주문 id** 를 돌려준다(원주문 id 는 더 이상 쓰지 않는다).
 // 정정은 멱등성 키를 받지 않으므로 401 재시도를 하지 않는다.
 //
 // 대표 에러: already-filled, already-canceled, already-modified, already-processing,
@@ -2129,6 +2151,7 @@ func (c *Client) Modify(ctx context.Context, orderID string, r ModifyRequest) (*
 }
 
 // Cancel 은 주문을 취소한다(POST /api/v1/orders/{orderId}/cancel). 이미 체결된 주문은 취소할 수 없다.
+// 성공 시 **새 주문 id** 를 돌려준다(원주문 id 와 다르다).
 // 취소는 멱등성 키를 받지 않으므로 401 재시도를 하지 않는다.
 //
 // 대표 에러: already-filled, already-canceled, already-processing, order-not-found,
@@ -3231,7 +3254,7 @@ func main() {
 	}
 	fmt.Printf("진행 중 주문 %d건\n", len(page.Orders))
 	for _, o := range page.Orders {
-		fmt.Printf("  %s %s %s %s주 (%s)\n", o.OrderID[:8], o.Symbol, o.Side, o.Quantity, o.Status)
+		fmt.Printf("  %s %s %s %s주 (%s)\n", o.OrderID, o.Symbol, o.Side, o.Quantity, o.Status)
 	}
 
 	// 실제 주문 예시 — 실행하면 진짜 주문이 나간다. 필요할 때만 주석을 풀 것.

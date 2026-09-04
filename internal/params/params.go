@@ -68,7 +68,7 @@ func IndicatorSymbols(symbols []string) (string, error) { return joinSymbols(sym
 // 서버가 account-header-required 를 돌려주므로 요청 전에 실패시킨다.
 func AccountSeq(seq int64) error {
 	if seq <= 0 {
-		return fmt.Errorf("toss: accountSeq must be positive (got %d) — Accounts 로 조회한 값을 사용한다", seq)
+		return fmt.Errorf("toss: accountSeq must be positive (got %d); use a value from Accounts", seq)
 	}
 	return nil
 }

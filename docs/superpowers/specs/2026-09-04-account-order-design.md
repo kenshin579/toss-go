@@ -182,6 +182,8 @@ func Send(ctx, hc, method, path string, q url.Values, body any, accountSeq int64
 
 - 응답 타입은 openapi 스키마를 그대로 옮긴다. 수치 `decimal.Decimal`, nullable 은 포인터,
   date-time `time.Time`, date `tosstypes.Date` — v0.1.0 규약 유지.
+- **정정·취소 응답의 `orderId` 는 새로 발급된 주문 id 다**(원주문 id 와 다름). 이후 조회·정정·취소에는 반환된
+  id 를 쓴다. 조건주문 수정도 같은 방식(기존 취소 후 재생성)이라 새 `conditionalOrderId` 가 발급된다.
 - 커서 페이지는 `Page{Orders []Order; NextCursor *string; HasNext bool}` 로 토스 필드를 그대로 노출한다.
   반복은 호출자 책임(이터레이터 없음).
 - 열거값은 `tosstypes` 가 아니라 **각 패키지**에 둔다(`order.SideBuy`, `order.StatusFilled`,

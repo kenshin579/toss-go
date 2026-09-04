@@ -40,6 +40,7 @@ type modifyBody struct {
 }
 
 // Modify 는 주문의 가격 또는 수량을 정정한다(POST /api/v1/orders/{orderId}/modify).
+// 성공 시 **새 주문 id** 를 돌려준다(원주문 id 는 더 이상 쓰지 않는다).
 // 정정은 멱등성 키를 받지 않으므로 401 재시도를 하지 않는다.
 //
 // 대표 에러: already-filled, already-canceled, already-modified, already-processing,
@@ -83,6 +84,7 @@ func (c *Client) Modify(ctx context.Context, orderID string, r ModifyRequest) (*
 }
 
 // Cancel 은 주문을 취소한다(POST /api/v1/orders/{orderId}/cancel). 이미 체결된 주문은 취소할 수 없다.
+// 성공 시 **새 주문 id** 를 돌려준다(원주문 id 와 다르다).
 // 취소는 멱등성 키를 받지 않으므로 401 재시도를 하지 않는다.
 //
 // 대표 에러: already-filled, already-canceled, already-processing, order-not-found,

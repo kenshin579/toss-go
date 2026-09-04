@@ -355,7 +355,8 @@ func TestPlace_Validation(t *testing.T) {
 }
 
 func TestModify(t *testing.T) {
-	c, body, done := captureBody(t, "/api/v1/orders/o-1/modify", "3", []byte(`{"result":{"orderId":"o-1"}}`))
+	// 정정 응답의 orderId 는 새로 발급된 id 다(원주문 id 와 다르다)
+	c, body, done := captureBody(t, "/api/v1/orders/o-1/modify", "3", []byte(`{"result":{"orderId":"o-1b"}}`))
 	defer done()
 	price, qty := d("71000"), d("5")
 	res, err := c.Modify(context.Background(), "o-1", ModifyRequest{OrderType: TypeLimit, Price: &price, Quantity: &qty})
@@ -363,8 +364,8 @@ func TestModify(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertJSON(t, *body, `{"orderType":"LIMIT","price":"71000","quantity":"5"}`)
-	if res.OrderID != "o-1" {
-		t.Errorf("res = %+v", res)
+	if res.OrderID != "o-1b" || res.OrderID == "o-1" {
+		t.Errorf("정정 결과는 새 주문 id 여야 한다: %+v", res)
 	}
 }
 
@@ -397,15 +398,16 @@ func TestModify_Validation(t *testing.T) {
 }
 
 func TestCancel(t *testing.T) {
-	c, body, done := captureBody(t, "/api/v1/orders/o-1/cancel", "3", []byte(`{"result":{"orderId":"o-1"}}`))
+	// 취소 응답의 orderId 도 새로 발급된 id 다
+	c, body, done := captureBody(t, "/api/v1/orders/o-1/cancel", "3", []byte(`{"result":{"orderId":"o-1c"}}`))
 	defer done()
 	res, err := c.Cancel(context.Background(), "o-1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertJSON(t, *body, `{}`) // 취소는 빈 바디
-	if res.OrderID != "o-1" {
-		t.Errorf("res = %+v", res)
+	if res.OrderID != "o-1c" || res.OrderID == "o-1" {
+		t.Errorf("취소 결과는 새 주문 id 여야 한다: %+v", res)
 	}
 }
 

@@ -90,10 +90,11 @@ type Holdings struct {
 
 // HoldingsParams 는 Holdings 의 선택 인자.
 type HoldingsParams struct {
-	Symbol string // 특정 종목만 조회. 비우면 전체
+	Symbol string // 특정 종목만 조회. 비우면 전체. 지정하면 요약 필드도 그 종목 기준으로 재계산된다
 }
 
 // Holdings 는 보유 주식을 조회한다(GET /api/v1/holdings). 인자의 zero value 면 전체를 조회한다.
+// Symbol 을 지정하면 Items 뿐 아니라 TotalPurchaseAmount·MarketValue 등 요약 필드도 그 종목 기준으로 재계산된다.
 // 보유하지 않은 종목을 지정하면 Items 가 빈 슬라이스로 돌아온다.
 func (c *Client) Holdings(ctx context.Context, p HoldingsParams) (*Holdings, error) {
 	if err := params.AccountSeq(c.accountSeq); err != nil {
