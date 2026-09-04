@@ -27,6 +27,14 @@ func TestPrices_NoSymbols(t *testing.T) {
 	}
 }
 
+func TestPrices_BondSymbol(t *testing.T) {
+	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/market-indicators/prices", Query: url.Values{"symbols": {"KOSPI,KR_BOND_10Y"}}}, 200, testutil.Fixture(t, "prices.json"))
+	defer done()
+	if _, err := New(hc).Prices(context.Background(), "KOSPI", "KR_BOND_10Y"); err != nil {
+		t.Errorf("bond symbol must be accepted: %v", err)
+	}
+}
+
 func TestCandles(t *testing.T) {
 	// fixture = openapi 예시(dailyCandles)
 	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/market-indicators/KOSPI/candles", Query: url.Values{"interval": {"1d"}, "count": {"2"}}}, 200, testutil.Fixture(t, "candles.json"))
@@ -63,6 +71,22 @@ func TestCandles_Validation(t *testing.T) {
 	}
 }
 
+func TestIndicatorSymbolAlphabet(t *testing.T) {
+	// 지표 심볼은 '_' 허용('KR_BOND_10Y'), 종목 심볼 알파벳('.'/'-')은 거부
+	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/market-indicators/KR_BOND_10Y/candles", Query: url.Values{"interval": {"1d"}}}, 200, testutil.Fixture(t, "candles.json"))
+	defer done()
+	if _, err := New(hc).Candles(context.Background(), "KR_BOND_10Y", CandlesParams{Interval: tosstypes.Interval1d}); err != nil {
+		t.Errorf("KR_BOND_10Y must be accepted: %v", err)
+	}
+	c := New(nil) // nil client: 검증이 요청 전에 실패해야 한다
+	if _, err := c.Candles(context.Background(), "BRK.B", CandlesParams{Interval: tosstypes.Interval1d}); err == nil {
+		t.Error("BRK.B must be rejected for indicators")
+	}
+	if _, err := c.Prices(context.Background(), "KOSPI", "BF-B"); err == nil {
+		t.Error("BF-B must be rejected for indicators")
+	}
+}
+
 func TestInvestorTrading(t *testing.T) {
 	// fixture = openapi 예시(daily)
 	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/market-indicators/KOSPI/investor-trading", Query: url.Values{"interval": {"1d"}, "count": {"1"}, "until": {"2026-09-03"}}}, 200, testutil.Fixture(t, "investor_trading.json"))
@@ -77,6 +101,12 @@ func TestInvestorTrading(t *testing.T) {
 	r := page.Records[0]
 	if r.Date != "2026-06-11" || r.Institution.Breakdown.PensionFund.BuyAmount.String() != "500000000000" || r.Institution.Breakdown.PensionFund.SellAmount.String() != "490000000000" {
 		t.Errorf("r = %+v", r)
+	}
+	if page.NextUntil == nil || *page.NextUntil != "2026-06-09" {
+		t.Errorf("NextUntil = %v", page.NextUntil)
+	}
+	if r.Institution.BuyAmount.String() != "2100000000000" {
+		t.Errorf("Institution.BuyAmount = %s", r.Institution.BuyAmount)
 	}
 }
 

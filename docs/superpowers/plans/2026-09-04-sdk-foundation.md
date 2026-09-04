@@ -1459,6 +1459,28 @@ func TestSymbol(t *testing.T) {
 	}
 }
 
+func TestIndicatorSymbol(t *testing.T) {
+	for _, ok := range []string{"KOSPI", "KOSDAQ", "KR_BOND_10Y", "kr_bond_2y"} {
+		if err := IndicatorSymbol(ok); err != nil {
+			t.Errorf("IndicatorSymbol(%q) = %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "BRK.B", "BF-B", "KR BOND", "코스피"} {
+		if err := IndicatorSymbol(bad); err == nil {
+			t.Errorf("IndicatorSymbol(%q) must fail", bad)
+		}
+	}
+	if err := Symbol("KR_BOND_10Y"); err == nil {
+		t.Error("stock Symbol must reject '_'")
+	}
+	if got, err := IndicatorSymbols([]string{"KOSPI", "KR_BOND_10Y"}); err != nil || got != "KOSPI,KR_BOND_10Y" {
+		t.Errorf("IndicatorSymbols = %q, %v", got, err)
+	}
+	if _, err := IndicatorSymbols([]string{"KOSPI", "BRK.B"}); err == nil {
+		t.Error("IndicatorSymbols must reject '.'")
+	}
+}
+
 func TestSymbols(t *testing.T) {
 	if got, err := Symbols([]string{"005930", "AAPL"}); err != nil || got != "005930,AAPL" {
 		t.Errorf("got %q, %v", got, err)
@@ -1532,22 +1554,29 @@ func Require(name, v string) error {
 	return nil
 }
 
-// symbolPattern 은 토스 심볼 규칙(openapi components.parameters.Symbol): 영문 대/소문자, 숫자, '.', '-'.
+// symbolPattern 은 종목 심볼 규칙(openapi components.parameters.Symbol): 영문 대/소문자, 숫자, '.', '-'.
 var symbolPattern = regexp.MustCompile(`^[A-Za-z0-9.\-]+$`)
+
+// indicatorSymbolPattern 은 시장 지표 심볼 규칙(GET /market-indicators/*): 영문 대/소문자, 숫자, '_' (예: KOSPI, KR_BOND_10Y).
+var indicatorSymbolPattern = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 
 // MaxSymbols 는 symbols= 쿼리에 넣을 수 있는 최대 심볼 수(openapi: 최대 200개).
 const MaxSymbols = 200
 
-// Symbol 은 심볼 형식을 검증한다(빈 값·공백·허용 외 문자 거부). 요청을 보내기 전에 실패시켜 rate limit 을 아낀다.
-func Symbol(v string) error {
-	if !symbolPattern.MatchString(v) {
-		return fmt.Errorf("toss: invalid symbol %q (allowed: A-Z a-z 0-9 . -)", v)
+func matchSymbol(re *regexp.Regexp, allowed, v string) error {
+	if !re.MatchString(v) {
+		return fmt.Errorf("toss: invalid symbol %q (allowed: %s)", v, allowed)
 	}
 	return nil
 }
 
-// Symbols 는 symbols= 쿼리 값을 만든다. 빈 목록, 형식 위반 원소, MaxSymbols 초과를 거부한다.
-func Symbols(symbols []string) (string, error) {
+// Symbol 은 종목 심볼 형식을 검증한다(빈 값·공백·허용 외 문자 거부). 요청 전에 실패시켜 rate limit 을 아낀다.
+func Symbol(v string) error { return matchSymbol(symbolPattern, "A-Z a-z 0-9 . -", v) }
+
+// IndicatorSymbol 은 시장 지표 심볼 형식을 검증한다. 종목 심볼과 알파벳이 다르다('_' 허용, '.'/'-' 불허).
+func IndicatorSymbol(v string) error { return matchSymbol(indicatorSymbolPattern, "A-Z a-z 0-9 _", v) }
+
+func joinSymbols(symbols []string, validate func(string) error) (string, error) {
 	if len(symbols) == 0 {
 		return "", errors.New("toss: symbols must not be empty")
 	}
@@ -1555,12 +1584,18 @@ func Symbols(symbols []string) (string, error) {
 		return "", fmt.Errorf("toss: too many symbols %d (max %d)", len(symbols), MaxSymbols)
 	}
 	for _, s := range symbols {
-		if err := Symbol(s); err != nil {
+		if err := validate(s); err != nil {
 			return "", err
 		}
 	}
 	return strings.Join(symbols, ","), nil
 }
+
+// Symbols 는 종목 symbols= 쿼리 값을 만든다. 빈 목록, 형식 위반 원소, MaxSymbols 초과를 거부한다.
+func Symbols(symbols []string) (string, error) { return joinSymbols(symbols, Symbol) }
+
+// IndicatorSymbols 는 시장 지표 symbols= 쿼리 값을 만든다(규칙은 IndicatorSymbol).
+func IndicatorSymbols(symbols []string) (string, error) { return joinSymbols(symbols, IndicatorSymbol) }
 
 // Str 은 s 가 비어 있지 않으면 설정한다.
 func Str(v url.Values, key, s string) {
@@ -3092,6 +3127,14 @@ func TestPrices_NoSymbols(t *testing.T) {
 	}
 }
 
+func TestPrices_BondSymbol(t *testing.T) {
+	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/market-indicators/prices", Query: url.Values{"symbols": {"KOSPI,KR_BOND_10Y"}}}, 200, testutil.Fixture(t, "prices.json"))
+	defer done()
+	if _, err := New(hc).Prices(context.Background(), "KOSPI", "KR_BOND_10Y"); err != nil {
+		t.Errorf("bond symbol must be accepted: %v", err)
+	}
+}
+
 func TestCandles(t *testing.T) {
 	// fixture = openapi 예시(dailyCandles)
 	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/market-indicators/KOSPI/candles", Query: url.Values{"interval": {"1d"}, "count": {"2"}}}, 200, testutil.Fixture(t, "candles.json"))
@@ -3128,6 +3171,22 @@ func TestCandles_Validation(t *testing.T) {
 	}
 }
 
+func TestIndicatorSymbolAlphabet(t *testing.T) {
+	// 지표 심볼은 '_' 허용('KR_BOND_10Y'), 종목 심볼 알파벳('.'/'-')은 거부
+	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/market-indicators/KR_BOND_10Y/candles", Query: url.Values{"interval": {"1d"}}}, 200, testutil.Fixture(t, "candles.json"))
+	defer done()
+	if _, err := New(hc).Candles(context.Background(), "KR_BOND_10Y", CandlesParams{Interval: tosstypes.Interval1d}); err != nil {
+		t.Errorf("KR_BOND_10Y must be accepted: %v", err)
+	}
+	c := New(nil) // nil client: 검증이 요청 전에 실패해야 한다
+	if _, err := c.Candles(context.Background(), "BRK.B", CandlesParams{Interval: tosstypes.Interval1d}); err == nil {
+		t.Error("BRK.B must be rejected for indicators")
+	}
+	if _, err := c.Prices(context.Background(), "KOSPI", "BF-B"); err == nil {
+		t.Error("BF-B must be rejected for indicators")
+	}
+}
+
 func TestInvestorTrading(t *testing.T) {
 	// fixture = openapi 예시(daily)
 	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/market-indicators/KOSPI/investor-trading", Query: url.Values{"interval": {"1d"}, "count": {"1"}, "until": {"2026-09-03"}}}, 200, testutil.Fixture(t, "investor_trading.json"))
@@ -3142,6 +3201,12 @@ func TestInvestorTrading(t *testing.T) {
 	r := page.Records[0]
 	if r.Date != "2026-06-11" || r.Institution.Breakdown.PensionFund.BuyAmount.String() != "500000000000" || r.Institution.Breakdown.PensionFund.SellAmount.String() != "490000000000" {
 		t.Errorf("r = %+v", r)
+	}
+	if page.NextUntil == nil || *page.NextUntil != "2026-06-09" {
+		t.Errorf("NextUntil = %v", page.NextUntil)
+	}
+	if r.Institution.BuyAmount.String() != "2100000000000" {
+		t.Errorf("Institution.BuyAmount = %s", r.Institution.BuyAmount)
 	}
 }
 
@@ -3193,9 +3258,9 @@ import (
 
 // RankingPrice 는 랭킹 항목의 가격 정보.
 type RankingPrice struct {
-	LastPrice  decimal.Decimal  `json:"lastPrice"`
-	BasePrice  decimal.Decimal  `json:"basePrice"`  // 기준가(전일 종가)
-	ChangeRate *decimal.Decimal `json:"changeRate"` // 등락률(소수). 없으면 nil
+	LastPrice  decimal.Decimal  `json:"lastPrice"`  // 현재가
+	BasePrice  decimal.Decimal  `json:"basePrice"`  // 기준가. TOP_GAINERS/TOP_LOSERS 는 duration 시작 시점 가격, 그 외 유형은 전일 종가
+	ChangeRate *decimal.Decimal `json:"changeRate"` // 등락률 = (lastPrice - basePrice) / basePrice, 소수 비율(0.0125 = 1.25%). basePrice 가 0 이면 nil. TOP_* 는 기간 등락률, 그 외는 전일 대비
 }
 
 // RankingItem 은 랭킹 1건.
@@ -3204,13 +3269,13 @@ type RankingItem struct {
 	Symbol        string             `json:"symbol"`
 	Currency      tosstypes.Currency `json:"currency"`
 	Price         RankingPrice       `json:"price"`
-	TradingVolume decimal.Decimal    `json:"tradingVolume"`
-	TradingAmount decimal.Decimal    `json:"tradingAmount"`
+	TradingVolume decimal.Decimal    `json:"tradingVolume"` // duration 누적. TOSS_SECURITIES_* 는 토스증권 체결 기준, 그 외는 시장 전체
+	TradingAmount decimal.Decimal    `json:"tradingAmount"` // duration 누적. TOSS_SECURITIES_* 는 토스증권 체결 기준, 그 외는 시장 전체
 }
 
 // Rankings 는 랭킹 결과.
 type Rankings struct {
-	RankedAt *time.Time    `json:"rankedAt"`
+	RankedAt *time.Time    `json:"rankedAt"` // 집계 시각. 집계되지 않은 조합이면 Rankings 가 비고 nil
 	Rankings []RankingItem `json:"rankings"`
 }
 
@@ -3223,7 +3288,7 @@ type RankingsParams struct {
 	Count                    int                       // 최대 100, 0 이면 서버 기본값(100)
 }
 
-// Rankings 는 주식 랭킹을 조회한다(GET /api/v1/rankings).
+// Rankings 는 주식 랭킹을 조회한다(GET /api/v1/rankings). TOP_GAINERS/TOP_LOSERS 에 duration=realtime 은 400 unsupported-ranking-duration. 집계되지 않은 조합은 빈 Rankings(RankedAt nil).
 func (c *Client) Rankings(ctx context.Context, p RankingsParams) (*Rankings, error) {
 	if err := params.Require("type", string(p.Type)); err != nil {
 		return nil, err
@@ -3243,6 +3308,7 @@ EOF
 cat > indicators/client.go << 'EOF'
 // Package indicators 는 토스 Open API 시장 지표(Market Indicators) 그룹 — 지수 현재가·캔들·투자자별 매매대금.
 // toss.Client.MarketIndicators 로 접근한다.
+// 지표 심볼 카탈로그(1.2.14 기준): KOSPI, KOSDAQ, KR_BOND_2Y, KR_BOND_3Y, KR_BOND_5Y, KR_BOND_10Y, KR_BOND_20Y, KR_BOND_30Y. 지수는 포인트, 국채는 수익률(%) 단위이며 통화 필드가 없다. 지원하지 않는 심볼은 400 unsupported-symbol.
 package indicators
 
 import "github.com/kenshin579/toss-go/internal/httpclient"
@@ -3273,13 +3339,13 @@ import (
 type Price struct {
 	Symbol    string          `json:"symbol"`
 	Timestamp *time.Time      `json:"timestamp"` // 없으면 nil
-	LastPrice decimal.Decimal `json:"lastPrice"`
+	LastPrice decimal.Decimal `json:"lastPrice"` // 지수 포인트 또는 국채 수익률(%). 통화 없음
 }
 
-// Prices 는 시장 지표 현재가를 조회한다(GET /api/v1/market-indicators/prices). 최대 200개. 예: KOSPI, KOSDAQ.
+// Prices 는 시장 지표 현재가를 조회한다(GET /api/v1/market-indicators/prices). 최대 200개. 심볼 카탈로그는 패키지 주석 참고(KOSPI, KOSDAQ, KR_BOND_*).
 // 지원하지 않는 심볼은 400 unsupported-symbol, 잘못된 요청은 400 invalid-request.
 func (c *Client) Prices(ctx context.Context, symbols ...string) ([]Price, error) {
-	joined, err := params.Symbols(symbols)
+	joined, err := params.IndicatorSymbols(symbols)
 	if err != nil {
 		return nil, err
 	}
@@ -3301,9 +3367,9 @@ import (
 	"github.com/kenshin579/toss-go/tosstypes"
 )
 
-// Candle 은 시장 지표 OHLCV 봉 1개.
+// Candle 은 시장 지표 OHLCV 봉 1개(지수 포인트 또는 국채 수익률 %).
 type Candle struct {
-	Timestamp  time.Time       `json:"timestamp"`
+	Timestamp  time.Time       `json:"timestamp"` // 봉 시작 시각
 	OpenPrice  decimal.Decimal `json:"openPrice"`
 	HighPrice  decimal.Decimal `json:"highPrice"`
 	LowPrice   decimal.Decimal `json:"lowPrice"`
@@ -3314,12 +3380,12 @@ type Candle struct {
 // CandlePage 는 캔들 한 페이지. NextBefore 를 다음 요청의 Before 로 넘기면 이어서 조회한다.
 type CandlePage struct {
 	Candles    []Candle   `json:"candles"`
-	NextBefore *time.Time `json:"nextBefore"`
+	NextBefore *time.Time `json:"nextBefore"` // 더 없으면 nil
 }
 
 // CandlesParams 는 Candles 인자.
 type CandlesParams struct {
-	Interval tosstypes.Interval // 필수 (1m, 1d)
+	Interval tosstypes.Interval // 필수. 1m 은 KOSPI/KOSDAQ 만, KR_BOND_* 는 1d 만(그 외 400 invalid-request)
 	Count    int                // 최대 200, 0 이면 서버 기본값(100)
 	Before   *time.Time         // 이 시각 이하의 봉만. nil 이면 최신부터
 }
@@ -3327,7 +3393,7 @@ type CandlesParams struct {
 // Candles 는 시장 지표 캔들을 조회한다(GET /api/v1/market-indicators/{symbol}/candles).
 // 지원하지 않는 심볼은 400 unsupported-symbol, 잘못된 요청은 400 invalid-request.
 func (c *Client) Candles(ctx context.Context, symbol string, p CandlesParams) (*CandlePage, error) {
-	if err := params.Symbol(symbol); err != nil {
+	if err := params.IndicatorSymbol(symbol); err != nil {
 		return nil, err
 	}
 	if err := params.Require("interval", string(p.Interval)); err != nil {
@@ -3354,7 +3420,7 @@ import (
 	"github.com/kenshin579/toss-go/tosstypes"
 )
 
-// TradingAmount 는 매수/매도 대금.
+// TradingAmount 는 매수/매도 대금(KRW 정수, 통화 필드 없음).
 type TradingAmount struct {
 	BuyAmount  decimal.Decimal `json:"buyAmount"`
 	SellAmount decimal.Decimal `json:"sellAmount"`
@@ -3379,8 +3445,8 @@ type InstitutionTradingAmount struct {
 
 // InvestorTradingRecord 는 투자자별 매매대금 1구간.
 type InvestorTradingRecord struct {
-	Date             tosstypes.Date           `json:"date"`
-	UpdatedAt        time.Time                `json:"updatedAt"`
+	Date             tosstypes.Date           `json:"date"`      // 집계 기준일(interval 집계 기간의 대표 일자, KST)
+	UpdatedAt        time.Time                `json:"updatedAt"` // 갱신 시각. 당일 기록은 장 종료 전까지 갱신되는 잠정치
 	Individual       TradingAmount            `json:"individual"`
 	Foreigner        TradingAmount            `json:"foreigner"`
 	Institution      InstitutionTradingAmount `json:"institution"`
@@ -3403,7 +3469,7 @@ type InvestorTradingParams struct {
 // InvestorTrading 은 투자자별 매매대금을 조회한다(GET /api/v1/market-indicators/{symbol}/investor-trading). Until 은 KST 기준 날짜.
 // KOSPI, KOSDAQ 만 지원한다. 지원하지 않는 심볼은 400 unsupported-symbol, 잘못된 요청은 400 invalid-request.
 func (c *Client) InvestorTrading(ctx context.Context, symbol string, p InvestorTradingParams) (*InvestorTradingPage, error) {
-	if err := params.Symbol(symbol); err != nil {
+	if err := params.IndicatorSymbol(symbol); err != nil {
 		return nil, err
 	}
 	if err := params.Require("interval", string(p.Interval)); err != nil {
@@ -3417,7 +3483,7 @@ func (c *Client) InvestorTrading(ctx context.Context, symbol string, p InvestorT
 EOF
 gofmt -l ranking indicators; go vet ./ranking/ ./indicators/ && go test ./ranking/ ./indicators/ -v 2>&1 | grep -E '^(=== RUN|--- (PASS|FAIL)|ok|FAIL)' | grep -c -- '--- PASS'
 ```
-Expected: gofmt 출력 없음, `8` (PASS 8건: ranking 2 + indicators 6).
+Expected: gofmt 출력 없음, `10` (PASS 10건: ranking 2 + indicators 8).
 
 - [ ] **Step 4: 커밋**
 

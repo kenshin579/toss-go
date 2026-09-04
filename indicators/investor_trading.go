@@ -12,7 +12,7 @@ import (
 	"github.com/kenshin579/toss-go/tosstypes"
 )
 
-// TradingAmount 는 매수/매도 대금.
+// TradingAmount 는 매수/매도 대금(KRW 정수, 통화 필드 없음).
 type TradingAmount struct {
 	BuyAmount  decimal.Decimal `json:"buyAmount"`
 	SellAmount decimal.Decimal `json:"sellAmount"`
@@ -37,8 +37,8 @@ type InstitutionTradingAmount struct {
 
 // InvestorTradingRecord 는 투자자별 매매대금 1구간.
 type InvestorTradingRecord struct {
-	Date             tosstypes.Date           `json:"date"`
-	UpdatedAt        time.Time                `json:"updatedAt"`
+	Date             tosstypes.Date           `json:"date"`      // 집계 기준일(interval 집계 기간의 대표 일자, KST)
+	UpdatedAt        time.Time                `json:"updatedAt"` // 갱신 시각. 당일 기록은 장 종료 전까지 갱신되는 잠정치
 	Individual       TradingAmount            `json:"individual"`
 	Foreigner        TradingAmount            `json:"foreigner"`
 	Institution      InstitutionTradingAmount `json:"institution"`
@@ -61,7 +61,7 @@ type InvestorTradingParams struct {
 // InvestorTrading 은 투자자별 매매대금을 조회한다(GET /api/v1/market-indicators/{symbol}/investor-trading). Until 은 KST 기준 날짜.
 // KOSPI, KOSDAQ 만 지원한다. 지원하지 않는 심볼은 400 unsupported-symbol, 잘못된 요청은 400 invalid-request.
 func (c *Client) InvestorTrading(ctx context.Context, symbol string, p InvestorTradingParams) (*InvestorTradingPage, error) {
-	if err := params.Symbol(symbol); err != nil {
+	if err := params.IndicatorSymbol(symbol); err != nil {
 		return nil, err
 	}
 	if err := params.Require("interval", string(p.Interval)); err != nil {

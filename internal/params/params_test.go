@@ -33,6 +33,28 @@ func TestSymbol(t *testing.T) {
 	}
 }
 
+func TestIndicatorSymbol(t *testing.T) {
+	for _, ok := range []string{"KOSPI", "KOSDAQ", "KR_BOND_10Y", "kr_bond_2y"} {
+		if err := IndicatorSymbol(ok); err != nil {
+			t.Errorf("IndicatorSymbol(%q) = %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "BRK.B", "BF-B", "KR BOND", "코스피"} {
+		if err := IndicatorSymbol(bad); err == nil {
+			t.Errorf("IndicatorSymbol(%q) must fail", bad)
+		}
+	}
+	if err := Symbol("KR_BOND_10Y"); err == nil {
+		t.Error("stock Symbol must reject '_'")
+	}
+	if got, err := IndicatorSymbols([]string{"KOSPI", "KR_BOND_10Y"}); err != nil || got != "KOSPI,KR_BOND_10Y" {
+		t.Errorf("IndicatorSymbols = %q, %v", got, err)
+	}
+	if _, err := IndicatorSymbols([]string{"KOSPI", "BRK.B"}); err == nil {
+		t.Error("IndicatorSymbols must reject '.'")
+	}
+}
+
 func TestSymbols(t *testing.T) {
 	if got, err := Symbols([]string{"005930", "AAPL"}); err != nil || got != "005930,AAPL" {
 		t.Errorf("got %q, %v", got, err)

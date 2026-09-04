@@ -161,6 +161,7 @@ func IsCode(err error, code string) bool   // errors.As(APIError) && Code == cod
 - date-time 은 표준 `time.Time`(RFC3339 `.000+09:00` 파싱 가능), null 가능은 `*time.Time`.
 - 수치는 `decimal.Decimal`, null 가능은 `*decimal.Decimal`.
 - 심볼은 요청 전에 `^[A-Za-z0-9.\-]+$` 로 검증하고 `symbols=` 는 최대 200개(openapi 규칙) — 서버 400 으로 rate limit 을 소모하지 않기 위함.
+  시장 지표 심볼은 별도 규칙 `^[A-Za-z0-9_]+$`(params.IndicatorSymbol) — 종목 규칙과 알파벳이 달라 합치지 않는다.
 
 ## 엔드포인트 매핑 (21 ops)
 
@@ -185,9 +186,9 @@ func IsCode(err error, code string) bool   // errors.As(APIError) && Code == cod
 | marketinfo | `KRMarketCalendar(ctx, date Date) (*KRMarketCalendar, error)` | GET /api/v1/market-calendar/KR |
 | marketinfo | `USMarketCalendar(ctx, date Date) (*USMarketCalendar, error)` | GET /api/v1/market-calendar/US |
 | ranking | `Rankings(ctx, RankingsParams{Type, MarketCountry, Duration, ExcludeInvestmentCaution *bool, Count}) (*Rankings, error)` | GET /api/v1/rankings |
-| indicators | `Prices(ctx, symbols ...string) ([]IndicatorPrice, error)` | GET /api/v1/market-indicators/prices |
-| indicators | `Candles(ctx, symbol, IndicatorCandlesParams{Interval, Count, Before *time.Time}) (*IndicatorCandlePage, error)` | GET /api/v1/market-indicators/{symbol}/candles |
-| indicators | `InvestorTrading(ctx, symbol, IndicatorInvestorTradingParams{Interval, Count, Until Date}) (*IndicatorInvestorTradingPage, error)` | GET /api/v1/market-indicators/{symbol}/investor-trading |
+| indicators | `Prices(ctx, symbols ...string) ([]indicators.Price, error)` | GET /api/v1/market-indicators/prices |
+| indicators | `Candles(ctx, symbol, indicators.CandlesParams{Interval, Count, Before *time.Time}) (*indicators.CandlePage, error)` | GET /api/v1/market-indicators/{symbol}/candles |
+| indicators | `InvestorTrading(ctx, symbol, indicators.InvestorTradingParams{Interval, Count, Until Date}) (*indicators.InvestorTradingPage, error)` | GET /api/v1/market-indicators/{symbol}/investor-trading |
 
 - `*Page` 응답은 토스 필드를 그대로 노출: `Candles []Candle; NextBefore *time.Time`,
   `Records []T; NextUntil *Date`. 반복 조회는 호출자가 `NextBefore/NextUntil` 을 다음 요청에 넣는다
