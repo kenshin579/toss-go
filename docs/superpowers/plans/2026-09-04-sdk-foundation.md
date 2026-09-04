@@ -3511,6 +3511,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -3547,6 +3548,17 @@ func TestNewClientFromEnv(t *testing.T) {
 	t.Setenv("TOSS_CLIENT_SECRET", "sec")
 	if _, err := NewClientFromEnv(); err != nil {
 		t.Errorf("NewClientFromEnv: %v", err)
+	}
+
+	t.Setenv("TOSS_CLIENT_ID", "")
+	t.Setenv("TOSS_CLIENT_SECRET", "sec")
+	if _, err := NewClientFromEnv(); err == nil || !strings.Contains(err.Error(), "TOSS_CLIENT_ID") || strings.Contains(err.Error(), "SECRET") {
+		t.Errorf("missing id: %v", err)
+	}
+	t.Setenv("TOSS_CLIENT_ID", "id")
+	t.Setenv("TOSS_CLIENT_SECRET", "")
+	if _, err := NewClientFromEnv(); err == nil || !strings.Contains(err.Error(), "TOSS_CLIENT_SECRET") {
+		t.Errorf("missing secret: %v", err)
 	}
 }
 
@@ -3607,6 +3619,53 @@ func TestAPIErrorAlias(t *testing.T) {
 		t.Error("APIError must alias httpclient.APIError")
 	}
 }
+
+func TestWithBaseURL_Empty(t *testing.T) {
+	// WithBaseURL("") 은 무시되고 기본 URL 이 쓰인다(토큰만 상대경로가 되는 반쪽 동작 방지)
+	c, err := NewClient("i", "s", WithBaseURL(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.AccessToken(context.Background()); err == nil {
+		t.Skip("network reachable; skip")
+	} else if strings.Contains(err.Error(), "unsupported protocol scheme") {
+		t.Errorf("token URL is relative: %v", err)
+	}
+}
+
+func TestAuthErrorAlias(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(403)
+		_, _ = w.Write([]byte(`{"error":"access_denied","error_description":"IP address not allowed"}`))
+	}))
+	defer srv.Close()
+	c, err := NewClient("i", "s", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.AccessToken(context.Background())
+	var ae *AuthError
+	if !errors.As(err, &ae) || ae.StatusCode != 403 || ae.Code != "access_denied" || ae.Description != "IP address not allowed" {
+		t.Fatalf("want *AuthError, got %T %v", err, err)
+	}
+	// API 호출도 같은 토큰 실패를 그대로 전달한다
+	if _, err := c.MarketData.Prices(context.Background(), "005930"); !errors.As(err, &ae) {
+		t.Errorf("API call must surface AuthError, got %v", err)
+	}
+}
+
+func TestWithHTTPClient_OverridesTimeout(t *testing.T) {
+	custom := &http.Client{Timeout: 123 * time.Second}
+	c, err := NewClient("i", "s", WithTimeout(time.Second), WithHTTPClient(custom))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 주입한 클라이언트가 그대로 쓰이는지 — 타임아웃이 1s 로 덮이지 않았는지 확인
+	if got := c.httpClientForTest(); got != custom || got.Timeout != 123*time.Second {
+		t.Errorf("custom client not used: %+v", got)
+	}
+}
 EOF
 go test . 2>&1 | head -5
 ```
@@ -3651,11 +3710,21 @@ import (
 	"github.com/kenshin579/toss-go/internal/httpclient"
 )
 
-// APIError 는 토스 API 의 4xx/5xx 응답. errors.As 로 StatusCode/Code/RequestID/Data/RetryAfter 에 접근한다.
-// Code 는 unknown 값을 허용하므로 문자열 비교로 판별한다(IsCode 참고).
+// APIError 는 토스 API 의 4xx/5xx 응답이다. errors.As 로 아래 필드에 접근한다.
+//
+//	StatusCode int            // HTTP 상태코드
+//	RequestID  string         // 응답 requestId(없으면 X-Request-Id 헤더)
+//	Code       string         // 토스 에러 코드(unknown 값 허용, IsCode 로 비교)
+//	Message    string         // 사용자 노출용 메시지(빈 문자열일 수 있음)
+//	Data       map[string]any // 에러 해결 힌트(코드별로 다름, 없으면 nil)
+//	RetryAfter time.Duration  // 429 의 Retry-After. 그 외에는 0
 type APIError = httpclient.APIError
 
-// AuthError 는 토큰 발급(POST /oauth2/token) 실패. OAuth2 형식(error/error_description)을 담는다.
+// AuthError 는 토큰 발급(POST /oauth2/token) 실패다. 공통 봉투가 아니라 OAuth2 표준 형식으로 내려온다.
+//
+//	StatusCode  int    // HTTP 상태코드(예: 403)
+//	Code        string // OAuth2 error(예: access_denied)
+//	Description string // OAuth2 error_description(예: IP address not allowed)
 type AuthError = auth.Error
 
 // IsCode 는 err 가 주어진 토스 에러 코드(예: "stock-not-found", "expired-token")의 *APIError 인지 판별한다.
@@ -3675,8 +3744,13 @@ import (
 // NewClientFromEnv 는 TOSS_CLIENT_ID / TOSS_CLIENT_SECRET 환경변수로 Client 를 만든다.
 func NewClientFromEnv(opts ...Option) (*Client, error) {
 	id, secret := os.Getenv("TOSS_CLIENT_ID"), os.Getenv("TOSS_CLIENT_SECRET")
-	if id == "" || secret == "" {
+	switch {
+	case id == "" && secret == "":
 		return nil, errors.New("toss: TOSS_CLIENT_ID and TOSS_CLIENT_SECRET must be set")
+	case id == "":
+		return nil, errors.New("toss: TOSS_CLIENT_ID must be set")
+	case secret == "":
+		return nil, errors.New("toss: TOSS_CLIENT_SECRET must be set")
 	}
 	return NewClient(id, secret, opts...)
 }
@@ -3686,6 +3760,8 @@ cat > client.go << 'EOF'
 //
 // 인증은 OAuth2 Client Credentials 로, 첫 호출 때 토큰을 발급해 만료 전까지 재사용한다.
 // 수치는 shopspring/decimal, 시각은 time.Time(KST 오프셋), 날짜는 tosstypes.Date 로 표현한다.
+//
+//	import toss "github.com/kenshin579/toss-go"
 //
 //	c, _ := toss.NewClientFromEnv() // TOSS_CLIENT_ID / TOSS_CLIENT_SECRET
 //	ps, err := c.MarketData.Prices(ctx, "005930", "AAPL")
@@ -3706,8 +3782,9 @@ import (
 )
 
 // Client 는 toss-go 의 단일 진입점. 그룹별 sub-client 를 필드로 노출한다.
+// Client 와 sub-client 는 여러 goroutine 에서 동시에 사용해도 안전하다.
 type Client struct {
-	http   *httpclient.Client
+	hc     *http.Client
 	tokens *auth.TokenSource
 
 	MarketData       *marketdata.Client // 시세: 현재가·호가·체결·상하한가·캔들
@@ -3726,6 +3803,9 @@ func NewClient(clientID, clientSecret string, opts ...Option) (*Client, error) {
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+	if cfg.baseURL == "" { // WithBaseURL("") 이 토큰 URL 만 상대경로로 만드는 것을 막는다
+		cfg.baseURL = httpclient.DefaultBaseURL
+	}
 	hc := cfg.httpClient
 	if hc == nil {
 		hc = &http.Client{Timeout: cfg.timeout}
@@ -3734,7 +3814,7 @@ func NewClient(clientID, clientSecret string, opts ...Option) (*Client, error) {
 	h := httpclient.New(httpclient.Config{BaseURL: cfg.baseURL, HTTPClient: hc, Tokens: tokens})
 
 	return &Client{
-		http:             h,
+		hc:               hc,
 		tokens:           tokens,
 		MarketData:       marketdata.New(h),
 		StockInfo:        stockinfo.New(h),
@@ -3748,6 +3828,9 @@ func NewClient(clientID, clientSecret string, opts ...Option) (*Client, error) {
 func (c *Client) AccessToken(ctx context.Context) (string, error) {
 	return c.tokens.Token(ctx)
 }
+
+// httpClientForTest 는 테스트에서 주입된 *http.Client 를 확인하기 위한 접근자다.
+func (c *Client) httpClientForTest() *http.Client { return c.hc }
 EOF
 gofmt -l .; go vet ./... && go test ./... -race 2>&1 | tail -12
 ```

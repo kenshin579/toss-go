@@ -3,6 +3,8 @@
 // 인증은 OAuth2 Client Credentials 로, 첫 호출 때 토큰을 발급해 만료 전까지 재사용한다.
 // 수치는 shopspring/decimal, 시각은 time.Time(KST 오프셋), 날짜는 tosstypes.Date 로 표현한다.
 //
+//	import toss "github.com/kenshin579/toss-go"
+//
 //	c, _ := toss.NewClientFromEnv() // TOSS_CLIENT_ID / TOSS_CLIENT_SECRET
 //	ps, err := c.MarketData.Prices(ctx, "005930", "AAPL")
 package toss
@@ -22,8 +24,9 @@ import (
 )
 
 // Client 는 toss-go 의 단일 진입점. 그룹별 sub-client 를 필드로 노출한다.
+// Client 와 sub-client 는 여러 goroutine 에서 동시에 사용해도 안전하다.
 type Client struct {
-	http   *httpclient.Client
+	hc     *http.Client
 	tokens *auth.TokenSource
 
 	MarketData       *marketdata.Client // 시세: 현재가·호가·체결·상하한가·캔들
@@ -42,6 +45,9 @@ func NewClient(clientID, clientSecret string, opts ...Option) (*Client, error) {
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+	if cfg.baseURL == "" { // WithBaseURL("") 이 토큰 URL 만 상대경로로 만드는 것을 막는다
+		cfg.baseURL = httpclient.DefaultBaseURL
+	}
 	hc := cfg.httpClient
 	if hc == nil {
 		hc = &http.Client{Timeout: cfg.timeout}
@@ -50,7 +56,7 @@ func NewClient(clientID, clientSecret string, opts ...Option) (*Client, error) {
 	h := httpclient.New(httpclient.Config{BaseURL: cfg.baseURL, HTTPClient: hc, Tokens: tokens})
 
 	return &Client{
-		http:             h,
+		hc:               hc,
 		tokens:           tokens,
 		MarketData:       marketdata.New(h),
 		StockInfo:        stockinfo.New(h),
@@ -64,3 +70,6 @@ func NewClient(clientID, clientSecret string, opts ...Option) (*Client, error) {
 func (c *Client) AccessToken(ctx context.Context) (string, error) {
 	return c.tokens.Token(ctx)
 }
+
+// httpClientForTest 는 테스트에서 주입된 *http.Client 를 확인하기 위한 접근자다.
+func (c *Client) httpClientForTest() *http.Client { return c.hc }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -41,6 +42,17 @@ func TestNewClientFromEnv(t *testing.T) {
 	t.Setenv("TOSS_CLIENT_SECRET", "sec")
 	if _, err := NewClientFromEnv(); err != nil {
 		t.Errorf("NewClientFromEnv: %v", err)
+	}
+
+	t.Setenv("TOSS_CLIENT_ID", "")
+	t.Setenv("TOSS_CLIENT_SECRET", "sec")
+	if _, err := NewClientFromEnv(); err == nil || !strings.Contains(err.Error(), "TOSS_CLIENT_ID") || strings.Contains(err.Error(), "SECRET") {
+		t.Errorf("missing id: %v", err)
+	}
+	t.Setenv("TOSS_CLIENT_ID", "id")
+	t.Setenv("TOSS_CLIENT_SECRET", "")
+	if _, err := NewClientFromEnv(); err == nil || !strings.Contains(err.Error(), "TOSS_CLIENT_SECRET") {
+		t.Errorf("missing secret: %v", err)
 	}
 }
 
@@ -99,5 +111,52 @@ func TestAPIErrorAlias(t *testing.T) {
 	var ae *APIError
 	if !errors.As(e, &ae) {
 		t.Error("APIError must alias httpclient.APIError")
+	}
+}
+
+func TestWithBaseURL_Empty(t *testing.T) {
+	// WithBaseURL("") 은 무시되고 기본 URL 이 쓰인다(토큰만 상대경로가 되는 반쪽 동작 방지)
+	c, err := NewClient("i", "s", WithBaseURL(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.AccessToken(context.Background()); err == nil {
+		t.Skip("network reachable; skip")
+	} else if strings.Contains(err.Error(), "unsupported protocol scheme") {
+		t.Errorf("token URL is relative: %v", err)
+	}
+}
+
+func TestAuthErrorAlias(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(403)
+		_, _ = w.Write([]byte(`{"error":"access_denied","error_description":"IP address not allowed"}`))
+	}))
+	defer srv.Close()
+	c, err := NewClient("i", "s", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.AccessToken(context.Background())
+	var ae *AuthError
+	if !errors.As(err, &ae) || ae.StatusCode != 403 || ae.Code != "access_denied" || ae.Description != "IP address not allowed" {
+		t.Fatalf("want *AuthError, got %T %v", err, err)
+	}
+	// API 호출도 같은 토큰 실패를 그대로 전달한다
+	if _, err := c.MarketData.Prices(context.Background(), "005930"); !errors.As(err, &ae) {
+		t.Errorf("API call must surface AuthError, got %v", err)
+	}
+}
+
+func TestWithHTTPClient_OverridesTimeout(t *testing.T) {
+	custom := &http.Client{Timeout: 123 * time.Second}
+	c, err := NewClient("i", "s", WithTimeout(time.Second), WithHTTPClient(custom))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 주입한 클라이언트가 그대로 쓰이는지 — 타임아웃이 1s 로 덮이지 않았는지 확인
+	if got := c.httpClientForTest(); got != custom || got.Timeout != 123*time.Second {
+		t.Errorf("custom client not used: %+v", got)
 	}
 }
