@@ -3,6 +3,7 @@ package httpclient
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -295,5 +296,168 @@ func TestGet_NonEnvelopeErrorBodyRuneSafe(t *testing.T) {
 	var ae *APIError
 	if !errors.As(err, &ae) || !utf8.ValidString(ae.Message) || len(ae.Message) > 200 {
 		t.Errorf("got %+v (%v)", ae, err)
+	}
+}
+
+func TestDo_PostSendsBodyAndHeaders(t *testing.T) {
+	type reqBody struct {
+		Symbol string `json:"symbol"`
+	}
+	var got struct {
+		method, ct, acct, auth string
+		body                   string
+	}
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got.method, got.ct, got.acct, got.auth, got.body = r.Method, r.Header.Get("Content-Type"), r.Header.Get("X-Tossinvest-Account"), r.Header.Get("Authorization"), string(b)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"result":{"orderId":"o-1"}}`))
+	})
+	defer done()
+	var out struct {
+		OrderID string `json:"orderId"`
+	}
+	err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/api/v1/orders", Body: reqBody{Symbol: "005930"}, AccountSeq: 7, Out: &out})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.method != http.MethodPost || got.ct != "application/json" || got.acct != "7" || got.auth != "Bearer tok" {
+		t.Errorf("headers = %+v", got)
+	}
+	if got.body != `{"symbol":"005930"}` {
+		t.Errorf("body = %s", got.body)
+	}
+	if out.OrderID != "o-1" {
+		t.Errorf("out = %+v", out)
+	}
+}
+
+func TestDo_NoAccountHeaderWhenZero(t *testing.T) {
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := r.Header["X-Tossinvest-Account"]; ok {
+			t.Errorf("account header must be absent, got %q", r.Header.Get("X-Tossinvest-Account"))
+		}
+		_, _ = w.Write([]byte(`{"result":[]}`))
+	})
+	defer done()
+	var out []struct{}
+	if err := c.Do(context.Background(), Request{Method: http.MethodGet, Path: "/api/v1/accounts", Out: &out, Idempotent: true}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDo_NoContent(t *testing.T) {
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Errorf("method = %s", r.Method)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	defer done()
+	// Out 이 nil 이면 204 는 성공
+	if err := c.Do(context.Background(), Request{Method: http.MethodDelete, Path: "/api/v1/conditional-orders/c-1", AccountSeq: 1}); err != nil {
+		t.Fatalf("204 with nil Out: %v", err)
+	}
+}
+
+func TestDo_NoContentWithOutIsError(t *testing.T) {
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	defer done()
+	var out struct{ A int }
+	err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/x", Out: &out})
+	if err == nil || !strings.Contains(err.Error(), "no result") {
+		t.Errorf("want no-result error, got %v", err)
+	}
+}
+
+func TestDo_WriteWithoutIdempotencyDoesNotRetry(t *testing.T) {
+	var n int32
+	c, st, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&n, 1)
+		w.WriteHeader(401)
+		_, _ = w.Write([]byte(`{"error":{"requestId":"r","code":"expired-token","message":""}}`))
+	})
+	defer done()
+	err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/api/v1/orders", Body: map[string]string{"a": "b"}})
+	var ae *APIError
+	if !errors.As(err, &ae) || ae.Code != "expired-token" {
+		t.Fatalf("want expired-token, got %v", err)
+	}
+	// 멱등성 키가 없는 쓰기는 재시도하지 않는다(중복 주문 방지). 토큰은 무효화한다.
+	if atomic.LoadInt32(&n) != 1 || atomic.LoadInt32(&st.invalidated) != 1 {
+		t.Errorf("calls=%d invalidated=%d, want 1/1", atomic.LoadInt32(&n), atomic.LoadInt32(&st.invalidated))
+	}
+}
+
+func TestDo_IdempotentWriteRetriesOnce(t *testing.T) {
+	var n int32
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&n, 1) == 1 {
+			w.WriteHeader(401)
+			_, _ = w.Write([]byte(`{"error":{"requestId":"r","code":"expired-token","message":""}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"result":{"orderId":"o-2"}}`))
+	}, "tok1", "tok2")
+	defer done()
+	var out struct {
+		OrderID string `json:"orderId"`
+	}
+	if err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/api/v1/orders", Body: map[string]string{"a": "b"}, Idempotent: true, Out: &out}); err != nil {
+		t.Fatal(err)
+	}
+	if out.OrderID != "o-2" || atomic.LoadInt32(&n) != 2 {
+		t.Errorf("out=%+v calls=%d", out, atomic.LoadInt32(&n))
+	}
+}
+
+func TestDo_BodyIsResentOnRetry(t *testing.T) {
+	var bodies []string
+	var mu sync.Mutex
+	var n int32
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(b))
+		mu.Unlock()
+		if atomic.AddInt32(&n, 1) == 1 {
+			w.WriteHeader(401)
+			_, _ = w.Write([]byte(`{"error":{"requestId":"r","code":"expired-token","message":""}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"result":{"ok":true}}`))
+	}, "tok1", "tok2")
+	defer done()
+	var out struct {
+		OK bool `json:"ok"`
+	}
+	if err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/x", Body: map[string]string{"k": "v"}, Idempotent: true, Out: &out}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 || bodies[0] != bodies[1] || bodies[0] != `{"k":"v"}` {
+		t.Errorf("bodies = %q", bodies)
+	}
+}
+
+func TestGet_StillIdempotent(t *testing.T) {
+	var n int32
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&n, 1) == 1 {
+			w.WriteHeader(401)
+			_, _ = w.Write([]byte(`{"error":{"requestId":"r","code":"expired-token","message":""}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"result":{"ok":true}}`))
+	}, "tok1", "tok2")
+	defer done()
+	var out struct {
+		OK bool `json:"ok"`
+	}
+	if err := c.Get(context.Background(), "/x", nil, &out); err != nil || !out.OK {
+		t.Fatalf("GET must still retry: %+v %v", out, err)
 	}
 }
