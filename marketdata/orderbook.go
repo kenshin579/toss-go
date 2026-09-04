@@ -31,5 +31,5 @@ func (c *Client) Orderbook(ctx context.Context, symbol string) (*Orderbook, erro
 	if err := params.Symbol(symbol); err != nil {
 		return nil, err
 	}
-	return fetch.One[Orderbook](ctx, c.http, "/api/v1/orderbook", url.Values{"symbol": {symbol}})
+	return fetch.One[Orderbook](ctx, c.http, "/api/v1/orderbook", url.Values{"symbol": {symbol}}, 0)
 }

@@ -22,5 +22,5 @@ func (c *Client) Warnings(ctx context.Context, symbol string) ([]Warning, error)
 	if err := params.Symbol(symbol); err != nil {
 		return nil, err
 	}
-	return fetch.List[Warning](ctx, c.http, "/api/v1/stocks/"+url.PathEscape(symbol)+"/warnings", nil)
+	return fetch.List[Warning](ctx, c.http, "/api/v1/stocks/"+url.PathEscape(symbol)+"/warnings", nil, 0)
 }

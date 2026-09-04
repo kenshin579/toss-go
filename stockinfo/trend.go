@@ -168,5 +168,5 @@ func fetchTrend[T any](ctx context.Context, hc *httpclient.Client, symbol, segme
 	q := url.Values{}
 	params.Int(q, "count", p.Count)
 	params.Date(q, "until", p.Until)
-	return fetch.One[TrendPage[T]](ctx, hc, "/api/v1/stocks/"+url.PathEscape(symbol)+"/"+segment, q)
+	return fetch.One[TrendPage[T]](ctx, hc, "/api/v1/stocks/"+url.PathEscape(symbol)+"/"+segment, q, 0)
 }

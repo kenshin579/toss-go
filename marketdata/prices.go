@@ -26,5 +26,5 @@ func (c *Client) Prices(ctx context.Context, symbols ...string) ([]Price, error)
 	if err != nil {
 		return nil, err
 	}
-	return fetch.List[Price](ctx, c.http, "/api/v1/prices", url.Values{"symbols": {joined}})
+	return fetch.List[Price](ctx, c.http, "/api/v1/prices", url.Values{"symbols": {joined}}, 0)
 }

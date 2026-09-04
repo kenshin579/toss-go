@@ -35,6 +35,16 @@ func (d Date) Time() (time.Time, error) {
 	return t, nil
 }
 
+// AccountType 은 계좌 종류.
+type AccountType string
+
+const (
+	AccountTypeBrokerage           AccountType = "BROKERAGE"            // 위탁(주식)
+	AccountTypeOverseasDerivatives AccountType = "OVERSEAS_DERIVATIVES" // 해외파생
+	AccountTypePensionSavings      AccountType = "PENSION_SAVINGS"      // 연금저축
+	AccountTypeReshoringInvestment AccountType = "RESHORING_INVESTMENT" // 국내복귀기업 투자
+)
+
 // Currency 는 통화 코드.
 type Currency string
 

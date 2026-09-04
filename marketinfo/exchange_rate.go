@@ -34,5 +34,5 @@ func (c *Client) ExchangeRate(ctx context.Context, base, quote tosstypes.Currenc
 	}
 	q := url.Values{"baseCurrency": {string(base)}, "quoteCurrency": {string(quote)}}
 	params.Time(q, "dateTime", at)
-	return fetch.One[ExchangeRate](ctx, c.http, "/api/v1/exchange-rate", q)
+	return fetch.One[ExchangeRate](ctx, c.http, "/api/v1/exchange-rate", q, 0)
 }

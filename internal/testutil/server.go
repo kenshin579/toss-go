@@ -29,29 +29,53 @@ type Expect struct {
 func NewServer(t *testing.T, want Expect, status int, body []byte) (*httpclient.Client, func()) {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != want.Path {
-			t.Errorf("path = %q, want %q", r.URL.Path, want.Path)
-		}
-		got := r.URL.Query()
-		for k := range want.Query {
-			if got.Get(k) != want.Query.Get(k) {
-				t.Errorf("query %s = %q, want %q", k, got.Get(k), want.Query.Get(k))
-			}
-		}
-		for k := range got {
-			if _, ok := want.Query[k]; !ok {
-				t.Errorf("unexpected query %s=%q", k, got.Get(k))
-			}
-		}
-		if r.Header.Get("Authorization") != "Bearer test-token" {
-			t.Errorf("Authorization = %q", r.Header.Get("Authorization"))
-		}
+		checkRequest(t, r, want)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		_, _ = w.Write(body)
 	}))
 	c := httpclient.New(httpclient.Config{BaseURL: srv.URL, HTTPClient: srv.Client(), Tokens: staticTokens{}})
 	return c, srv.Close
+}
+
+// NewServerWithHeader 는 NewServer 와 같지만 X-Tossinvest-Account 헤더까지 검증한다.
+// wantAccount 가 빈 문자열이면 헤더가 없어야 한다.
+func NewServerWithHeader(t *testing.T, want Expect, wantAccount string, status int, body []byte) (*httpclient.Client, func()) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		checkRequest(t, r, want)
+		if got := r.Header.Get("X-Tossinvest-Account"); got != wantAccount {
+			t.Errorf("X-Tossinvest-Account = %q, want %q", got, wantAccount)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		if body != nil {
+			_, _ = w.Write(body)
+		}
+	}))
+	c := httpclient.New(httpclient.Config{BaseURL: srv.URL, HTTPClient: srv.Client(), Tokens: staticTokens{}})
+	return c, srv.Close
+}
+
+func checkRequest(t *testing.T, r *http.Request, want Expect) {
+	t.Helper()
+	if r.URL.Path != want.Path {
+		t.Errorf("path = %q, want %q", r.URL.Path, want.Path)
+	}
+	got := r.URL.Query()
+	for k := range want.Query {
+		if got.Get(k) != want.Query.Get(k) {
+			t.Errorf("query %s = %q, want %q", k, got.Get(k), want.Query.Get(k))
+		}
+	}
+	for k := range got {
+		if _, ok := want.Query[k]; !ok {
+			t.Errorf("unexpected query %s=%q", k, got.Get(k))
+		}
+	}
+	if r.Header.Get("Authorization") != "Bearer test-token" {
+		t.Errorf("Authorization = %q", r.Header.Get("Authorization"))
+	}
 }
 
 // Fixture 는 testdata/<name> 을 읽는다.

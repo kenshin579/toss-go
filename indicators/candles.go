@@ -47,5 +47,5 @@ func (c *Client) Candles(ctx context.Context, symbol string, p CandlesParams) (*
 	q := url.Values{"interval": {string(p.Interval)}}
 	params.Int(q, "count", p.Count)
 	params.Time(q, "before", p.Before)
-	return fetch.One[CandlePage](ctx, c.http, "/api/v1/market-indicators/"+url.PathEscape(symbol)+"/candles", q)
+	return fetch.One[CandlePage](ctx, c.http, "/api/v1/market-indicators/"+url.PathEscape(symbol)+"/candles", q, 0)
 }
