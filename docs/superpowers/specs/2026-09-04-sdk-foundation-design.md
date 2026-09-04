@@ -174,7 +174,7 @@ func IsCode(err error, code string) bool   // errors.As(APIError) && Code == cod
 | marketdata | `PriceLimits(ctx, symbol) (*PriceLimits, error)` | GET /api/v1/price-limits |
 | marketdata | `Candles(ctx, CandlesParams{Symbol, Interval, Count, Before *time.Time, Adjusted *bool}) (*CandlePage, error)` | GET /api/v1/candles |
 | stockinfo | `Stocks(ctx, symbols ...string) ([]Stock, error)` | GET /api/v1/stocks?symbols= |
-| stockinfo | `ListStocks(ctx, ListStocksParams{Market, Status, SecurityType, CommonShare *bool}) ([]Stock, error)` | GET /api/v1/stocks/all |
+| stockinfo | `ListStocks(ctx, ListStocksParams{Market, Status, SecurityType, CommonShare *bool}) ([]ListedStock, error)` | GET /api/v1/stocks/all |
 | stockinfo | `Warnings(ctx, symbol) ([]Warning, error)` | GET /api/v1/stocks/{symbol}/warnings |
 | stockinfo | `InvestorTrading(ctx, symbol, TrendParams{Count, Until Date}) (*InvestorTradingPage, error)` | GET /api/v1/stocks/{symbol}/investor-trading |
 | stockinfo | `ProgramTrades(ctx, symbol, TrendParams) (*ProgramTradesPage, error)` | GET /api/v1/stocks/{symbol}/program-trades |

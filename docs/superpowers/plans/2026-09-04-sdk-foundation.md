@@ -2624,7 +2624,7 @@ func fetchTrend[T any](ctx context.Context, hc *httpclient.Client, symbol, segme
 EOF
 gofmt -l stockinfo; go vet ./stockinfo/ && go test ./stockinfo/ -v 2>&1 | tail -16
 ```
-Expected: gofmt 출력 없음, 13 tests PASS. `TestCreditTrades`/`TestSecuritiesLending` 이 캡처 데이터 때문에 실패하면(예: 레코드 0건) 캡처 명령의 `count` 나 날짜를 바꿔 다시 캡처한다 — 테스트 조건을 완화하지 않는다.
+Expected: gofmt 출력 없음, 12 tests PASS. `TestCreditTrades`/`TestSecuritiesLending` 이 캡처 데이터 때문에 실패하면(예: 레코드 0건) 캡처 명령의 `count` 나 날짜를 바꿔 다시 캡처한다 — 테스트 조건을 완화하지 않는다.
 
 - [ ] **Step 4: 커밋**
 
