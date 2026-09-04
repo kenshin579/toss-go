@@ -3187,6 +3187,7 @@ import (
 	"time"
 
 	toss "github.com/kenshin579/toss-go"
+	"github.com/kenshin579/toss-go/asset"
 	"github.com/kenshin579/toss-go/order"
 	"github.com/kenshin579/toss-go/tosstypes"
 )
@@ -3209,7 +3210,7 @@ func main() {
 	a := c.Account(accts[0].AccountSeq)
 	fmt.Printf("account %s (%s)\n", accts[0].AccountNo, accts[0].AccountType)
 
-	h, err := a.Asset.Holdings(ctx, nil)
+	h, err := a.Asset.Holdings(ctx, asset.HoldingsParams{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -3275,7 +3276,7 @@ func TestIntegration_AccountReadOnly(t *testing.T) {
 	a := c.Account(accts[0].AccountSeq)
 	time.Sleep(1100 * time.Millisecond) // ACCOUNT 그룹 1/s
 
-	if _, err := a.Asset.Holdings(ctx, nil); err != nil {
+	if _, err := a.Asset.Holdings(ctx, asset.HoldingsParams{}); err != nil {
 		t.Errorf("Holdings: %v", err)
 	}
 	time.Sleep(300 * time.Millisecond)
@@ -3315,7 +3316,7 @@ func TestIntegration_AccountReadOnly(t *testing.T) {
 }
 EOF
 ```
-import 에 `"github.com/kenshin579/toss-go/order"`, `"github.com/kenshin579/toss-go/conditionalorder"` 를 추가한다.
+import 에 `"github.com/kenshin579/toss-go/asset"`, `"github.com/kenshin579/toss-go/order"`, `"github.com/kenshin579/toss-go/conditionalorder"` 를 추가한다.
 
 ```bash
 gofmt -w . && go vet -tags integration ./... && echo VET_OK
@@ -3346,7 +3347,7 @@ Expected: `VET_OK`. 실행은 허용 IP 가 등록된 환경에서만 성공한�
 accts, _ := c.Accounts(ctx)          // 계좌 헤더가 필요 없는 유일한 계좌 API
 a := c.Account(accts[0].AccountSeq)  // 이후 모든 호출에 계좌 헤더 자동 주입
 
-h, _ := a.Asset.Holdings(ctx, nil)
+h, _ := a.Asset.Holdings(ctx, asset.HoldingsParams{})
 bp, _ := a.Order.BuyingPower(ctx, tosstypes.CurrencyKRW)
 
 res, err := a.Order.Place(ctx, order.PlaceRequest{
