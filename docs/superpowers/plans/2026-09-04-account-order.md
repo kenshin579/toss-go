@@ -1249,6 +1249,7 @@ ex "/api/v1/commissions" standard commissions
 for f in order/testdata/*.json; do printf "%-40s " "$f"; jq -c 'if .result|type=="array" then {n:(.result|length)} else (.result|keys|join(",")) end' "$f"; done
 ```
 Expected: 9개 파일. `orders.json` 은 `orders,nextCursor,hasNext`, `order_filled.json` 은 `orderId,symbol,...`, `commissions.json` 은 `{"n":2}`.
+`order_partial.json`(usMarketPartialFilled)·`order_rejected.json`(rejected) 은 `TestGet_USPartialFilled`/`TestGet_Rejected` 가 소비한다(둘 다 초안에서 미사용이었다가 리뷰로 추가).
 
 - [x] **Step 2: 실패 테스트 작성**
 
@@ -1259,8 +1260,11 @@ package order
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/url"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/shopspring/decimal"
@@ -1362,6 +1366,50 @@ func TestGet_RequiresID(t *testing.T) {
 	}
 }
 
+func TestGet_USPartialFilled(t *testing.T) {
+	// fixture = openapi 예시(usMarketPartialFilled): 미국 시장가 매수, 소수점 없는 수량 5주 중 3주 체결
+	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/orders/o-2"}, "3", 200, testutil.Fixture(t, "order_partial.json"))
+	defer done()
+	o, err := New(hc, 3).Get(context.Background(), "o-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.Symbol != "AAPL" || o.Side != SideBuy || o.OrderType != TypeMarket || o.Currency != tosstypes.CurrencyUSD {
+		t.Errorf("order = %+v", o)
+	}
+	if o.Status != StatusPartialFilled || o.Price != nil || o.Quantity.String() != "5" || o.OrderAmount != nil {
+		t.Errorf("order fields = %+v", o)
+	}
+	if o.Execution.FilledQuantity.String() != "3" || o.Execution.AverageFilledPrice == nil || o.Execution.AverageFilledPrice.String() != "185.25" {
+		t.Errorf("execution = %+v", o.Execution)
+	}
+	if o.Execution.Commission == nil || o.Execution.Commission.String() != "0.99" || o.Execution.Tax == nil || o.Execution.Tax.String() != "0" {
+		t.Errorf("cost = %+v", o.Execution)
+	}
+	if o.Execution.FilledAt == nil || o.Execution.SettlementDate != nil {
+		t.Errorf("filledAt/settlementDate = %v %v", o.Execution.FilledAt, o.Execution.SettlementDate)
+	}
+}
+
+func TestGet_Rejected(t *testing.T) {
+	// fixture = openapi 예시(rejected): 미국 시장가, 소수점 수량 0.5주, 체결 없이 거부
+	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/orders/o-3"}, "3", 200, testutil.Fixture(t, "order_rejected.json"))
+	defer done()
+	o, err := New(hc, 3).Get(context.Background(), "o-3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.Status != StatusRejected || o.Quantity.String() != "0.5" || o.Price != nil || o.Currency != tosstypes.CurrencyUSD {
+		t.Errorf("order = %+v", o)
+	}
+	if o.Execution.FilledQuantity.String() != "0" || o.Execution.AverageFilledPrice != nil || o.Execution.FilledAmount != nil {
+		t.Errorf("execution = %+v", o.Execution)
+	}
+	if o.Execution.Commission != nil || o.Execution.Tax != nil || o.Execution.FilledAt != nil || o.Execution.SettlementDate != nil {
+		t.Errorf("execution nulls = %+v", o.Execution)
+	}
+}
+
 func TestBuyingPower(t *testing.T) {
 	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/buying-power", Query: url.Values{"currency": {"KRW"}}}, "3", 200, testutil.Fixture(t, "buying_power.json"))
 	defer done()
@@ -1432,13 +1480,14 @@ func TestZeroAccountSeq(t *testing.T) {
 	if _, err := c.Commissions(ctx); err == nil {
 		t.Error("Commissions: want error for accountSeq=0")
 	}
-	if _, err := c.Place(ctx, Request{Symbol: "005930", Side: SideBuy, OrderType: TypeLimit, Quantity: d("10"), Price: d("70000")}); err == nil {
+	if _, err := c.Place(ctx, PlaceRequest{Symbol: "005930", Side: SideBuy, OrderType: TypeLimit, Quantity: d("10"), Price: d("70000")}); err == nil {
 		t.Error("Place: want error for accountSeq=0")
 	}
 	if _, err := c.PlaceAmount(ctx, AmountRequest{Symbol: "AAPL", Side: SideBuy, OrderAmount: d("100")}); err == nil {
 		t.Error("PlaceAmount: want error for accountSeq=0")
 	}
-	if _, err := c.Modify(ctx, "o-1", ModifyRequest{OrderType: TypeLimit, Price: d("71000"), Quantity: d("5")}); err == nil {
+	price, qty := d("71000"), d("5")
+	if _, err := c.Modify(ctx, "o-1", ModifyRequest{OrderType: TypeLimit, Price: &price, Quantity: &qty}); err == nil {
 		t.Error("Modify: want error for accountSeq=0")
 	}
 	if _, err := c.Cancel(ctx, "o-1"); err == nil {
@@ -1467,8 +1516,7 @@ func captureBody(t *testing.T, path, wantAccount string, respond []byte) (*Clien
 		if a := r.Header.Get("X-Tossinvest-Account"); a != wantAccount {
 			t.Errorf("account = %q, want %q", a, wantAccount)
 		}
-		b := make([]byte, r.ContentLength)
-		_, _ = r.Body.Read(b)
+		b, _ := io.ReadAll(r.Body)
 		got = string(b)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(respond)
@@ -1495,7 +1543,7 @@ func assertJSON(t *testing.T, got, want string) {
 func TestPlace_LimitBuy(t *testing.T) {
 	c, body, done := captureBody(t, "/api/v1/orders", "3", []byte(`{"result":{"orderId":"o-9","clientOrderId":"k1"}}`))
 	defer done()
-	res, err := c.Place(context.Background(), Request{
+	res, err := c.Place(context.Background(), PlaceRequest{
 		Symbol: "005930", Side: SideBuy, OrderType: TypeLimit,
 		Quantity: d("10"), Price: d("70000"), ClientOrderID: "k1",
 	})
@@ -1511,7 +1559,7 @@ func TestPlace_LimitBuy(t *testing.T) {
 func TestPlace_MarketSellOmitsPriceAndTIF(t *testing.T) {
 	c, body, done := captureBody(t, "/api/v1/orders", "3", []byte(`{"result":{"orderId":"o-10"}}`))
 	defer done()
-	if _, err := c.Place(context.Background(), Request{Symbol: "AAPL", Side: SideSell, OrderType: TypeMarket, Quantity: d("1.5")}); err != nil {
+	if _, err := c.Place(context.Background(), PlaceRequest{Symbol: "AAPL", Side: SideSell, OrderType: TypeMarket, Quantity: d("1.5")}); err != nil {
 		t.Fatal(err)
 	}
 	assertJSON(t, *body, `{"symbol":"AAPL","side":"SELL","orderType":"MARKET","quantity":"1.5"}`)
@@ -1520,7 +1568,7 @@ func TestPlace_MarketSellOmitsPriceAndTIF(t *testing.T) {
 func TestPlace_TimeInForceAndConfirm(t *testing.T) {
 	c, body, done := captureBody(t, "/api/v1/orders", "3", []byte(`{"result":{"orderId":"o-11"}}`))
 	defer done()
-	if _, err := c.Place(context.Background(), Request{
+	if _, err := c.Place(context.Background(), PlaceRequest{
 		Symbol: "AAPL", Side: SideBuy, OrderType: TypeLimit, Quantity: d("1"), Price: d("200"),
 		TimeInForce: TimeInForceClose, ConfirmHighValue: true,
 	}); err != nil {
@@ -1542,15 +1590,16 @@ func TestPlaceAmount(t *testing.T) {
 func TestPlace_Validation(t *testing.T) {
 	c := New(nil, 3) // nil client: 검증이 요청 전에 실패해야 한다
 	ctx := context.Background()
-	cases := map[string]Request{
-		"empty symbol":   {Side: SideBuy, OrderType: TypeLimit, Quantity: d("1"), Price: d("1")},
-		"bad symbol":     {Symbol: "삼성", Side: SideBuy, OrderType: TypeLimit, Quantity: d("1"), Price: d("1")},
-		"empty side":     {Symbol: "005930", OrderType: TypeLimit, Quantity: d("1"), Price: d("1")},
-		"empty type":     {Symbol: "005930", Side: SideBuy, Quantity: d("1"), Price: d("1")},
-		"zero quantity":  {Symbol: "005930", Side: SideBuy, OrderType: TypeLimit, Price: d("1")},
-		"neg quantity":   {Symbol: "005930", Side: SideBuy, OrderType: TypeLimit, Quantity: d("-1"), Price: d("1")},
-		"limit no price": {Symbol: "005930", Side: SideBuy, OrderType: TypeLimit, Quantity: d("1")},
-		"bad key":        {Symbol: "005930", Side: SideBuy, OrderType: TypeLimit, Quantity: d("1"), Price: d("1"), ClientOrderID: "has space"},
+	cases := map[string]PlaceRequest{
+		"empty symbol":      {Side: SideBuy, OrderType: TypeLimit, Quantity: d("1"), Price: d("1")},
+		"bad symbol":        {Symbol: "삼성", Side: SideBuy, OrderType: TypeLimit, Quantity: d("1"), Price: d("1")},
+		"empty side":        {Symbol: "005930", OrderType: TypeLimit, Quantity: d("1"), Price: d("1")},
+		"empty type":        {Symbol: "005930", Side: SideBuy, Quantity: d("1"), Price: d("1")},
+		"zero quantity":     {Symbol: "005930", Side: SideBuy, OrderType: TypeLimit, Price: d("1")},
+		"neg quantity":      {Symbol: "005930", Side: SideBuy, OrderType: TypeLimit, Quantity: d("-1"), Price: d("1")},
+		"limit no price":    {Symbol: "005930", Side: SideBuy, OrderType: TypeLimit, Quantity: d("1")},
+		"bad key":           {Symbol: "005930", Side: SideBuy, OrderType: TypeLimit, Quantity: d("1"), Price: d("1"), ClientOrderID: "has space"},
+		"market with price": {Symbol: "005930", Side: SideBuy, OrderType: TypeMarket, Quantity: d("1"), Price: d("70000")},
 	}
 	for name, r := range cases {
 		if _, err := c.Place(ctx, r); err == nil {
@@ -1565,7 +1614,8 @@ func TestPlace_Validation(t *testing.T) {
 func TestModify(t *testing.T) {
 	c, body, done := captureBody(t, "/api/v1/orders/o-1/modify", "3", []byte(`{"result":{"orderId":"o-1"}}`))
 	defer done()
-	res, err := c.Modify(context.Background(), "o-1", ModifyRequest{OrderType: TypeLimit, Price: d("71000"), Quantity: d("5")})
+	price, qty := d("71000"), d("5")
+	res, err := c.Modify(context.Background(), "o-1", ModifyRequest{OrderType: TypeLimit, Price: &price, Quantity: &qty})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1577,11 +1627,29 @@ func TestModify(t *testing.T) {
 
 func TestModify_Validation(t *testing.T) {
 	c := New(nil, 3)
-	if _, err := c.Modify(context.Background(), "", ModifyRequest{OrderType: TypeLimit}); err == nil {
+	ctx := context.Background()
+	if _, err := c.Modify(ctx, "", ModifyRequest{OrderType: TypeLimit}); err == nil {
 		t.Error("empty orderId: want error")
 	}
-	if _, err := c.Modify(context.Background(), "o-1", ModifyRequest{}); err == nil {
+	if _, err := c.Modify(ctx, "o-1", ModifyRequest{}); err == nil {
 		t.Error("empty orderType: want error")
+	}
+
+	price, qtyZero, qtyFrac, qtyNeg := d("71000"), d("0"), d("1.5"), d("-1")
+	if _, err := c.Modify(ctx, "o-1", ModifyRequest{OrderType: TypeLimit}); err == nil {
+		t.Error("LIMIT with nil price: want error")
+	}
+	if _, err := c.Modify(ctx, "o-1", ModifyRequest{OrderType: TypeMarket, Price: &price}); err == nil {
+		t.Error("MARKET with price set: want error")
+	}
+	if _, err := c.Modify(ctx, "o-1", ModifyRequest{OrderType: TypeLimit, Price: &price, Quantity: &qtyZero}); err == nil {
+		t.Error("quantity 0: want error")
+	}
+	if _, err := c.Modify(ctx, "o-1", ModifyRequest{OrderType: TypeLimit, Price: &price, Quantity: &qtyFrac}); err == nil {
+		t.Error("fractional quantity: want error")
+	}
+	if _, err := c.Modify(ctx, "o-1", ModifyRequest{OrderType: TypeLimit, Price: &price, Quantity: &qtyNeg}); err == nil {
+		t.Error("negative quantity: want error")
 	}
 }
 
@@ -1601,6 +1669,85 @@ func TestCancel(t *testing.T) {
 func TestCancel_RequiresID(t *testing.T) {
 	if _, err := New(nil, 3).Cancel(context.Background(), ""); err == nil {
 		t.Error("want error")
+	}
+}
+
+// --- 중복 주문 방지 불변식 ---
+
+// countingUnauthorized 는 항상 401 invalid-token 을 돌려주며 요청 수를 센다.
+func countingUnauthorized(t *testing.T) (*Client, *int32, func()) {
+	t.Helper()
+	var n int32
+	hc, done := testutil.NewServerFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&n, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(401)
+		_, _ = w.Write([]byte(`{"error":{"requestId":"r","code":"invalid-token","message":""}}`))
+	})
+	return New(hc, 3), &n, done
+}
+
+func TestWrites_WithoutKeyAreNeverRetried(t *testing.T) {
+	// 멱등성 키 없는 쓰기는 401 이어도 절대 재전송되지 않는다 — 중복 주문 방지의 핵심 불변식
+	ctx := context.Background()
+	for name, call := range map[string]func(c *Client) error{
+		"Place": func(c *Client) error {
+			_, err := c.Place(ctx, PlaceRequest{Symbol: "005930", Side: SideBuy, OrderType: TypeMarket, Quantity: d("1")})
+			return err
+		},
+		"PlaceAmount": func(c *Client) error {
+			_, err := c.PlaceAmount(ctx, AmountRequest{Symbol: "AAPL", Side: SideBuy, OrderAmount: d("10")})
+			return err
+		},
+		"Modify": func(c *Client) error {
+			q := d("1")
+			p := d("100")
+			_, err := c.Modify(ctx, "o-1", ModifyRequest{OrderType: TypeLimit, Quantity: &q, Price: &p})
+			return err
+		},
+		"Cancel": func(c *Client) error { _, err := c.Cancel(ctx, "o-1"); return err },
+	} {
+		c, n, done := countingUnauthorized(t)
+		if err := call(c); err == nil {
+			t.Errorf("%s: want error", name)
+		}
+		if got := atomic.LoadInt32(n); got != 1 {
+			t.Errorf("%s: %d requests, want exactly 1 (재시도 금지)", name, got)
+		}
+		done()
+	}
+}
+
+func TestPlace_WithKeyRetriesAndResendsSameKey(t *testing.T) {
+	// 키가 있으면 1회 재시도하되, 두 요청의 clientOrderId 가 같아야 서버가 중복을 제거할 수 있다
+	var n int32
+	var keys []string
+	var mu sync.Mutex
+	hc, done := testutil.NewServerFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var body struct {
+			ClientOrderID string `json:"clientOrderId"`
+		}
+		_ = json.Unmarshal(b, &body)
+		mu.Lock()
+		keys = append(keys, body.ClientOrderID)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if atomic.AddInt32(&n, 1) == 1 {
+			w.WriteHeader(401)
+			_, _ = w.Write([]byte(`{"error":{"requestId":"r","code":"expired-token","message":""}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"result":{"orderId":"o-1","clientOrderId":"k9"}}`))
+	})
+	defer done()
+	if _, err := New(hc, 3).Place(context.Background(), PlaceRequest{Symbol: "005930", Side: SideBuy, OrderType: TypeMarket, Quantity: d("1"), ClientOrderID: "k9"}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keys) != 2 || keys[0] != "k9" || keys[1] != "k9" {
+		t.Errorf("clientOrderId per attempt = %q, want [k9 k9]", keys)
 	}
 }
 EOF
@@ -1625,12 +1772,29 @@ func NewServerFunc(t *testing.T, h http.HandlerFunc) (*httpclient.Client, func()
 
 **계좌 검증**: `order` 의 모든 메서드는 다른 검증보다 먼저 `params.AccountSeq(c.accountSeq)` 를 확인한다
 (asset 패키지 컨벤션과 동일 — accountSeq <= 0 이면 계좌 헤더 없이 요청이 나가 서버가
-`account-header-required` 를 돌려주므로 요청 전에 막는다). 파라미터 구조체는 값으로 받는다(포인터 아님).
+`account-header-required` 를 돌려주므로 요청 전에 막는다). 파라미터 구조체는 값으로 받는다(포인터 아님) —
+단, `ModifyRequest.Quantity`/`Price` 는 예외로 포인터다(아래 참고).
 
 **에러 코드 보정**: 계획 초안의 `대표 에러:` 주석 중 `docs/api/openapi.json` 에 실제로 존재하지 않는
 문자열을 실제 코드로 교정했다 — `invalid-tick-size`/`amount-us-market-only` → `invalid-request`
 (둘 다 스펙상 400 `invalid-request` 로 뭉뚱그려진다), `unsupported-currency` → `invalid-request`
-(스펙 예시 키는 `unsupportedCurrency` 지만 `code` 필드는 `invalid-request`).
+(스펙 예시 키는 `unsupportedCurrency` 지만 `code` 필드는 `invalid-request`). `idempotency-key-conflict`
+는 실재가 확인되어 `Place`/`PlaceAmount` 대표 에러 목록에 추가했다.
+
+**코드 리뷰 반영(Critical/Important)**:
+- `Place`: `MARKET` 주문에 `Price` 를 지정하면 조용히 버리지 않고 요청 전에 거부한다
+  (openapi: `MARKET` 에 `price` 전달 시 서버가 `400 invalid-request`로 거부 — 가격을 버리고
+  시장가로 체결시키는 쪽이 서버보다 위험하다).
+- `ModifyRequest.Quantity`/`Price` 를 `*decimal.Decimal` 로 바꿨다 — 값 `0` 과 "미전송" 을 구분하기
+  위해서다. `Quantity` 는 양의 정수(`IsInteger`)인지도 사전 검증하고, `OrderType` 에 따라 `LIMIT` 이면
+  `Price` 필수·`MARKET` 이면 `Price` 는 반드시 `nil` 이어야 한다.
+- `order.Request` → `order.PlaceRequest` 로 이름을 바꿨다(conditionalorder 가 두 번째 `Request` 를
+  만들기 전에 지금이 가장 싸다).
+- `order_test.go` 에 중복 주문 방지 불변식 테스트를 추가했다: 멱등성 키 없는 쓰기 4종(Place/
+  PlaceAmount/Modify/Cancel)은 401 이어도 정확히 1회만 요청되고, 키 있는 `Place` 는 401 에 1회
+  재시도하되 두 시도가 같은 `clientOrderId` 를 보낸다.
+- `captureBody` 의 바디 읽기를 `r.Body.Read(make([]byte, r.ContentLength))` 에서 `io.ReadAll(r.Body)`
+  로 바꿔 안정화했다(짧은 읽기로 바디가 잘릴 수 있는 문제).
 
 ```bash
 mkdir -p order && cat > order/client.go << 'EOF'
@@ -1640,8 +1804,9 @@ mkdir -p order && cat > order/client.go << 'EOF'
 // 주문은 실제 체결로 이어진다. SDK 는 요청 조립 오류(필수 누락·형식)만 사전 검증하고,
 // 호가단위·잔고·거래시간 같은 상태 의존 규칙은 서버가 판단한다 — 에러는 *toss.APIError 로 온다.
 //
-// 멱등성: Request.ClientOrderID 를 채우면 (1) 같은 값으로 재요청 시 토스가 이전 주문 결과를
+// 멱등성: PlaceRequest.ClientOrderID 를 채우면 (1) 같은 값으로 재요청 시 토스가 이전 주문 결과를
 // 그대로 돌려주고(10분), (2) SDK 가 401 토큰 오류에 1회 재시도한다. 키가 없으면 재시도하지 않는다.
+// 같은 키로 내용이 다른 요청을 보내면 400 idempotency-key-conflict 를 받는다.
 package order
 
 import "github.com/kenshin579/toss-go/internal/httpclient"
@@ -1780,13 +1945,13 @@ import (
 	"github.com/kenshin579/toss-go/internal/params"
 )
 
-// Request 는 수량 기준 주문 생성 요청.
-type Request struct {
+// PlaceRequest 는 수량 기준 주문 생성 요청.
+type PlaceRequest struct {
 	Symbol           string          // 필수
 	Side             Side            // 필수
 	OrderType        Type            // 필수
 	Quantity         decimal.Decimal // 필수. 소수점 수량은 미국 주식 시장가 매도 전용이며 정규장 종료 1시간 전까지만 접수된다
-	Price            decimal.Decimal // LIMIT 이면 필수, MARKET 이면 무시(전송하지 않음)
+	Price            decimal.Decimal // LIMIT 이면 필수. MARKET 이면 반드시 zero(전달하면 400 invalid-request)
 	TimeInForce      TimeInForce     // 비우면 서버 기본값 DAY
 	ClientOrderID    string          // 멱등성 키(10분). 설정하면 401 토큰 오류에 1회 재시도한다
 	ConfirmHighValue bool            // 1억원 이상 주문에 true 가 아니면 400 confirm-high-value-required
@@ -1817,8 +1982,8 @@ type placeBody struct {
 // Place 는 수량 기준 주문을 생성한다(POST /api/v1/orders).
 //
 // 대표 에러: insufficient-buying-power, order-hours-closed, invalid-request, price-out-of-range,
-// stock-restricted, confirm-high-value-required, request-in-progress.
-func (c *Client) Place(ctx context.Context, r Request) (*PlaceResult, error) {
+// stock-restricted, confirm-high-value-required, request-in-progress, idempotency-key-conflict.
+func (c *Client) Place(ctx context.Context, r PlaceRequest) (*PlaceResult, error) {
 	if err := params.AccountSeq(c.accountSeq); err != nil {
 		return nil, err
 	}
@@ -1837,6 +2002,9 @@ func (c *Client) Place(ctx context.Context, r Request) (*PlaceResult, error) {
 	if r.OrderType == TypeLimit && !r.Price.IsPositive() {
 		return nil, fmt.Errorf("toss: price is required for LIMIT orders (got %s)", r.Price)
 	}
+	if r.OrderType == TypeMarket && !r.Price.IsZero() {
+		return nil, fmt.Errorf("toss: price must not be set for MARKET orders (got %s)", r.Price)
+	}
 	if err := validateKey(r.ClientOrderID); err != nil {
 		return nil, err
 	}
@@ -1845,7 +2013,7 @@ func (c *Client) Place(ctx context.Context, r Request) (*PlaceResult, error) {
 		Quantity: r.Quantity.String(), TimeInForce: string(r.TimeInForce),
 		ClientOrderID: r.ClientOrderID, ConfirmHighValueOrder: r.ConfirmHighValue,
 	}
-	if r.OrderType == TypeLimit {
+	if !r.Price.IsZero() {
 		body.Price = r.Price.String()
 	}
 	return fetch.PostOne[PlaceResult](ctx, c.http, "/api/v1/orders", body, c.accountSeq, r.ClientOrderID)
@@ -1855,7 +2023,8 @@ func (c *Client) Place(ctx context.Context, r Request) (*PlaceResult, error) {
 // orderType 은 SDK 가 MARKET 으로 채운다.
 //
 // 대표 에러: invalid-request(미국 시장가 외 요청 등), amount-order-outside-regular-hours,
-// insufficient-buying-power, max-order-amount-exceeded, confirm-high-value-required.
+// insufficient-buying-power, max-order-amount-exceeded, confirm-high-value-required,
+// idempotency-key-conflict.
 func (c *Client) PlaceAmount(ctx context.Context, r AmountRequest) (*PlaceResult, error) {
 	if err := params.AccountSeq(c.accountSeq); err != nil {
 		return nil, err
@@ -1887,6 +2056,7 @@ package order
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/url"
 
 	"github.com/shopspring/decimal"
@@ -1916,12 +2086,14 @@ func validateKey(id string) error {
 }
 
 // ModifyRequest 는 주문 정정 요청.
+// Quantity/Price 는 nil 이면 전송하지 않는다 — 값 0 과 "미전송" 을 구분하기 위해 포인터다.
 // 국내 주식은 Quantity 가 필수(양의 정수)이고, 미국 주식은 Quantity 를 보낼 수 없다
-// (보내면 400 us-modify-quantity-not-supported) — 가격만 정정할 수 있다.
+// (보내면 400 us-modify-quantity-not-supported) — 가격만 정정할 수 있다. SDK 는 시장을 알 수 없으므로
+// 이 규칙은 서버가 판단한다.
 type ModifyRequest struct {
-	OrderType        Type            // 필수
-	Quantity         decimal.Decimal // 국내 필수, 미국은 0(미전송)
-	Price            decimal.Decimal // 0 이면 미전송
+	OrderType        Type             // 필수
+	Quantity         *decimal.Decimal // 국내 필수(양의 정수). 미국은 nil
+	Price            *decimal.Decimal // LIMIT 필수, MARKET 은 nil 이어야 한다
 	ConfirmHighValue bool
 }
 
@@ -1947,11 +2119,29 @@ func (c *Client) Modify(ctx context.Context, orderID string, r ModifyRequest) (*
 	if r.OrderType == "" {
 		return nil, errors.New("toss: orderType is required")
 	}
+	if r.Quantity != nil {
+		if !r.Quantity.IsPositive() {
+			return nil, fmt.Errorf("toss: quantity must be positive (got %s)", r.Quantity)
+		}
+		if !r.Quantity.IsInteger() {
+			return nil, fmt.Errorf("toss: quantity must be an integer (got %s)", r.Quantity)
+		}
+	}
+	switch r.OrderType {
+	case TypeLimit:
+		if r.Price == nil || !r.Price.IsPositive() {
+			return nil, errors.New("toss: price is required for LIMIT orders")
+		}
+	case TypeMarket:
+		if r.Price != nil {
+			return nil, fmt.Errorf("toss: price must not be set for MARKET orders (got %s)", r.Price)
+		}
+	}
 	body := modifyBody{OrderType: r.OrderType, ConfirmHighValueOrder: r.ConfirmHighValue}
-	if r.Quantity.IsPositive() {
+	if r.Quantity != nil {
 		body.Quantity = r.Quantity.String()
 	}
-	if r.Price.IsPositive() {
+	if r.Price != nil {
 		body.Price = r.Price.String()
 	}
 	return fetch.PostOne[OperationResult](ctx, c.http, "/api/v1/orders/"+url.PathEscape(orderID)+"/modify", body, c.accountSeq, "")
@@ -1991,7 +2181,7 @@ type ListParams struct {
 	From   tosstypes.Date // 주문 생성일(orderedAt, KST) 기준 시작일(inclusive)
 	To     tosstypes.Date // 주문 생성일 기준 종료일(inclusive)
 	Cursor string         // 이전 응답의 NextCursor
-	Limit  int            // 최대 100, 0 이면 서버 기본값(20)
+	Limit  int            // 최대 100, 0 이면 서버 기본값(20). Status 가 OPEN 이면 무시되고 전량 반환된다
 }
 
 // List 는 주문 목록을 조회한다(GET /api/v1/orders).
@@ -2098,7 +2288,7 @@ EOF
 ```bash
 gofmt -w . && go vet ./... && go test ./order/ . -race -v 2>&1 | grep -cE '^--- PASS'
 ```
-Expected: order 20 + 루트 13 = `33` (실행 결과로 확인하고 모두 PASS 인지만 본다).
+Expected: order 24 + 루트 13 = `37` (실행 결과로 확인하고 모두 PASS 인지만 본다).
 
 - [x] **Step 5: 커밋**
 
@@ -2107,6 +2297,8 @@ git add order account.go internal/testutil && git commit -m "feat(order): 주문
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
+
+(리뷰 반영 커밋은 별도로 `fix(order): ...` 로 이어졌다 — 위 Critical/Important 항목 참고.)
 
 ---
 
@@ -2242,7 +2434,7 @@ func assertJSON(t *testing.T, got, want string) {
 func TestPlace_Single(t *testing.T) {
 	c, body, done := captureBody(t, "/api/v1/conditional-orders", http.MethodPost, "4", 200, []byte(`{"result":{"conditionalOrderId":"c-9","clientOrderId":"k1"}}`))
 	defer done()
-	res, err := c.Place(context.Background(), Request{
+	res, err := c.Place(context.Background(), PlaceRequest{
 		Symbol: "005930", Type: TypeSingle, Quantity: d("10"), OrderType: OrderTypeLimit,
 		ExpireDate: "2026-12-31", ClientOrderID: "k1",
 		First: Condition{OrderSide: SideSell, TriggerPrice: d("65000"), OrderPrice: d("64900")},
@@ -2260,7 +2452,7 @@ func TestPlace_OCOWithSecond(t *testing.T) {
 	c, body, done := captureBody(t, "/api/v1/conditional-orders", http.MethodPost, "4", 200, []byte(`{"result":{"conditionalOrderId":"c-10"}}`))
 	defer done()
 	second := Condition{OrderSide: SideSell, TriggerPrice: d("80000")}
-	if _, err := c.Place(context.Background(), Request{
+	if _, err := c.Place(context.Background(), PlaceRequest{
 		Symbol: "005930", Type: TypeOCO, Quantity: d("5"), OrderType: OrderTypeMarket, ExpireDate: "2026-10-01",
 		First:  Condition{OrderSide: SideSell, TriggerPrice: d("60000")},
 		Second: &second,
@@ -2274,7 +2466,7 @@ func TestPlace_Validation(t *testing.T) {
 	c := New(nil, 4) // nil client: 검증이 요청 전에 실패해야 한다
 	ctx := context.Background()
 	ok := Condition{OrderSide: SideSell, TriggerPrice: d("1")}
-	cases := map[string]Request{
+	cases := map[string]PlaceRequest{
 		"empty symbol":  {Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
 		"empty type":    {Symbol: "005930", Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
 		"zero quantity": {Symbol: "005930", Type: TypeSingle, OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
@@ -2517,8 +2709,8 @@ func (c Condition) body() conditionBody {
 	return b
 }
 
-// Request 는 조건주문 생성 요청.
-type Request struct {
+// PlaceRequest 는 조건주문 생성 요청.
+type PlaceRequest struct {
 	Symbol           string          // 필수
 	Type             Type            // 필수. SINGLE/OCO/OTO
 	Quantity         decimal.Decimal // 필수
@@ -2584,7 +2776,7 @@ func validateCommon(symbol string, typ Type, qty decimal.Decimal, ot OrderType, 
 
 // Place 는 조건주문을 생성한다(POST /api/v1/conditional-orders).
 // 대표 에러: invalid-order-side, invalid-trigger-price, invalid-tick-size, stock-restricted.
-func (c *Client) Place(ctx context.Context, r Request) (*PlaceResult, error) {
+func (c *Client) Place(ctx context.Context, r PlaceRequest) (*PlaceResult, error) {
 	if err := validateCommon(r.Symbol, r.Type, r.Quantity, r.OrderType, r.ExpireDate, r.First); err != nil {
 		return nil, err
 	}

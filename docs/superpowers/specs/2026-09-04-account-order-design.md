@@ -98,7 +98,7 @@ a := c.Account(accts[0].AccountSeq)         // 네트워크 호출 없음, 헤�
 h, _ := a.Asset.Holdings(ctx, asset.HoldingsParams{Symbol: "005930"})
 bp, _ := a.Order.BuyingPower(ctx, tosstypes.CurrencyKRW)
 
-res, err := a.Order.Place(ctx, order.Request{
+res, err := a.Order.Place(ctx, order.PlaceRequest{
     Symbol: "005930", Side: order.SideBuy, OrderType: order.TypeLimit,
     Quantity: decimal.NewFromInt(1), Price: decimal.NewFromInt(70000),
     ClientOrderID: toss.NewClientOrderID(), // 멱등성 + 401 재시도 허용
@@ -165,7 +165,7 @@ func Send(ctx, hc, method, path string, q url.Values, body any, accountSeq int64
 |---|---|---|
 | 루트 | `Accounts(ctx) ([]Account, error)` | GET /accounts |
 | asset | `Holdings(ctx, HoldingsParams) (*Holdings, error)` — zero value 면 전체 | GET /holdings |
-| order | `Place(ctx, Request) (*PlaceResult, error)` | POST /orders |
+| order | `Place(ctx, PlaceRequest) (*PlaceResult, error)` | POST /orders |
 | order | `PlaceAmount(ctx, AmountRequest) (*PlaceResult, error)` | POST /orders |
 | order | `Modify(ctx, orderID string, ModifyRequest) (*OperationResult, error)` | POST /orders/{id}/modify |
 | order | `Cancel(ctx, orderID string) (*OperationResult, error)` | POST /orders/{id}/cancel |
@@ -174,7 +174,7 @@ func Send(ctx, hc, method, path string, q url.Values, body any, accountSeq int64
 | order | `BuyingPower(ctx, currency) (*BuyingPower, error)` | GET /buying-power |
 | order | `SellableQuantity(ctx, symbol string) (*SellableQuantity, error)` | GET /sellable-quantity |
 | order | `Commissions(ctx) ([]Commission, error)` | GET /commissions |
-| conditionalorder | `Place(ctx, Request) (*PlaceResult, error)` | POST /conditional-orders |
+| conditionalorder | `Place(ctx, PlaceRequest) (*PlaceResult, error)` | POST /conditional-orders |
 | conditionalorder | `Modify(ctx, id string, ModifyRequest) (*Result, error)` | POST /conditional-orders/{id}/modify |
 | conditionalorder | `Cancel(ctx, id string) error` | DELETE /conditional-orders/{id} (204) |
 | conditionalorder | `List(ctx, ListParams{Status, Symbol, Cursor, Limit}) (*Page, error)` | GET /conditional-orders |
@@ -190,13 +190,13 @@ func Send(ctx, hc, method, path string, q url.Values, body any, accountSeq int64
 ## 주문 요청 타입
 
 ```go
-// Request 는 수량 기준 주문(POST /api/v1/orders).
-type Request struct {
+// PlaceRequest 는 수량 기준 주문(POST /api/v1/orders).
+type PlaceRequest struct {
     Symbol           string          // 필수
     Side             Side            // 필수 BUY/SELL
     OrderType        Type            // 필수 LIMIT/MARKET
     Quantity         decimal.Decimal // 필수. 소수점은 US MARKET SELL 전용
-    Price            decimal.Decimal // LIMIT 필수, MARKET 은 생략
+    Price            decimal.Decimal // LIMIT 필수, MARKET 은 zero 여야 한다(전달 시 400 invalid-request)
     TimeInForce      TimeInForce     // 비우면 서버 기본 DAY
     ClientOrderID    string          // 멱등성 키(10분). 설정 시에만 401 재시도
     ConfirmHighValue bool            // 1억원 이상 주문에 필수
@@ -210,10 +210,21 @@ type AmountRequest struct {
     ClientOrderID    string
     ConfirmHighValue bool
 }
+
+// ModifyRequest 는 정정 요청(POST /api/v1/orders/{id}/modify). Quantity/Price 는
+// *decimal.Decimal — 값 0 과 "미전송" 을 구분해야 해서 포인터다.
+type ModifyRequest struct {
+    OrderType        Type             // 필수
+    Quantity         *decimal.Decimal // 국내 필수(양의 정수). 미국은 nil(전달 시 400 us-modify-quantity-not-supported)
+    Price            *decimal.Decimal // LIMIT 필수, MARKET 은 nil 이어야 한다
+    ConfirmHighValue bool
+}
 ```
 
 - 클라이언트 사전 검증은 **요청 조립 오류만** 한다: 필수 필드 누락, `LIMIT` 인데 `Price` 0,
-  `Quantity`/`OrderAmount` 0 이하, `ClientOrderID` 형식(36자·`^[A-Za-z0-9_-]+$`).
+  `MARKET` 인데 `Price` 설정(0 이 아님 — 서버가 400 `invalid-request` 로 거부하는 조합을 클라이언트가
+  조용히 버리지 않고 사전에 막는다), `Quantity`/`OrderAmount` 0 이하, 정정 `Quantity` 가 양의 정수가
+  아님(`IsInteger` 위반), `ClientOrderID` 형식(36자·`^[A-Za-z0-9_-]+$`).
   호가단위·잔고·거래시간 등 **상태 의존 규칙은 검증하지 않는다**(서버 권위).
 - `PlaceAmount` 는 `orderType=MARKET` 을 SDK 가 채운다(스키마상 유일값).
 
@@ -221,8 +232,8 @@ type AmountRequest struct {
 
 - 기존 `*toss.APIError` 와 `toss.IsCode` 를 그대로 쓴다. 새 타입 없음.
 - 각 메서드 godoc 에 **대표 에러 코드**를 적는다(전수 나열 금지, 상위 5~7개):
-  - `Place`: insufficient-buying-power, order-hours-closed, invalid-tick-size, price-out-of-range,
-    stock-restricted, confirm-high-value-required, request-in-progress
+  - `Place`: insufficient-buying-power, order-hours-closed, invalid-request, price-out-of-range,
+    stock-restricted, confirm-high-value-required, request-in-progress, idempotency-key-conflict
   - `Modify`/`Cancel`: already-filled, already-canceled, already-modified, already-processing,
     order-not-found, modify-restricted/cancel-restricted, order-hours-closed
   - 공통: account-header-required, account-not-found

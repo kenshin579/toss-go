@@ -16,7 +16,7 @@ type ListParams struct {
 	From   tosstypes.Date // 주문 생성일(orderedAt, KST) 기준 시작일(inclusive)
 	To     tosstypes.Date // 주문 생성일 기준 종료일(inclusive)
 	Cursor string         // 이전 응답의 NextCursor
-	Limit  int            // 최대 100, 0 이면 서버 기본값(20)
+	Limit  int            // 최대 100, 0 이면 서버 기본값(20). Status 가 OPEN 이면 무시되고 전량 반환된다
 }
 
 // List 는 주문 목록을 조회한다(GET /api/v1/orders).
