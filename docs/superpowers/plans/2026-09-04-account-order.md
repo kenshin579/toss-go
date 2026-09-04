@@ -1,0 +1,2644 @@
+# toss-go 계좌·주문 15 ops (v0.2.0) Implementation Plan
+
+> 내부 개발 문서(설계/실행 계획). 라이브러리 사용법은 [README](../../../README.md) 를 보세요.
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 계좌·자산 2, 주문 8, 조건주문 5 = 15 ops 를 추가하고 v0.2.0 으로 릴리스한다. SDK 의 첫 쓰기(write) 경로다.
+
+**Architecture:** `internal/httpclient` 에 `Do(ctx, Request)` 를 추가해 POST/DELETE·계좌 헤더·204·쓰기 재시도 정책을 담고, 기존 `Get` 은 그 위의 얇은 래퍼로 남긴다. 루트 `toss.Client` 에 `Accounts(ctx)`(헤더 불필요)와 `Account(seq) *AccountScope`(헤더 고정 핸들)를 추가하고, 스코프가 `asset`/`order`/`conditionalorder` 세 sub-client 를 보유한다. 주문 생성은 openapi 의 `oneOf` 를 메서드 2개(`Place` 수량 기준 / `PlaceAmount` 금액 기준 US 시장가 전용)로 갈라 타입으로 강제한다.
+
+**안전 원칙(전 태스크 공통):** **실주문을 내는 코드는 어디에도 두지 않는다.** integration 테스트는 조회 9개만 호출하고, 예시·문서의 주문 코드는 주석 처리한다. 쓰기 경로는 스텁 서버로만 검증한다.
+
+**Tech Stack:** Go 1.25, `shopspring/decimal`, 표준 `net/http`·`httptest`. 새 의존성 없음.
+
+**Spec:** `docs/superpowers/specs/2026-09-04-account-order-design.md`
+**Branch:** `feature/account-order` (스펙 커밋 완료: 51c38bc)
+**Base:** v0.1.0 (main 493ceb0) — `marketdata`/`stockinfo`/`marketinfo`/`ranking`/`indicators` 패턴을 그대로 따른다.
+
+---
+
+## 파일 구조
+
+| 경로 | 책임 |
+|---|---|
+| `internal/httpclient/client.go` | (수정) `Request`/`Do` — 메서드·바디·계좌 헤더·204·`Idempotent` 재시도 정책 |
+| `internal/fetch/fetch.go` | (수정) `One`/`List` 에 accountSeq 추가, `PostOne`/`Send` 신규 |
+| `tosstypes/types.go` | (수정) `AccountType` 4종 추가 |
+| `accounts.go` | (신규) 루트 `Account` 타입 + `Client.Accounts` |
+| `account.go` | (신규) `AccountScope` + `Client.Account(seq)` |
+| `clientorderid.go` (+`_test.go`) | (신규) `NewClientOrderID`, `ValidateClientOrderID` |
+| `codes.go` | (신규) 자주 쓰는 에러 코드 상수 |
+| `asset/` | `client.go`, `holdings.go`, `asset_test.go`, `testdata/` |
+| `order/` | `client.go`, `types.go`(열거·공용), `place.go`, `modify.go`, `history.go`, `info.go`, `order_test.go`, `testdata/` |
+| `conditionalorder/` | `client.go`, `types.go`, `place.go`, `history.go`, `conditionalorder_test.go`, `testdata/` |
+| `examples/order/main.go` | (신규) 조회 전용 예시 |
+| `integration_test.go` | (수정) 조회 9개 추가 |
+| `README.md` | (수정) 커버리지·계좌 스코프·주문 주의사항 |
+
+fixture 는 전부 `docs/api/openapi.json` 의 응답 예시에서 뽑는다(쓰기 계열은 2xx 예시가 없어 fixture 없이 요청 조립만 검증). 추출 헬퍼는 각 태스크에 있다. 커밋 메시지는 항상 아래 트레일러로 끝낸다:
+
+```
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+```
+
+---
+
+### Task 1: `internal/httpclient` — Request/Do (POST·DELETE·헤더·204·재시도 정책)
+
+**Files:**
+- Modify: `internal/httpclient/client.go`
+- Modify: `internal/httpclient/client_test.go`
+
+- [ ] **Step 1: 실패 테스트 추가** — 기존 테스트는 그대로 두고 아래를 파일 끝에 덧붙인다.
+
+```bash
+cat >> internal/httpclient/client_test.go << 'EOF'
+
+func TestDo_PostSendsBodyAndHeaders(t *testing.T) {
+	type reqBody struct {
+		Symbol string `json:"symbol"`
+	}
+	var got struct {
+		method, ct, acct, auth string
+		body                   string
+	}
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got.method, got.ct, got.acct, got.auth, got.body = r.Method, r.Header.Get("Content-Type"), r.Header.Get("X-Tossinvest-Account"), r.Header.Get("Authorization"), string(b)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"result":{"orderId":"o-1"}}`))
+	})
+	defer done()
+	var out struct {
+		OrderID string `json:"orderId"`
+	}
+	err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/api/v1/orders", Body: reqBody{Symbol: "005930"}, AccountSeq: 7, Out: &out})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.method != http.MethodPost || got.ct != "application/json" || got.acct != "7" || got.auth != "Bearer tok" {
+		t.Errorf("headers = %+v", got)
+	}
+	if got.body != `{"symbol":"005930"}` {
+		t.Errorf("body = %s", got.body)
+	}
+	if out.OrderID != "o-1" {
+		t.Errorf("out = %+v", out)
+	}
+}
+
+func TestDo_NoAccountHeaderWhenZero(t *testing.T) {
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := r.Header["X-Tossinvest-Account"]; ok {
+			t.Errorf("account header must be absent, got %q", r.Header.Get("X-Tossinvest-Account"))
+		}
+		_, _ = w.Write([]byte(`{"result":[]}`))
+	})
+	defer done()
+	var out []struct{}
+	if err := c.Do(context.Background(), Request{Method: http.MethodGet, Path: "/api/v1/accounts", Out: &out, Idempotent: true}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDo_NoContent(t *testing.T) {
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Errorf("method = %s", r.Method)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	defer done()
+	// Out 이 nil 이면 204 는 성공
+	if err := c.Do(context.Background(), Request{Method: http.MethodDelete, Path: "/api/v1/conditional-orders/c-1", AccountSeq: 1}); err != nil {
+		t.Fatalf("204 with nil Out: %v", err)
+	}
+}
+
+func TestDo_NoContentWithOutIsError(t *testing.T) {
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	defer done()
+	var out struct{ A int }
+	err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/x", Out: &out})
+	if err == nil || !strings.Contains(err.Error(), "no result") {
+		t.Errorf("want no-result error, got %v", err)
+	}
+}
+
+func TestDo_WriteWithoutIdempotencyDoesNotRetry(t *testing.T) {
+	var n int32
+	c, st, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&n, 1)
+		w.WriteHeader(401)
+		_, _ = w.Write([]byte(`{"error":{"requestId":"r","code":"expired-token","message":""}}`))
+	})
+	defer done()
+	err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/api/v1/orders", Body: map[string]string{"a": "b"}})
+	var ae *APIError
+	if !errors.As(err, &ae) || ae.Code != "expired-token" {
+		t.Fatalf("want expired-token, got %v", err)
+	}
+	// 멱등성 키가 없는 쓰기는 재시도하지 않는다(중복 주문 방지). 토큰은 무효화한다.
+	if atomic.LoadInt32(&n) != 1 || atomic.LoadInt32(&st.invalidated) != 1 {
+		t.Errorf("calls=%d invalidated=%d, want 1/1", atomic.LoadInt32(&n), atomic.LoadInt32(&st.invalidated))
+	}
+}
+
+func TestDo_IdempotentWriteRetriesOnce(t *testing.T) {
+	var n int32
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&n, 1) == 1 {
+			w.WriteHeader(401)
+			_, _ = w.Write([]byte(`{"error":{"requestId":"r","code":"expired-token","message":""}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"result":{"orderId":"o-2"}}`))
+	}, "tok1", "tok2")
+	defer done()
+	var out struct {
+		OrderID string `json:"orderId"`
+	}
+	if err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/api/v1/orders", Body: map[string]string{"a": "b"}, Idempotent: true, Out: &out}); err != nil {
+		t.Fatal(err)
+	}
+	if out.OrderID != "o-2" || atomic.LoadInt32(&n) != 2 {
+		t.Errorf("out=%+v calls=%d", out, atomic.LoadInt32(&n))
+	}
+}
+
+func TestDo_BodyIsResentOnRetry(t *testing.T) {
+	var bodies []string
+	var mu sync.Mutex
+	var n int32
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(b))
+		mu.Unlock()
+		if atomic.AddInt32(&n, 1) == 1 {
+			w.WriteHeader(401)
+			_, _ = w.Write([]byte(`{"error":{"requestId":"r","code":"expired-token","message":""}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"result":{"ok":true}}`))
+	}, "tok1", "tok2")
+	defer done()
+	var out struct {
+		OK bool `json:"ok"`
+	}
+	if err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/x", Body: map[string]string{"k": "v"}, Idempotent: true, Out: &out}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 || bodies[0] != bodies[1] || bodies[0] != `{"k":"v"}` {
+		t.Errorf("bodies = %q", bodies)
+	}
+}
+
+func TestGet_StillIdempotent(t *testing.T) {
+	var n int32
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&n, 1) == 1 {
+			w.WriteHeader(401)
+			_, _ = w.Write([]byte(`{"error":{"requestId":"r","code":"expired-token","message":""}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"result":{"ok":true}}`))
+	}, "tok1", "tok2")
+	defer done()
+	var out struct {
+		OK bool `json:"ok"`
+	}
+	if err := c.Get(context.Background(), "/x", nil, &out); err != nil || !out.OK {
+		t.Fatalf("GET must still retry: %+v %v", out, err)
+	}
+}
+EOF
+go test ./internal/httpclient/ 2>&1 | head -5
+```
+Expected: 컴파일 에러(`undefined: Request`, `c.Do`). `io`, `sync` import 가 없다면 함께 추가해야 한다(다음 스텝에서 처리).
+
+- [ ] **Step 2: 구현** — `client.go` 의 `Get`/`do` 를 `Request`/`Do` 기반으로 바꾼다.
+
+`internal/httpclient/client.go` 에서 `// Get 은 GET ...` 주석부터 `func isTokenError` 앞까지를 아래로 교체한다(Edit 도구로 정확히 치환):
+
+```go
+// Request 는 한 번의 HTTP 호출을 기술한다.
+type Request struct {
+	Method     string     // GET/POST/DELETE. 빈 값이면 GET
+	Path       string     // 예: /api/v1/orders
+	Query      url.Values // nil 가능
+	Body       any        // nil 이 아니면 JSON 으로 직렬화해 전송
+	AccountSeq int64      // 0 이 아니면 X-Tossinvest-Account 헤더
+	Idempotent bool       // true 면 401 토큰 오류에 1회 재시도. 쓰기는 멱등성 키가 있을 때만 true
+	Out        any        // nil 이면 응답 본문을 읽지 않는다(204 포함)
+}
+
+// Do 는 Request 를 실행하고 `result` 를 Out 으로 디코딩한다.
+// Out 이 nil 이면 본문을 버린다(204 정상). Out 이 nil 이 아닌데 본문이 없거나 result 가 null 이면 에러.
+// 4xx/5xx 는 *APIError. 401 이고 code 가 expired-token / invalid-token 이면 토큰을 무효화하고,
+// Idempotent 인 요청만 정확히 1회 재시도한다(멱등성 키 없는 쓰기의 중복 실행 방지).
+func (c *Client) Do(ctx context.Context, r Request) error {
+	if r.Method == "" {
+		r.Method = http.MethodGet
+	}
+	var payload []byte
+	if r.Body != nil {
+		b, err := json.Marshal(r.Body)
+		if err != nil {
+			return fmt.Errorf("toss: encode body %s: %w", r.Path, err)
+		}
+		payload = b
+	}
+	body, err := c.do(ctx, r, payload, false)
+	if err != nil {
+		return err
+	}
+	if r.Out == nil {
+		return nil
+	}
+	var env resultEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		return fmt.Errorf("toss: decode envelope %s: %w", r.Path, err)
+	}
+	if len(env.Result) == 0 || string(env.Result) == "null" {
+		return fmt.Errorf("toss: %s: response has no result", r.Path)
+	}
+	if err := json.Unmarshal(env.Result, r.Out); err != nil {
+		return fmt.Errorf("toss: decode result %s: %w", r.Path, err)
+	}
+	return nil
+}
+
+// Get 은 GET 조회 단축형이다. GET 은 항상 멱등이므로 401 재시도가 적용된다.
+func (c *Client) Get(ctx context.Context, path string, query url.Values, out any) error {
+	return c.Do(ctx, Request{Method: http.MethodGet, Path: path, Query: query, Out: out, Idempotent: true})
+}
+
+func (c *Client) do(ctx context.Context, r Request, payload []byte, retried bool) ([]byte, error) {
+	tok, err := c.tokens.Token(ctx)
+	if err != nil {
+		return nil, err
+	}
+	u := c.baseURL + r.Path
+	if len(r.Query) > 0 {
+		u += "?" + r.Query.Encode()
+	}
+	var reader io.Reader
+	if payload != nil {
+		reader = bytes.NewReader(payload) // 재시도 때 다시 읽을 수 있도록 매번 새 Reader
+	}
+	req, err := http.NewRequestWithContext(ctx, r.Method, u, reader)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Accept", "application/json")
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if r.AccountSeq != 0 {
+		req.Header.Set("X-Tossinvest-Account", strconv.FormatInt(r.AccountSeq, 10))
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("toss: %s %s: %w", r.Method, r.Path, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("toss: read %s: %w", r.Path, err)
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return body, nil
+	}
+
+	apiErr := parseError(resp, body)
+	if resp.StatusCode == http.StatusUnauthorized && isTokenError(apiErr.Code) {
+		// 서버가 거부한 토큰은 재시도 여부와 무관하게 캐시에서 제거한다(재시도 후 401 이어도 하루 동안 남지 않도록).
+		c.tokens.Invalidate(tok)
+		if !retried && r.Idempotent {
+			return c.do(ctx, r, payload, true)
+		}
+	}
+	return nil, apiErr
+}
+```
+
+import 에 `"bytes"` 를 추가한다. 테스트 파일에는 `"io"`, `"sync"` 를 추가한다(이미 있으면 생략).
+
+```bash
+cd /Users/user/src/workspace_moneyflow/toss-go && gofmt -w internal/httpclient && go vet ./internal/httpclient/ && go test ./internal/httpclient/ -race -v 2>&1 | grep -cE '^--- PASS'
+```
+Expected: `23` (기존 15 + 신규 8).
+
+- [ ] **Step 3: 커밋**
+
+```bash
+git add internal/httpclient && git commit -m "feat(httpclient): Request/Do — POST·DELETE, 계좌 헤더, 204, 멱등성 기반 쓰기 재시도
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 2: `internal/fetch` 확장 + `tosstypes.AccountType`
+
+**Files:**
+- Modify: `internal/fetch/fetch.go`, `internal/fetch/fetch_test.go`
+- Modify: `tosstypes/types.go`, `tosstypes/types_test.go`
+- Modify: 5개 그룹 패키지의 `fetch.One`/`fetch.List` 호출부(시그니처 변경 반영)
+
+- [ ] **Step 1: fetch 확장**
+
+```bash
+cd /Users/user/src/workspace_moneyflow/toss-go && cat > internal/fetch/fetch.go << 'EOF'
+// Package fetch 는 그룹 패키지가 공유하는 제네릭 요청 헬퍼다. 검증·쿼리 조립은 호출 측이 하고,
+// 여기서는 httpclient 호출과 결과 포인터/슬라이스 반환만 담당한다.
+package fetch
+
+import (
+	"context"
+	"net/http"
+	"net/url"
+
+	"github.com/kenshin579/toss-go/internal/httpclient"
+)
+
+// One 은 GET 으로 result 객체 하나를 *T 로 디코딩한다. accountSeq 가 0 이 아니면 계좌 헤더를 붙인다.
+func One[T any](ctx context.Context, hc *httpclient.Client, path string, q url.Values, accountSeq int64) (*T, error) {
+	var out T
+	if err := hc.Do(ctx, httpclient.Request{Method: http.MethodGet, Path: path, Query: q, AccountSeq: accountSeq, Idempotent: true, Out: &out}); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// List 는 GET 으로 result 배열을 []T 로 디코딩한다. 빈 배열은 nil 이 아닌 빈 슬라이스, 실패 시 nil 과 에러.
+func List[T any](ctx context.Context, hc *httpclient.Client, path string, q url.Values, accountSeq int64) ([]T, error) {
+	out := []T{}
+	if err := hc.Do(ctx, httpclient.Request{Method: http.MethodGet, Path: path, Query: q, AccountSeq: accountSeq, Idempotent: true, Out: &out}); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// PostOne 은 POST 로 body 를 보내고 result 를 *T 로 디코딩한다.
+// idempotent 는 멱등성 키(clientOrderId)가 있는 요청에만 true 여야 한다 — 401 재시도 허용 여부를 결정한다.
+func PostOne[T any](ctx context.Context, hc *httpclient.Client, path string, body any, accountSeq int64, idempotent bool) (*T, error) {
+	var out T
+	if err := hc.Do(ctx, httpclient.Request{Method: http.MethodPost, Path: path, Body: body, AccountSeq: accountSeq, Idempotent: idempotent, Out: &out}); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Send 는 응답 본문을 쓰지 않는 요청(예: DELETE 204)을 보낸다.
+func Send(ctx context.Context, hc *httpclient.Client, method, path string, body any, accountSeq int64) error {
+	return hc.Do(ctx, httpclient.Request{Method: method, Path: path, Body: body, AccountSeq: accountSeq})
+}
+EOF
+```
+
+- [ ] **Step 2: fetch 테스트 갱신 + 신규**
+
+기존 `fetch_test.go` 의 `One[item](ctx, hc, "/one", url.Values{...})` 호출에 `, 0` 을 추가하고(4곳), 아래를 파일 끝에 덧붙인다:
+
+```bash
+cat >> internal/fetch/fetch_test.go << 'EOF'
+
+func TestOne_SendsAccountHeader(t *testing.T) {
+	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/h"}, "9", 200, []byte(`{"result":{"symbol":"X"}}`))
+	defer done()
+	if _, err := One[item](context.Background(), hc, "/h", nil, 9); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPostOne(t *testing.T) {
+	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/p"}, "3", 200, []byte(`{"result":{"symbol":"P"}}`))
+	defer done()
+	got, err := PostOne[item](context.Background(), hc, "/p", map[string]string{"a": "b"}, 3, true)
+	if err != nil || got == nil || got.Symbol != "P" {
+		t.Fatalf("got %+v, %v", got, err)
+	}
+}
+
+func TestSend_NoContent(t *testing.T) {
+	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/d"}, "2", 204, nil)
+	defer done()
+	if err := Send(context.Background(), hc, http.MethodDelete, "/d", nil, 2); err != nil {
+		t.Fatal(err)
+	}
+}
+EOF
+```
+`net/http` import 를 테스트에 추가한다.
+
+- [ ] **Step 3: testutil 에 헤더 검증 서버 추가**
+
+`internal/testutil/server.go` 에 아래를 덧붙인다:
+
+```go
+// NewServerWithHeader 는 NewServer 와 같지만 X-Tossinvest-Account 헤더까지 검증한다.
+// wantAccount 가 빈 문자열이면 헤더가 없어야 한다.
+func NewServerWithHeader(t *testing.T, want Expect, wantAccount string, status int, body []byte) (*httpclient.Client, func()) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		checkRequest(t, r, want)
+		if got := r.Header.Get("X-Tossinvest-Account"); got != wantAccount {
+			t.Errorf("X-Tossinvest-Account = %q, want %q", got, wantAccount)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		if body != nil {
+			_, _ = w.Write(body)
+		}
+	}))
+	c := httpclient.New(httpclient.Config{BaseURL: srv.URL, HTTPClient: srv.Client(), Tokens: staticTokens{}})
+	return c, srv.Close
+}
+```
+그리고 기존 `NewServer` 의 핸들러 본문 중 경로·쿼리·Authorization 검증 부분을 `checkRequest(t, r, want)` 헬퍼로 추출해 둘이 공유하게 한다:
+
+```go
+func checkRequest(t *testing.T, r *http.Request, want Expect) {
+	t.Helper()
+	if r.URL.Path != want.Path {
+		t.Errorf("path = %q, want %q", r.URL.Path, want.Path)
+	}
+	got := r.URL.Query()
+	for k := range want.Query {
+		if got.Get(k) != want.Query.Get(k) {
+			t.Errorf("query %s = %q, want %q", k, got.Get(k), want.Query.Get(k))
+		}
+	}
+	for k := range got {
+		if _, ok := want.Query[k]; !ok {
+			t.Errorf("unexpected query %s=%q", k, got.Get(k))
+		}
+	}
+	if r.Header.Get("Authorization") != "Bearer test-token" {
+		t.Errorf("Authorization = %q", r.Header.Get("Authorization"))
+	}
+}
+```
+
+- [ ] **Step 4: 5개 그룹 패키지 호출부 갱신** — `fetch.One[...](ctx, c.http, path, q)` → `fetch.One[...](ctx, c.http, path, q, 0)`, `fetch.List` 동일. 기계적 치환:
+
+```bash
+cd /Users/user/src/workspace_moneyflow/toss-go && perl -pi -e 's/(fetch\.(?:One|List)\[[^\]]+\]\(ctx, (?:c\.http|hc), [^)]*?)\)/$1, 0)/g' marketdata/*.go stockinfo/*.go marketinfo/*.go ranking/*.go indicators/*.go && gofmt -w . && go build ./... && echo BUILD_OK
+```
+Expected: `BUILD_OK`. 실패하면 컴파일 에러 메시지의 파일을 열어 수동으로 `, 0` 을 추가한다(정규식이 다중행 호출을 놓칠 수 있다).
+
+- [ ] **Step 5: tosstypes.AccountType 추가**
+
+`tosstypes/types.go` 의 `Currency` 정의 바로 위에 추가:
+```go
+// AccountType 은 계좌 종류.
+type AccountType string
+
+const (
+	AccountTypeBrokerage            AccountType = "BROKERAGE"             // 위탁(주식)
+	AccountTypeOverseasDerivatives  AccountType = "OVERSEAS_DERIVATIVES"  // 해외파생
+	AccountTypePensionSavings       AccountType = "PENSION_SAVINGS"       // 연금저축
+	AccountTypeReshoringInvestment  AccountType = "RESHORING_INVESTMENT"  // 국내복귀기업 투자
+)
+```
+
+- [ ] **Step 6: 검증 + 커밋**
+
+```bash
+gofmt -l . ; go vet ./... && go test ./... -race -count=1 2>&1 | tail -14
+git add internal tosstypes marketdata stockinfo marketinfo ranking indicators && git commit -m "feat(fetch): 계좌 헤더·PostOne·Send 추가, AccountType 열거
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+Expected: 전 패키지 `ok`.
+
+---
+
+### Task 3: 루트 — `Account`/`Accounts`/`AccountScope`/`NewClientOrderID`/에러 코드 상수
+
+**Files:**
+- Create: `accounts.go`, `account.go`, `clientorderid.go`, `clientorderid_test.go`, `codes.go`, `account_test.go`
+- Create: `asset/client.go`, `asset/holdings.go`, `asset/asset_test.go`, `asset/testdata/holdings.json`
+- Modify: `client.go` (import 3개 추가는 Task 4·5 이후 — 이 태스크에서는 `asset` 만 연결)
+
+> 이 태스크는 스코프 뼈대 + 가장 단순한 그룹(`asset` 1 op)까지 만들어 구조를 먼저 검증한다.
+> `order`/`conditionalorder` 는 Task 4·5 에서 추가하며, 그때 `AccountScope` 에 필드를 덧붙인다.
+
+- [ ] **Step 1: fixture 추출**
+
+```bash
+mkdir -p asset/testdata && jq '.paths."/api/v1/holdings".get.responses."200".content."application/json".examples.withHoldings.value' docs/api/openapi.json > asset/testdata/holdings.json && jq '.paths."/api/v1/holdings".get.responses."200".content."application/json".examples.emptyHoldings.value' docs/api/openapi.json > asset/testdata/holdings_empty.json && jq -c '.result | {n:(.items|length), krw:.totalPurchaseAmount.krw}' asset/testdata/holdings.json && jq -c '.result | {n:(.items|length)}' asset/testdata/holdings_empty.json
+```
+Expected: `{"n":1,"krw":"6500000"}` 와 `{"n":0}`.
+
+- [ ] **Step 2: 실패 테스트 작성**
+
+```bash
+cat > clientorderid_test.go << 'EOF'
+package toss
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestNewClientOrderID(t *testing.T) {
+	seen := map[string]bool{}
+	for i := 0; i < 100; i++ {
+		id := NewClientOrderID()
+		if err := ValidateClientOrderID(id); err != nil {
+			t.Fatalf("generated id %q invalid: %v", id, err)
+		}
+		if seen[id] {
+			t.Fatalf("duplicate id %q", id)
+		}
+		seen[id] = true
+	}
+}
+
+func TestValidateClientOrderID(t *testing.T) {
+	for _, ok := range []string{"a", "A-b_C9", strings.Repeat("x", 36)} {
+		if err := ValidateClientOrderID(ok); err != nil {
+			t.Errorf("ValidateClientOrderID(%q) = %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", strings.Repeat("x", 37), "has space", "한글", "a.b", "a/b"} {
+		if err := ValidateClientOrderID(bad); err == nil {
+			t.Errorf("ValidateClientOrderID(%q) must fail", bad)
+		}
+	}
+}
+EOF
+cat > account_test.go << 'EOF'
+package toss
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+// 계좌 목록은 헤더 없이, 스코프 호출은 헤더와 함께 나가는지 end-to-end 로 확인한다.
+func TestAccountsAndScope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/oauth2/token":
+			_, _ = w.Write([]byte(`{"access_token":"T","token_type":"Bearer","expires_in":3600}`))
+		case "/api/v1/accounts":
+			if got := r.Header.Get("X-Tossinvest-Account"); got != "" {
+				t.Errorf("accounts must not send account header, got %q", got)
+			}
+			_, _ = w.Write([]byte(`{"result":[{"accountNo":"12345678901","accountSeq":7,"accountType":"BROKERAGE"}]}`))
+		case "/api/v1/holdings":
+			if got := r.Header.Get("X-Tossinvest-Account"); got != "7" {
+				t.Errorf("holdings account header = %q, want 7", got)
+			}
+			_, _ = w.Write([]byte(`{"result":{"totalPurchaseAmount":{"krw":"1"},"marketValue":{"amount":{"krw":"1"},"amountAfterCost":{"krw":"1"}},"profitLoss":{"amount":{"krw":"0"},"amountAfterCost":{"krw":"0"},"rate":"0","rateAfterCost":"0"},"dailyProfitLoss":{"amount":{"krw":"0"},"rate":"0"},"items":[]}}`))
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c, err := NewClient("i", "s", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	accts, err := c.Accounts(ctx)
+	if err != nil || len(accts) != 1 {
+		t.Fatalf("Accounts = %+v, %v", accts, err)
+	}
+	a := accts[0]
+	if a.AccountNo != "12345678901" || a.AccountSeq != 7 || a.AccountType != "BROKERAGE" {
+		t.Errorf("account = %+v", a)
+	}
+	scope := c.Account(a.AccountSeq)
+	if scope.Asset == nil {
+		t.Fatal("scope.Asset is nil")
+	}
+	if _, err := scope.Asset.Holdings(ctx, nil); err != nil {
+		t.Fatalf("Holdings: %v", err)
+	}
+}
+EOF
+cat > asset/asset_test.go << 'EOF'
+package asset
+
+import (
+	"context"
+	"testing"
+
+	"github.com/kenshin579/toss-go/internal/testutil"
+	"github.com/kenshin579/toss-go/tosstypes"
+)
+
+func TestHoldings(t *testing.T) {
+	// fixture = openapi 예시(withHoldings)
+	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/holdings"}, "5", 200, testutil.Fixture(t, "holdings.json"))
+	defer done()
+	h, err := New(hc, 5).Holdings(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.TotalPurchaseAmount.KRW.String() != "6500000" || h.TotalPurchaseAmount.USD == nil || h.TotalPurchaseAmount.USD.String() != "1553" {
+		t.Errorf("TotalPurchaseAmount = %+v", h.TotalPurchaseAmount)
+	}
+	if h.MarketValue.Amount.KRW.String() != "7200000" || h.ProfitLoss.Rate.String() != "0.1179" || h.DailyProfitLoss.Rate.String() != "0.0141" {
+		t.Errorf("overview = %+v", h)
+	}
+	if len(h.Items) != 1 {
+		t.Fatalf("items = %d", len(h.Items))
+	}
+	it := h.Items[0]
+	if it.Symbol != "005930" || it.Name != "삼성전자" || it.MarketCountry != tosstypes.MarketCountryKR || it.Currency != tosstypes.CurrencyKRW {
+		t.Errorf("item = %+v", it)
+	}
+	if it.Quantity.String() != "100" || it.LastPrice.String() != "72000" || it.AveragePurchasePrice.String() != "65000" {
+		t.Errorf("item numbers = %+v", it)
+	}
+	if it.MarketValue.PurchaseAmount.String() != "6500000" || it.ProfitLoss.RateAfterCost.String() != "0.0846" || it.Cost.Commission.String() != "14400" {
+		t.Errorf("item nested = %+v", it)
+	}
+	if it.Cost.Tax == nil || it.Cost.Tax.String() != "135600" {
+		t.Errorf("tax = %v", it.Cost.Tax)
+	}
+}
+
+func TestHoldings_Empty(t *testing.T) {
+	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/holdings"}, "5", 200, testutil.Fixture(t, "holdings_empty.json"))
+	defer done()
+	h, err := New(hc, 5).Holdings(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.Items) != 0 {
+		t.Errorf("items = %+v", h.Items)
+	}
+}
+
+func TestHoldings_SymbolFilter(t *testing.T) {
+	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/holdings", Query: url.Values{"symbol": {"005930"}}}, "5", 200, testutil.Fixture(t, "holdings.json"))
+	defer done()
+	if _, err := New(hc, 5).Holdings(context.Background(), &HoldingsParams{Symbol: "005930"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHoldings_InvalidSymbol(t *testing.T) {
+	if _, err := New(nil, 5).Holdings(context.Background(), &HoldingsParams{Symbol: "삼성"}); err == nil {
+		t.Error("want validation error")
+	}
+}
+EOF
+go test ./asset/ . 2>&1 | head -5
+```
+Expected: 컴파일 에러(`undefined: New`, `Accounts` 등). 테스트 파일에 `net/url` import 를 추가해야 한다(다음 스텝에서 함께).
+
+- [ ] **Step 3: 구현**
+
+```bash
+cat > clientorderid.go << 'EOF'
+package toss
+
+import (
+	"crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"regexp"
+	"strings"
+)
+
+// MaxClientOrderIDLen 은 clientOrderId 최대 길이(토스 규칙).
+const MaxClientOrderIDLen = 36
+
+var clientOrderIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// NewClientOrderID 는 멱등성 키로 쓸 새 clientOrderId 를 만든다(32자, URL-safe).
+//
+// 주문 생성/조건주문 생성에 이 값을 넣으면 (1) 같은 값으로 재요청할 때 토스가 이전 주문 결과를
+// 그대로 돌려주고(10분 유효), (2) SDK 가 401 토큰 오류에 요청을 1회 재시도한다.
+// 키가 없으면 SDK 는 쓰기 요청을 재시도하지 않는다 — 중복 주문을 만들지 않기 위해서다.
+func NewClientOrderID() string {
+	var b [24]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic("toss: crypto/rand failed: " + err.Error()) // 이 실패는 프로세스가 정상 동작할 수 없는 상태다
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:]) // 24바이트 → 32자
+}
+
+// ValidateClientOrderID 는 clientOrderId 형식을 검증한다(1~36자, 영숫자와 -, _).
+func ValidateClientOrderID(id string) error {
+	if id == "" {
+		return fmt.Errorf("toss: clientOrderId must not be empty")
+	}
+	if len(id) > MaxClientOrderIDLen {
+		return fmt.Errorf("toss: clientOrderId too long: %d chars (max %d)", len(id), MaxClientOrderIDLen)
+	}
+	if !clientOrderIDPattern.MatchString(id) {
+		return fmt.Errorf("toss: invalid clientOrderId %q (allowed: A-Z a-z 0-9 - _)", strings.TrimSpace(id))
+	}
+	return nil
+}
+EOF
+cat > accounts.go << 'EOF'
+package toss
+
+import (
+	"context"
+
+	"github.com/kenshin579/toss-go/tosstypes"
+)
+
+// Account 는 계좌 하나의 식별 정보.
+type Account struct {
+	AccountNo   string                `json:"accountNo"`   // 계좌번호
+	AccountSeq  int64                 `json:"accountSeq"`  // 계좌 일련번호. Client.Account 와 X-Tossinvest-Account 헤더에 쓴다
+	AccountType tosstypes.AccountType `json:"accountType"` // 계좌 종류
+}
+
+// Accounts 는 계좌 목록을 조회한다(GET /api/v1/accounts).
+// 계좌 헤더가 필요 없는 유일한 계좌 API 이며, 여기서 얻은 AccountSeq 로 Client.Account 를 만든다.
+// Rate limit 그룹 ACCOUNT(초당 1회)이므로 반복 호출하지 말고 결과를 재사용한다.
+func (c *Client) Accounts(ctx context.Context) ([]Account, error) {
+	return fetchList[Account](ctx, c, "/api/v1/accounts")
+}
+EOF
+cat > account.go << 'EOF'
+package toss
+
+import (
+	"context"
+
+	"github.com/kenshin579/toss-go/asset"
+	"github.com/kenshin579/toss-go/internal/fetch"
+)
+
+// AccountScope 는 특정 계좌(accountSeq)에 고정된 sub-client 묶음이다.
+// 이 아래의 모든 요청에는 X-Tossinvest-Account 헤더가 자동으로 실린다.
+// 여러 goroutine 에서 동시에 사용해도 안전하다.
+type AccountScope struct {
+	AccountSeq int64
+
+	Asset *asset.Client // 자산: 보유 주식
+}
+
+// Account 는 accountSeq 에 고정된 스코프를 만든다. 네트워크 호출은 없다.
+// accountSeq 는 Accounts 로 조회한다.
+//
+//	accts, _ := c.Accounts(ctx)
+//	a := c.Account(accts[0].AccountSeq)
+//	h, _ := a.Asset.Holdings(ctx, nil)
+func (c *Client) Account(accountSeq int64) *AccountScope {
+	return &AccountScope{
+		AccountSeq: accountSeq,
+		Asset:      asset.New(c.http, accountSeq),
+	}
+}
+
+// fetchList 는 루트에서 계좌 헤더 없이 목록을 조회한다.
+func fetchList[T any](ctx context.Context, c *Client, path string) ([]T, error) {
+	return fetch.List[T](ctx, c.http, path, nil, 0)
+}
+EOF
+```
+> `account.go` 는 `c.http` 를 쓴다. v0.1.0 에서 미사용이라 지웠던 필드를 되살려야 한다 —
+> `client.go` 의 `Client` 구조체에 `http *httpclient.Client` 를 추가하고 `NewClient` 의 반환 리터럴에
+> `http: h,` 를 넣는다. `account.go` 의 import 에서 `httpclient` 는 쓰지 않으므로 넣지 않는다.
+
+```bash
+cat > codes.go << 'EOF'
+package toss
+
+// 자주 마주치는 토스 에러 코드. IsCode 와 함께 쓴다.
+//
+//	if toss.IsCode(err, toss.CodeInsufficientBuyingPower) { ... }
+//
+// 토스는 코드를 예고 없이 추가할 수 있으므로 이 목록은 편의일 뿐 전수가 아니다.
+// 알 수 없는 코드도 그대로 *APIError.Code 에 담긴다.
+const (
+	CodeAccountHeaderRequired     = "account-header-required"
+	CodeAccountNotFound           = "account-not-found"
+	CodeAlreadyCanceled           = "already-canceled"
+	CodeAlreadyFilled             = "already-filled"
+	CodeConfirmHighValueRequired  = "confirm-high-value-required"
+	CodeInsufficientBuyingPower   = "insufficient-buying-power"
+	CodeOrderNotFound             = "order-not-found"
+	CodeOutsideOrderHours         = "outside-order-hours"
+	CodePriceOutOfRange           = "price-out-of-range"
+	CodeStockRestricted           = "stock-restricted"
+)
+EOF
+mkdir -p asset && cat > asset/client.go << 'EOF'
+// Package asset 은 토스 Open API 자산(Asset) 그룹 — 보유 주식.
+// toss.Client.Account(seq).Asset 으로 접근하며, 모든 요청에 계좌 헤더가 실린다.
+package asset
+
+import "github.com/kenshin579/toss-go/internal/httpclient"
+
+// Client 는 자산 sub-client. accountSeq 에 고정된다.
+type Client struct {
+	http       *httpclient.Client
+	accountSeq int64
+}
+
+// New 는 internal 용도 — toss.Client.Account 가 호출한다.
+func New(hc *httpclient.Client, accountSeq int64) *Client {
+	return &Client{http: hc, accountSeq: accountSeq}
+}
+EOF
+cat > asset/holdings.go << 'EOF'
+package asset
+
+import (
+	"context"
+	"net/url"
+
+	"github.com/shopspring/decimal"
+
+	"github.com/kenshin579/toss-go/internal/fetch"
+	"github.com/kenshin579/toss-go/internal/params"
+	"github.com/kenshin579/toss-go/tosstypes"
+)
+
+// Amount 는 원화·달러 동시 표기 금액. USD 는 국내 전용 계좌 등에서 nil 일 수 있다.
+type Amount struct {
+	KRW decimal.Decimal  `json:"krw"`
+	USD *decimal.Decimal `json:"usd"`
+}
+
+// OverviewMarketValue 는 계좌 전체 평가금액.
+type OverviewMarketValue struct {
+	Amount          Amount `json:"amount"`          // 평가금액
+	AmountAfterCost Amount `json:"amountAfterCost"` // 비용(수수료·세금) 차감 후 평가금액
+}
+
+// OverviewProfitLoss 는 계좌 전체 손익.
+type OverviewProfitLoss struct {
+	Amount          Amount          `json:"amount"`
+	AmountAfterCost Amount          `json:"amountAfterCost"`
+	Rate            decimal.Decimal `json:"rate"`          // 수익률(소수 비율, 0.1179 = 11.79%)
+	RateAfterCost   decimal.Decimal `json:"rateAfterCost"` // 비용 차감 후 수익률
+}
+
+// OverviewDailyProfitLoss 는 계좌 전체 일간 손익.
+type OverviewDailyProfitLoss struct {
+	Amount Amount          `json:"amount"`
+	Rate   decimal.Decimal `json:"rate"`
+}
+
+// MarketValue 는 종목별 평가금액.
+type MarketValue struct {
+	PurchaseAmount  decimal.Decimal `json:"purchaseAmount"`  // 매입금액
+	Amount          decimal.Decimal `json:"amount"`          // 평가금액
+	AmountAfterCost decimal.Decimal `json:"amountAfterCost"` // 비용 차감 후 평가금액
+}
+
+// ProfitLoss 는 종목별 손익.
+type ProfitLoss struct {
+	Amount          decimal.Decimal `json:"amount"`
+	AmountAfterCost decimal.Decimal `json:"amountAfterCost"`
+	Rate            decimal.Decimal `json:"rate"`
+	RateAfterCost   decimal.Decimal `json:"rateAfterCost"`
+}
+
+// DailyProfitLoss 는 종목별 일간 손익.
+type DailyProfitLoss struct {
+	Amount decimal.Decimal `json:"amount"`
+	Rate   decimal.Decimal `json:"rate"`
+}
+
+// Cost 는 매도 시 예상 비용. Tax 는 미국 주식 등 해당 없으면 nil.
+type Cost struct {
+	Commission decimal.Decimal  `json:"commission"`
+	Tax        *decimal.Decimal `json:"tax"`
+}
+
+// Item 은 보유 종목 1건.
+type Item struct {
+	Symbol               string                  `json:"symbol"`
+	Name                 string                  `json:"name"`
+	MarketCountry        tosstypes.MarketCountry `json:"marketCountry"`
+	Currency             tosstypes.Currency      `json:"currency"`
+	Quantity             decimal.Decimal         `json:"quantity"`
+	LastPrice            decimal.Decimal         `json:"lastPrice"`
+	AveragePurchasePrice decimal.Decimal         `json:"averagePurchasePrice"`
+	MarketValue          MarketValue             `json:"marketValue"`
+	ProfitLoss           ProfitLoss              `json:"profitLoss"`
+	DailyProfitLoss      DailyProfitLoss         `json:"dailyProfitLoss"`
+	Cost                 Cost                    `json:"cost"`
+}
+
+// Holdings 는 계좌 전체 요약과 보유 종목 목록.
+type Holdings struct {
+	TotalPurchaseAmount Amount                  `json:"totalPurchaseAmount"`
+	MarketValue         OverviewMarketValue     `json:"marketValue"`
+	ProfitLoss          OverviewProfitLoss      `json:"profitLoss"`
+	DailyProfitLoss     OverviewDailyProfitLoss `json:"dailyProfitLoss"`
+	Items               []Item                  `json:"items"`
+}
+
+// HoldingsParams 는 Holdings 의 선택 인자.
+type HoldingsParams struct {
+	Symbol string // 특정 종목만 조회. 비우면 전체
+}
+
+// Holdings 는 보유 주식을 조회한다(GET /api/v1/holdings). p 가 nil 이면 전체를 조회한다.
+// 보유하지 않은 종목을 지정하면 Items 가 빈 슬라이스로 돌아온다.
+func (c *Client) Holdings(ctx context.Context, p *HoldingsParams) (*Holdings, error) {
+	q := url.Values{}
+	if p != nil && p.Symbol != "" {
+		if err := params.Symbol(p.Symbol); err != nil {
+			return nil, err
+		}
+		q.Set("symbol", p.Symbol)
+	}
+	return fetch.One[Holdings](ctx, c.http, "/api/v1/holdings", q, c.accountSeq)
+}
+EOF
+gofmt -w . && go vet ./... && go test ./asset/ . -race -v 2>&1 | grep -cE '^--- PASS'
+```
+Expected: `13` (루트 8 기존 + `TestAccountsAndScope` + `TestNewClientOrderID` + `TestValidateClientOrderID` = 11, asset 4 → 합 15). **정확한 수는 실행 결과로 확인하고, 모두 PASS 인지만 본다.**
+
+- [ ] **Step 4: 커밋**
+
+```bash
+git add accounts.go account.go clientorderid.go clientorderid_test.go codes.go account_test.go client.go asset && git commit -m "feat(account): 계좌 목록·스코프 클라이언트·멱등성 키 + 보유 주식(asset)
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 4: `order` 패키지 (8 ops)
+
+**Files:**
+- Create: `order/client.go`, `order/types.go`, `order/place.go`, `order/modify.go`, `order/history.go`, `order/info.go`, `order/order_test.go`, `order/testdata/*.json`
+- Modify: `account.go` (`AccountScope.Order` 추가)
+
+- [ ] **Step 1: fixture 추출**
+
+```bash
+mkdir -p order/testdata && J=docs/api/openapi.json
+ex() { jq --arg p "$1" --arg k "$2" '.paths[$p].get.responses."200".content."application/json".examples[$k].value' "$J" > "order/testdata/$3.json"; }
+ex "/api/v1/orders" pendingMixed orders
+ex "/api/v1/orders" empty orders_empty
+ex "/api/v1/orders" completedWithNextPage orders_page
+ex "/api/v1/orders/{orderId}" krLimitFilled order_filled
+ex "/api/v1/orders/{orderId}" usMarketPartialFilled order_partial
+ex "/api/v1/orders/{orderId}" rejected order_rejected
+ex "/api/v1/buying-power" krw buying_power
+ex "/api/v1/sellable-quantity" kr sellable_quantity
+ex "/api/v1/commissions" standard commissions
+for f in order/testdata/*.json; do printf "%-40s " "$f"; jq -c 'if .result|type=="array" then {n:(.result|length)} else (.result|keys|join(",")) end' "$f"; done
+```
+Expected: 9개 파일. `orders.json` 은 `orders,nextCursor,hasNext`, `order_filled.json` 은 `orderId,symbol,...`, `commissions.json` 은 `{"n":2}`.
+
+- [ ] **Step 2: 실패 테스트 작성**
+
+```bash
+cat > order/order_test.go << 'EOF'
+package order
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/url"
+	"testing"
+
+	"github.com/shopspring/decimal"
+
+	"github.com/kenshin579/toss-go/internal/testutil"
+	"github.com/kenshin579/toss-go/tosstypes"
+)
+
+func d(s string) decimal.Decimal { return decimal.RequireFromString(s) }
+
+// --- 조회 ---
+
+func TestList(t *testing.T) {
+	// fixture = openapi 예시(pendingMixed): 2건, hasNext=false
+	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/orders", Query: url.Values{"status": {"OPEN"}}}, "3", 200, testutil.Fixture(t, "orders.json"))
+	defer done()
+	page, err := New(hc, 3).List(context.Background(), ListParams{Status: StatusFilterOpen})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Orders) != 2 || page.HasNext || page.NextCursor != nil {
+		t.Fatalf("page = %+v", page)
+	}
+	o := page.Orders[0]
+	if o.OrderID == "" || o.Symbol != "005930" || o.Side != SideBuy || o.OrderType != TypeLimit || o.TimeInForce != TimeInForceDay || o.Status != StatusPending {
+		t.Errorf("order = %+v", o)
+	}
+	if o.Price == nil || o.Price.String() != "70000" || o.Quantity.String() != "10" || o.OrderAmount != nil || o.Currency != tosstypes.CurrencyKRW {
+		t.Errorf("order numbers = %+v", o)
+	}
+	if o.OrderedAt.IsZero() || o.CanceledAt != nil {
+		t.Errorf("times = %v %v", o.OrderedAt, o.CanceledAt)
+	}
+	if o.Execution.FilledQuantity.String() != "0" || o.Execution.AverageFilledPrice != nil || o.Execution.FilledAt != nil || o.Execution.SettlementDate != nil {
+		t.Errorf("execution = %+v", o.Execution)
+	}
+}
+
+func TestList_AllParams(t *testing.T) {
+	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/orders", Query: url.Values{
+		"status": {"CLOSED"}, "symbol": {"005930"}, "from": {"2026-09-01"}, "to": {"2026-09-04"}, "cursor": {"c1"}, "limit": {"50"},
+	}}, "3", 200, testutil.Fixture(t, "orders_empty.json"))
+	defer done()
+	page, err := New(hc, 3).List(context.Background(), ListParams{
+		Status: StatusFilterClosed, Symbol: "005930", From: "2026-09-01", To: "2026-09-04", Cursor: "c1", Limit: 50,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Orders) != 0 {
+		t.Errorf("orders = %+v", page.Orders)
+	}
+}
+
+func TestList_NextCursor(t *testing.T) {
+	// fixture = openapi 예시(completedWithNextPage): hasNext=true, nextCursor 존재
+	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/orders", Query: url.Values{"status": {"CLOSED"}}}, "3", 200, testutil.Fixture(t, "orders_page.json"))
+	defer done()
+	page, err := New(hc, 3).List(context.Background(), ListParams{Status: StatusFilterClosed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !page.HasNext || page.NextCursor == nil || *page.NextCursor == "" {
+		t.Errorf("page = %+v", page)
+	}
+}
+
+func TestList_RequiresStatus(t *testing.T) {
+	if _, err := New(nil, 3).List(context.Background(), ListParams{}); err == nil {
+		t.Error("want error for empty status")
+	}
+}
+
+func TestGet(t *testing.T) {
+	// fixture = openapi 예시(krLimitFilled)
+	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/orders/o-1"}, "3", 200, testutil.Fixture(t, "order_filled.json"))
+	defer done()
+	o, err := New(hc, 3).Get(context.Background(), "o-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.Status != StatusFilled || o.Execution.FilledQuantity.String() != "10" {
+		t.Errorf("order = %+v", o)
+	}
+	if o.Execution.AverageFilledPrice == nil || o.Execution.AverageFilledPrice.String() != "70000" {
+		t.Errorf("avg = %v", o.Execution.AverageFilledPrice)
+	}
+	if o.Execution.Commission == nil || o.Execution.Commission.String() != "1400" || o.Execution.Tax == nil || o.Execution.Tax.String() != "0" {
+		t.Errorf("cost = %+v", o.Execution)
+	}
+	if o.Execution.FilledAt == nil || o.Execution.SettlementDate == nil || *o.Execution.SettlementDate != "2026-03-30" {
+		t.Errorf("settlement = %v %v", o.Execution.FilledAt, o.Execution.SettlementDate)
+	}
+}
+
+func TestGet_RequiresID(t *testing.T) {
+	if _, err := New(nil, 3).Get(context.Background(), ""); err == nil {
+		t.Error("want error")
+	}
+}
+
+func TestBuyingPower(t *testing.T) {
+	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/buying-power", Query: url.Values{"currency": {"KRW"}}}, "3", 200, testutil.Fixture(t, "buying_power.json"))
+	defer done()
+	bp, err := New(hc, 3).BuyingPower(context.Background(), tosstypes.CurrencyKRW)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bp.Currency != tosstypes.CurrencyKRW || bp.CashBuyingPower.String() != "5000000" {
+		t.Errorf("bp = %+v", bp)
+	}
+}
+
+func TestBuyingPower_RequiresCurrency(t *testing.T) {
+	if _, err := New(nil, 3).BuyingPower(context.Background(), ""); err == nil {
+		t.Error("want error")
+	}
+}
+
+func TestSellableQuantity(t *testing.T) {
+	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/sellable-quantity", Query: url.Values{"symbol": {"005930"}}}, "3", 200, testutil.Fixture(t, "sellable_quantity.json"))
+	defer done()
+	s, err := New(hc, 3).SellableQuantity(context.Background(), "005930")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.SellableQuantity.String() != "100" {
+		t.Errorf("sellable = %+v", s)
+	}
+}
+
+func TestCommissions(t *testing.T) {
+	// fixture = openapi 예시(standard): KR/US 2건
+	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/commissions"}, "3", 200, testutil.Fixture(t, "commissions.json"))
+	defer done()
+	cs, err := New(hc, 3).Commissions(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cs) != 2 {
+		t.Fatalf("commissions = %+v", cs)
+	}
+	if cs[0].MarketCountry != tosstypes.MarketCountryKR || cs[0].CommissionRate.String() != "0.00015" {
+		t.Errorf("kr = %+v", cs[0])
+	}
+	if cs[0].StartDate == nil || *cs[0].StartDate != "2026-01-01" || cs[1].StartDate != nil {
+		t.Errorf("dates = %v %v", cs[0].StartDate, cs[1].StartDate)
+	}
+}
+
+// --- 쓰기(요청 조립만 검증. 실주문은 절대 내지 않는다) ---
+
+// captureBody 는 요청 바디를 그대로 돌려주는 스텁이다.
+func captureBody(t *testing.T, path, wantAccount string, respond []byte) (*Client, *string, func()) {
+	t.Helper()
+	var got string
+	hc, done := testutil.NewServerFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != path {
+			t.Errorf("path = %q, want %q", r.URL.Path, path)
+		}
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s", r.Method)
+		}
+		if a := r.Header.Get("X-Tossinvest-Account"); a != wantAccount {
+			t.Errorf("account = %q, want %q", a, wantAccount)
+		}
+		b := make([]byte, r.ContentLength)
+		_, _ = r.Body.Read(b)
+		got = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(respond)
+	})
+	return New(hc, 3), &got, done
+}
+
+func assertJSON(t *testing.T, got, want string) {
+	t.Helper()
+	var g, w any
+	if err := json.Unmarshal([]byte(got), &g); err != nil {
+		t.Fatalf("got is not JSON: %s", got)
+	}
+	if err := json.Unmarshal([]byte(want), &w); err != nil {
+		t.Fatalf("want is not JSON: %s", want)
+	}
+	gb, _ := json.Marshal(g)
+	wb, _ := json.Marshal(w)
+	if string(gb) != string(wb) {
+		t.Errorf("body =\n  %s\nwant\n  %s", gb, wb)
+	}
+}
+
+func TestPlace_LimitBuy(t *testing.T) {
+	c, body, done := captureBody(t, "/api/v1/orders", "3", []byte(`{"result":{"orderId":"o-9","clientOrderId":"k1"}}`))
+	defer done()
+	res, err := c.Place(context.Background(), Request{
+		Symbol: "005930", Side: SideBuy, OrderType: TypeLimit,
+		Quantity: d("10"), Price: d("70000"), ClientOrderID: "k1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertJSON(t, *body, `{"symbol":"005930","side":"BUY","orderType":"LIMIT","quantity":"10","price":"70000","clientOrderId":"k1"}`)
+	if res.OrderID != "o-9" || res.ClientOrderID == nil || *res.ClientOrderID != "k1" {
+		t.Errorf("res = %+v", res)
+	}
+}
+
+func TestPlace_MarketSellOmitsPriceAndTIF(t *testing.T) {
+	c, body, done := captureBody(t, "/api/v1/orders", "3", []byte(`{"result":{"orderId":"o-10"}}`))
+	defer done()
+	if _, err := c.Place(context.Background(), Request{Symbol: "AAPL", Side: SideSell, OrderType: TypeMarket, Quantity: d("1.5")}); err != nil {
+		t.Fatal(err)
+	}
+	assertJSON(t, *body, `{"symbol":"AAPL","side":"SELL","orderType":"MARKET","quantity":"1.5"}`)
+}
+
+func TestPlace_TimeInForceAndConfirm(t *testing.T) {
+	c, body, done := captureBody(t, "/api/v1/orders", "3", []byte(`{"result":{"orderId":"o-11"}}`))
+	defer done()
+	if _, err := c.Place(context.Background(), Request{
+		Symbol: "AAPL", Side: SideBuy, OrderType: TypeLimit, Quantity: d("1"), Price: d("200"),
+		TimeInForce: TimeInForceClose, ConfirmHighValue: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertJSON(t, *body, `{"symbol":"AAPL","side":"BUY","orderType":"LIMIT","quantity":"1","price":"200","timeInForce":"CLS","confirmHighValueOrder":true}`)
+}
+
+func TestPlaceAmount(t *testing.T) {
+	c, body, done := captureBody(t, "/api/v1/orders", "3", []byte(`{"result":{"orderId":"o-12"}}`))
+	defer done()
+	if _, err := c.PlaceAmount(context.Background(), AmountRequest{Symbol: "AAPL", Side: SideBuy, OrderAmount: d("100"), ClientOrderID: "k2"}); err != nil {
+		t.Fatal(err)
+	}
+	// orderType 은 SDK 가 MARKET 으로 채운다(스키마상 유일값)
+	assertJSON(t, *body, `{"symbol":"AAPL","side":"BUY","orderType":"MARKET","orderAmount":"100","clientOrderId":"k2"}`)
+}
+
+func TestPlace_Validation(t *testing.T) {
+	c := New(nil, 3) // nil client: 검증이 요청 전에 실패해야 한다
+	ctx := context.Background()
+	cases := map[string]Request{
+		"empty symbol":   {Side: SideBuy, OrderType: TypeLimit, Quantity: d("1"), Price: d("1")},
+		"bad symbol":     {Symbol: "삼성", Side: SideBuy, OrderType: TypeLimit, Quantity: d("1"), Price: d("1")},
+		"empty side":     {Symbol: "005930", OrderType: TypeLimit, Quantity: d("1"), Price: d("1")},
+		"empty type":     {Symbol: "005930", Side: SideBuy, Quantity: d("1"), Price: d("1")},
+		"zero quantity":  {Symbol: "005930", Side: SideBuy, OrderType: TypeLimit, Price: d("1")},
+		"neg quantity":   {Symbol: "005930", Side: SideBuy, OrderType: TypeLimit, Quantity: d("-1"), Price: d("1")},
+		"limit no price": {Symbol: "005930", Side: SideBuy, OrderType: TypeLimit, Quantity: d("1")},
+		"bad key":        {Symbol: "005930", Side: SideBuy, OrderType: TypeLimit, Quantity: d("1"), Price: d("1"), ClientOrderID: "has space"},
+	}
+	for name, r := range cases {
+		if _, err := c.Place(ctx, r); err == nil {
+			t.Errorf("%s: want error", name)
+		}
+	}
+	if _, err := c.PlaceAmount(ctx, AmountRequest{Symbol: "AAPL", Side: SideBuy}); err == nil {
+		t.Error("zero orderAmount: want error")
+	}
+}
+
+func TestModify(t *testing.T) {
+	c, body, done := captureBody(t, "/api/v1/orders/o-1/modify", "3", []byte(`{"result":{"orderId":"o-1"}}`))
+	defer done()
+	res, err := c.Modify(context.Background(), "o-1", ModifyRequest{OrderType: TypeLimit, Price: d("71000"), Quantity: d("5")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertJSON(t, *body, `{"orderType":"LIMIT","price":"71000","quantity":"5"}`)
+	if res.OrderID != "o-1" {
+		t.Errorf("res = %+v", res)
+	}
+}
+
+func TestModify_Validation(t *testing.T) {
+	c := New(nil, 3)
+	if _, err := c.Modify(context.Background(), "", ModifyRequest{OrderType: TypeLimit}); err == nil {
+		t.Error("empty orderId: want error")
+	}
+	if _, err := c.Modify(context.Background(), "o-1", ModifyRequest{}); err == nil {
+		t.Error("empty orderType: want error")
+	}
+}
+
+func TestCancel(t *testing.T) {
+	c, body, done := captureBody(t, "/api/v1/orders/o-1/cancel", "3", []byte(`{"result":{"orderId":"o-1"}}`))
+	defer done()
+	res, err := c.Cancel(context.Background(), "o-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertJSON(t, *body, `{}`) // 취소는 빈 바디
+	if res.OrderID != "o-1" {
+		t.Errorf("res = %+v", res)
+	}
+}
+
+func TestCancel_RequiresID(t *testing.T) {
+	if _, err := New(nil, 3).Cancel(context.Background(), ""); err == nil {
+		t.Error("want error")
+	}
+}
+EOF
+go test ./order/ 2>&1 | head -5
+```
+Expected: 컴파일 에러(`undefined: New` 등). `testutil.NewServerFunc` 도 아직 없다.
+
+- [ ] **Step 3: testutil 에 임의 핸들러 서버 추가**
+
+`internal/testutil/server.go` 에 덧붙인다:
+```go
+// NewServerFunc 는 검증을 호출자가 직접 하는 스텁 서버다(POST 바디 캡처 등).
+func NewServerFunc(t *testing.T, h http.HandlerFunc) (*httpclient.Client, func()) {
+	t.Helper()
+	srv := httptest.NewServer(h)
+	c := httpclient.New(httpclient.Config{BaseURL: srv.URL, HTTPClient: srv.Client(), Tokens: staticTokens{}})
+	return c, srv.Close
+}
+```
+
+- [ ] **Step 4: 구현**
+
+```bash
+mkdir -p order && cat > order/client.go << 'EOF'
+// Package order 는 토스 Open API 주문 그룹 — 주문 생성·정정·취소, 주문 조회, 주문 정보.
+// toss.Client.Account(seq).Order 로 접근하며, 모든 요청에 계좌 헤더가 실린다.
+//
+// 주문은 실제 체결로 이어진다. SDK 는 요청 조립 오류(필수 누락·형식)만 사전 검증하고,
+// 호가단위·잔고·거래시간 같은 상태 의존 규칙은 서버가 판단한다 — 에러는 *toss.APIError 로 온다.
+//
+// 멱등성: Request.ClientOrderID 를 채우면 (1) 같은 값으로 재요청 시 토스가 이전 주문 결과를
+// 그대로 돌려주고(10분), (2) SDK 가 401 토큰 오류에 1회 재시도한다. 키가 없으면 재시도하지 않는다.
+package order
+
+import "github.com/kenshin579/toss-go/internal/httpclient"
+
+// Client 는 주문 sub-client. accountSeq 에 고정된다.
+type Client struct {
+	http       *httpclient.Client
+	accountSeq int64
+}
+
+// New 는 internal 용도 — toss.Client.Account 가 호출한다.
+func New(hc *httpclient.Client, accountSeq int64) *Client {
+	return &Client{http: hc, accountSeq: accountSeq}
+}
+EOF
+cat > order/types.go << 'EOF'
+package order
+
+import (
+	"time"
+
+	"github.com/shopspring/decimal"
+
+	"github.com/kenshin579/toss-go/tosstypes"
+)
+
+// Side 는 주문 방향.
+type Side string
+
+const (
+	SideBuy  Side = "BUY"
+	SideSell Side = "SELL"
+)
+
+// Type 은 호가 유형.
+type Type string
+
+const (
+	TypeLimit  Type = "LIMIT"  // 지정가
+	TypeMarket Type = "MARKET" // 시장가
+)
+
+// TimeInForce 는 주문 유효 조건. OrderType 과 결합해 주문 방식이 정해진다(LIMIT+CLS = LOC).
+type TimeInForce string
+
+const (
+	TimeInForceDay   TimeInForce = "DAY" // 당일 유효. 미지정 시 서버 기본값
+	TimeInForceClose TimeInForce = "CLS" // 장 마감(At the Close). 미국 주식 + LIMIT 만 지원
+	TimeInForceOpen  TimeInForce = "OPG" // 장 개시(국내 시가단일가). 국내 전용
+)
+
+// Status 는 개별 주문의 상태.
+type Status string
+
+const (
+	StatusPending         Status = "PENDING"          // 접수, 미체결
+	StatusPendingCancel   Status = "PENDING_CANCEL"   // 취소 처리 중
+	StatusPendingReplace  Status = "PENDING_REPLACE"  // 정정 처리 중
+	StatusPartialFilled   Status = "PARTIAL_FILLED"   // 부분 체결
+	StatusFilled          Status = "FILLED"           // 전량 체결
+	StatusCanceled        Status = "CANCELED"         // 취소됨
+	StatusRejected        Status = "REJECTED"         // 거부됨
+	StatusCancelRejected  Status = "CANCEL_REJECTED"  // 취소 거부
+	StatusReplaceRejected Status = "REPLACE_REJECTED" // 정정 거부
+	StatusReplaced        Status = "REPLACED"         // 정정되어 대체됨
+)
+
+// StatusFilter 는 주문 목록 조회의 라이프사이클 그룹 필터다. 개별 주문의 Status 와 값 체계가 다르다.
+type StatusFilter string
+
+const (
+	// StatusFilterOpen 은 진행 중 그룹 — PENDING, PARTIAL_FILLED, PENDING_CANCEL, PENDING_REPLACE.
+	StatusFilterOpen StatusFilter = "OPEN"
+	// StatusFilterClosed 는 종료 그룹 — FILLED, CANCELED, REJECTED, REPLACED, CANCEL_REJECTED,
+	// REPLACE_REJECTED, PARTIAL_FILLED.
+	StatusFilterClosed StatusFilter = "CLOSED"
+)
+
+// Execution 은 체결 정보. 미체결 주문은 FilledQuantity 가 0 이고 나머지는 nil 이다.
+type Execution struct {
+	FilledQuantity     decimal.Decimal  `json:"filledQuantity"`
+	AverageFilledPrice *decimal.Decimal `json:"averageFilledPrice"` // 미체결이면 nil
+	FilledAmount       *decimal.Decimal `json:"filledAmount"`
+	Commission         *decimal.Decimal `json:"commission"`
+	Tax                *decimal.Decimal `json:"tax"`
+	FilledAt           *time.Time       `json:"filledAt"`
+	SettlementDate     *tosstypes.Date  `json:"settlementDate"` // 결제일. 체결 전이면 nil
+}
+
+// Order 는 주문 1건.
+type Order struct {
+	OrderID     string             `json:"orderId"`
+	Symbol      string             `json:"symbol"`
+	Side        Side               `json:"side"`
+	OrderType   Type               `json:"orderType"`
+	TimeInForce TimeInForce        `json:"timeInForce"`
+	Status      Status             `json:"status"`
+	Price       *decimal.Decimal   `json:"price"`       // 시장가 주문이면 nil
+	Quantity    decimal.Decimal    `json:"quantity"`
+	OrderAmount *decimal.Decimal   `json:"orderAmount"` // 금액 주문이면 설정, 수량 주문이면 nil
+	Currency    tosstypes.Currency `json:"currency"`
+	OrderedAt   time.Time          `json:"orderedAt"`
+	CanceledAt  *time.Time         `json:"canceledAt"` // 취소되지 않았으면 nil
+	Execution   Execution          `json:"execution"`
+}
+
+// Page 는 주문 목록 한 페이지. NextCursor 를 다음 요청의 Cursor 로 넘기면 이어서 조회한다.
+type Page struct {
+	Orders     []Order `json:"orders"`
+	NextCursor *string `json:"nextCursor"` // 더 없으면 nil
+	HasNext    bool    `json:"hasNext"`
+}
+
+// PlaceResult 는 주문 생성 결과.
+type PlaceResult struct {
+	OrderID       string  `json:"orderId"`
+	ClientOrderID *string `json:"clientOrderId"` // 요청에 넣었을 때만 설정
+}
+
+// OperationResult 는 정정·취소 결과.
+type OperationResult struct {
+	OrderID string `json:"orderId"`
+}
+EOF
+cat > order/place.go << 'EOF'
+package order
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/shopspring/decimal"
+
+	"github.com/kenshin579/toss-go/internal/fetch"
+	"github.com/kenshin579/toss-go/internal/params"
+)
+
+// Request 는 수량 기준 주문 생성 요청.
+type Request struct {
+	Symbol           string          // 필수
+	Side             Side            // 필수
+	OrderType        Type            // 필수
+	Quantity         decimal.Decimal // 필수. 소수점 수량은 미국 주식 시장가 매도 전용이며 정규장 종료 1시간 전까지만 접수된다
+	Price            decimal.Decimal // LIMIT 이면 필수, MARKET 이면 무시(전송하지 않음)
+	TimeInForce      TimeInForce     // 비우면 서버 기본값 DAY
+	ClientOrderID    string          // 멱등성 키(10분). 설정하면 401 토큰 오류에 1회 재시도한다
+	ConfirmHighValue bool            // 1억원 이상 주문에 true 가 아니면 400 confirm-high-value-required
+}
+
+// AmountRequest 는 금액 기준 주문 생성 요청 — 미국 주식 시장가 전용.
+// 체결 수량은 시장가에 따라 정해지며, 정규장 시작~정규장 종료 1시간 전에만 접수된다.
+type AmountRequest struct {
+	Symbol           string
+	Side             Side
+	OrderAmount      decimal.Decimal // 필수(USD)
+	ClientOrderID    string
+	ConfirmHighValue bool
+}
+
+type placeBody struct {
+	Symbol                string `json:"symbol"`
+	Side                  Side   `json:"side"`
+	OrderType             Type   `json:"orderType"`
+	Quantity              string `json:"quantity,omitempty"`
+	OrderAmount           string `json:"orderAmount,omitempty"`
+	Price                 string `json:"price,omitempty"`
+	TimeInForce           string `json:"timeInForce,omitempty"`
+	ClientOrderID         string `json:"clientOrderId,omitempty"`
+	ConfirmHighValueOrder bool   `json:"confirmHighValueOrder,omitempty"`
+}
+
+// Place 는 수량 기준 주문을 생성한다(POST /api/v1/orders).
+//
+// 대표 에러: insufficient-buying-power, outside-order-hours, invalid-tick-size, price-out-of-range,
+// stock-restricted, confirm-high-value-required, request-in-progress.
+func (c *Client) Place(ctx context.Context, r Request) (*PlaceResult, error) {
+	if err := params.Symbol(r.Symbol); err != nil {
+		return nil, err
+	}
+	if r.Side == "" {
+		return nil, errors.New("toss: side is required")
+	}
+	if r.OrderType == "" {
+		return nil, errors.New("toss: orderType is required")
+	}
+	if !r.Quantity.IsPositive() {
+		return nil, fmt.Errorf("toss: quantity must be positive (got %s)", r.Quantity)
+	}
+	if r.OrderType == TypeLimit && !r.Price.IsPositive() {
+		return nil, fmt.Errorf("toss: price is required for LIMIT orders (got %s)", r.Price)
+	}
+	if err := validateKey(r.ClientOrderID); err != nil {
+		return nil, err
+	}
+	body := placeBody{
+		Symbol: r.Symbol, Side: r.Side, OrderType: r.OrderType,
+		Quantity: r.Quantity.String(), TimeInForce: string(r.TimeInForce),
+		ClientOrderID: r.ClientOrderID, ConfirmHighValueOrder: r.ConfirmHighValue,
+	}
+	if r.OrderType == TypeLimit {
+		body.Price = r.Price.String()
+	}
+	return fetch.PostOne[PlaceResult](ctx, c.http, "/api/v1/orders", body, c.accountSeq, r.ClientOrderID != "")
+}
+
+// PlaceAmount 는 금액 기준 주문을 생성한다(POST /api/v1/orders). 미국 주식 시장가 전용이며
+// orderType 은 SDK 가 MARKET 으로 채운다.
+//
+// 대표 에러: amount-us-market-only, amount-order-outside-regular-hours, insufficient-buying-power,
+// max-order-amount-exceeded, confirm-high-value-required.
+func (c *Client) PlaceAmount(ctx context.Context, r AmountRequest) (*PlaceResult, error) {
+	if err := params.Symbol(r.Symbol); err != nil {
+		return nil, err
+	}
+	if r.Side == "" {
+		return nil, errors.New("toss: side is required")
+	}
+	if !r.OrderAmount.IsPositive() {
+		return nil, fmt.Errorf("toss: orderAmount must be positive (got %s)", r.OrderAmount)
+	}
+	if err := validateKey(r.ClientOrderID); err != nil {
+		return nil, err
+	}
+	body := placeBody{
+		Symbol: r.Symbol, Side: r.Side, OrderType: TypeMarket,
+		OrderAmount: r.OrderAmount.String(),
+		ClientOrderID: r.ClientOrderID, ConfirmHighValueOrder: r.ConfirmHighValue,
+	}
+	return fetch.PostOne[PlaceResult](ctx, c.http, "/api/v1/orders", body, c.accountSeq, r.ClientOrderID != "")
+}
+EOF
+cat > order/modify.go << 'EOF'
+package order
+
+import (
+	"context"
+	"errors"
+	"net/url"
+
+	"github.com/shopspring/decimal"
+
+	"github.com/kenshin579/toss-go/internal/fetch"
+	"github.com/kenshin579/toss-go/internal/params"
+)
+
+// clientOrderIDPattern 검증은 루트 toss 패키지와 중복을 피하려고 여기서 최소 규칙만 확인한다.
+const maxClientOrderIDLen = 36
+
+func validateKey(id string) error {
+	if id == "" {
+		return nil // 멱등성 미적용
+	}
+	if len(id) > maxClientOrderIDLen {
+		return errors.New("toss: clientOrderId too long (max 36)")
+	}
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return errors.New("toss: invalid clientOrderId (allowed: A-Z a-z 0-9 - _)")
+		}
+	}
+	return nil
+}
+
+// ModifyRequest 는 주문 정정 요청.
+// 국내 주식은 Quantity 가 필수(양의 정수)이고, 미국 주식은 Quantity 를 보낼 수 없다
+// (보내면 400 us-modify-quantity-not-supported) — 가격만 정정할 수 있다.
+type ModifyRequest struct {
+	OrderType        Type            // 필수
+	Quantity         decimal.Decimal // 국내 필수, 미국은 0(미전송)
+	Price            decimal.Decimal // 0 이면 미전송
+	ConfirmHighValue bool
+}
+
+type modifyBody struct {
+	OrderType             Type   `json:"orderType"`
+	Quantity              string `json:"quantity,omitempty"`
+	Price                 string `json:"price,omitempty"`
+	ConfirmHighValueOrder bool   `json:"confirmHighValueOrder,omitempty"`
+}
+
+// Modify 는 주문의 가격 또는 수량을 정정한다(POST /api/v1/orders/{orderId}/modify).
+// 정정은 멱등성 키를 받지 않으므로 401 재시도를 하지 않는다.
+//
+// 대표 에러: already-filled, already-canceled, already-modified, already-processing,
+// order-not-found, modify-restricted, outside-order-hours, us-modify-quantity-not-supported.
+func (c *Client) Modify(ctx context.Context, orderID string, r ModifyRequest) (*OperationResult, error) {
+	if err := params.Require("orderId", orderID); err != nil {
+		return nil, err
+	}
+	if r.OrderType == "" {
+		return nil, errors.New("toss: orderType is required")
+	}
+	body := modifyBody{OrderType: r.OrderType, ConfirmHighValueOrder: r.ConfirmHighValue}
+	if r.Quantity.IsPositive() {
+		body.Quantity = r.Quantity.String()
+	}
+	if r.Price.IsPositive() {
+		body.Price = r.Price.String()
+	}
+	return fetch.PostOne[OperationResult](ctx, c.http, "/api/v1/orders/"+url.PathEscape(orderID)+"/modify", body, c.accountSeq, false)
+}
+
+// Cancel 은 주문을 취소한다(POST /api/v1/orders/{orderId}/cancel). 이미 체결된 주문은 취소할 수 없다.
+// 취소는 멱등성 키를 받지 않으므로 401 재시도를 하지 않는다.
+//
+// 대표 에러: already-filled, already-canceled, already-processing, order-not-found,
+// cancel-restricted, outside-order-hours.
+func (c *Client) Cancel(ctx context.Context, orderID string) (*OperationResult, error) {
+	if err := params.Require("orderId", orderID); err != nil {
+		return nil, err
+	}
+	return fetch.PostOne[OperationResult](ctx, c.http, "/api/v1/orders/"+url.PathEscape(orderID)+"/cancel", struct{}{}, c.accountSeq, false)
+}
+EOF
+cat > order/history.go << 'EOF'
+package order
+
+import (
+	"context"
+	"net/url"
+
+	"github.com/kenshin579/toss-go/internal/fetch"
+	"github.com/kenshin579/toss-go/internal/params"
+	"github.com/kenshin579/toss-go/tosstypes"
+)
+
+// ListParams 는 주문 목록 조회 인자. Status 는 필수다.
+type ListParams struct {
+	Status StatusFilter   // 필수. OPEN(진행 중) 또는 CLOSED(종료)
+	Symbol string         // 특정 종목만. 비우면 전체
+	From   tosstypes.Date // 주문 생성일(orderedAt, KST) 기준 시작일(inclusive)
+	To     tosstypes.Date // 주문 생성일 기준 종료일(inclusive)
+	Cursor string         // 이전 응답의 NextCursor
+	Limit  int            // 최대 100, 0 이면 서버 기본값(20)
+}
+
+// List 는 주문 목록을 조회한다(GET /api/v1/orders).
+func (c *Client) List(ctx context.Context, p ListParams) (*Page, error) {
+	if err := params.Require("status", string(p.Status)); err != nil {
+		return nil, err
+	}
+	q := url.Values{"status": {string(p.Status)}}
+	if p.Symbol != "" {
+		if err := params.Symbol(p.Symbol); err != nil {
+			return nil, err
+		}
+		q.Set("symbol", p.Symbol)
+	}
+	params.Date(q, "from", p.From)
+	params.Date(q, "to", p.To)
+	params.Str(q, "cursor", p.Cursor)
+	params.Int(q, "limit", p.Limit)
+	return fetch.One[Page](ctx, c.http, "/api/v1/orders", q, c.accountSeq)
+}
+
+// Get 은 주문 상세를 조회한다(GET /api/v1/orders/{orderId}). 없으면 404 order-not-found.
+func (c *Client) Get(ctx context.Context, orderID string) (*Order, error) {
+	if err := params.Require("orderId", orderID); err != nil {
+		return nil, err
+	}
+	return fetch.One[Order](ctx, c.http, "/api/v1/orders/"+url.PathEscape(orderID), nil, c.accountSeq)
+}
+EOF
+cat > order/info.go << 'EOF'
+package order
+
+import (
+	"context"
+	"net/url"
+
+	"github.com/shopspring/decimal"
+
+	"github.com/kenshin579/toss-go/internal/fetch"
+	"github.com/kenshin579/toss-go/internal/params"
+	"github.com/kenshin579/toss-go/tosstypes"
+)
+
+// BuyingPower 는 매수 가능 금액.
+type BuyingPower struct {
+	Currency        tosstypes.Currency `json:"currency"`
+	CashBuyingPower decimal.Decimal    `json:"cashBuyingPower"` // 현금 매수 가능 금액
+}
+
+// SellableQuantity 는 판매 가능 수량.
+type SellableQuantity struct {
+	SellableQuantity decimal.Decimal `json:"sellableQuantity"`
+}
+
+// Commission 은 시장별 매매 수수료율. StartDate/EndDate 는 기간 한정 요율일 때만 설정된다.
+type Commission struct {
+	MarketCountry  tosstypes.MarketCountry `json:"marketCountry"`
+	CommissionRate decimal.Decimal         `json:"commissionRate"` // 소수 비율(0.00015 = 0.015%)
+	StartDate      *tosstypes.Date         `json:"startDate"`
+	EndDate        *tosstypes.Date         `json:"endDate"`
+}
+
+// BuyingPower 는 매수 가능 금액을 조회한다(GET /api/v1/buying-power).
+// 대표 에러: unsupported-currency, account-not-found.
+func (c *Client) BuyingPower(ctx context.Context, currency tosstypes.Currency) (*BuyingPower, error) {
+	if err := params.Require("currency", string(currency)); err != nil {
+		return nil, err
+	}
+	return fetch.One[BuyingPower](ctx, c.http, "/api/v1/buying-power", url.Values{"currency": {string(currency)}}, c.accountSeq)
+}
+
+// SellableQuantity 는 판매 가능 수량을 조회한다(GET /api/v1/sellable-quantity).
+func (c *Client) SellableQuantity(ctx context.Context, symbol string) (*SellableQuantity, error) {
+	if err := params.Symbol(symbol); err != nil {
+		return nil, err
+	}
+	return fetch.One[SellableQuantity](ctx, c.http, "/api/v1/sellable-quantity", url.Values{"symbol": {symbol}}, c.accountSeq)
+}
+
+// Commissions 는 계좌의 매매 수수료율을 조회한다(GET /api/v1/commissions).
+func (c *Client) Commissions(ctx context.Context) ([]Commission, error) {
+	return fetch.List[Commission](ctx, c.http, "/api/v1/commissions", nil, c.accountSeq)
+}
+EOF
+```
+
+`account.go` 의 `AccountScope` 에 `Order *order.Client // 주문: 생성·정정·취소·조회·주문 정보` 필드를 추가하고 `Account` 에서 `Order: order.New(c.http, accountSeq),` 로 연결한다. import 도 추가한다.
+
+```bash
+gofmt -w . && go vet ./... && go test ./order/ . -race -v 2>&1 | grep -cE '^--- PASS'
+```
+Expected: order 18 + 루트 11 = `29` (실행 결과로 확인하고 모두 PASS 인지만 본다).
+
+- [ ] **Step 5: 커밋**
+
+```bash
+git add order account.go internal/testutil && git commit -m "feat(order): 주문 생성·정정·취소·조회·주문정보 8 ops
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 5: `conditionalorder` 패키지 (5 ops)
+
+**Files:**
+- Create: `conditionalorder/client.go`, `conditionalorder/types.go`, `conditionalorder/place.go`, `conditionalorder/history.go`, `conditionalorder/conditionalorder_test.go`
+- Modify: `account.go` (`AccountScope.ConditionalOrder` 추가)
+
+> 조건주문은 2xx 응답 예시가 없다. 조회 fixture 도 openapi 에 없으므로 **스키마 기준으로 손으로 만든
+> fixture** 를 쓴다(테스트 파일 안에 인라인 JSON). 필드명·타입은 `ConditionalOrderDetailResponse`,
+> `ConditionalOrderCondition`, `PaginatedConditionalOrderResponse` 스키마를 그대로 따른다.
+
+- [ ] **Step 1: 실패 테스트 작성**
+
+```bash
+mkdir -p conditionalorder && cat > conditionalorder/conditionalorder_test.go << 'EOF'
+package conditionalorder
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/url"
+	"testing"
+
+	"github.com/shopspring/decimal"
+
+	"github.com/kenshin579/toss-go/internal/testutil"
+)
+
+func d(s string) decimal.Decimal { return decimal.RequireFromString(s) }
+
+// detailJSON 은 ConditionalOrderDetailResponse 스키마를 그대로 옮긴 응답 예시다(openapi 에 2xx 예시가 없다).
+const detailJSON = `{"result":{"conditionalOrderId":"c-1","type":"OCO","status":"WATCHING","symbol":"005930","market":"KR","quantity":"10","orderType":"LIMIT","expireDate":"2026-12-31","first":{"type":"STOP","status":"WATCHING","triggerPrice":"65000","targetProfitRate":null,"orderPrice":"64900","triggeredOrderId":null},"second":{"type":"PROFIT_RATE","status":"HOLDING","triggerPrice":null,"targetProfitRate":"0.1","orderPrice":null,"triggeredOrderId":"o-77"},"createdAt":"2026-09-01T10:00:00+09:00"}}`
+
+const listJSON = `{"result":{"conditionalOrders":[{"conditionalOrderId":"c-1","type":"SINGLE","status":"WATCHING","symbol":"005930","market":"KR","quantity":"10","orderType":"MARKET","expireDate":"2026-12-31","first":{"type":"STOP","status":"WATCHING","triggerPrice":"65000","targetProfitRate":null,"orderPrice":null,"triggeredOrderId":null},"second":null,"createdAt":"2026-09-01T10:00:00+09:00"}],"nextCursor":"cur-2","hasNext":true}}`
+
+func TestGet(t *testing.T) {
+	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/conditional-orders/c-1"}, "4", 200, []byte(detailJSON))
+	defer done()
+	got, err := New(hc, 4).Get(context.Background(), "c-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ConditionalOrderID != "c-1" || got.Type != TypeOCO || got.Status != StatusWatching || got.Market != "KR" {
+		t.Errorf("detail = %+v", got)
+	}
+	if got.Quantity.String() != "10" || got.OrderType != OrderTypeLimit || got.ExpireDate == nil || *got.ExpireDate != "2026-12-31" || got.CreatedAt.IsZero() {
+		t.Errorf("detail fields = %+v", got)
+	}
+	if got.First.Type != ConditionStop || got.First.Status != ConditionWatching || got.First.TriggerPrice == nil || got.First.TriggerPrice.String() != "65000" {
+		t.Errorf("first = %+v", got.First)
+	}
+	if got.First.OrderPrice == nil || got.First.OrderPrice.String() != "64900" || got.First.TargetProfitRate != nil || got.First.TriggeredOrderID != nil {
+		t.Errorf("first optional = %+v", got.First)
+	}
+	if got.Second == nil || got.Second.Type != ConditionProfitRate || got.Second.TargetProfitRate == nil || got.Second.TargetProfitRate.String() != "0.1" {
+		t.Errorf("second = %+v", got.Second)
+	}
+	if got.Second.TriggeredOrderID == nil || *got.Second.TriggeredOrderID != "o-77" {
+		t.Errorf("triggeredOrderId = %v", got.Second.TriggeredOrderID)
+	}
+}
+
+func TestList(t *testing.T) {
+	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/conditional-orders", Query: url.Values{"status": {"OPEN"}, "symbol": {"005930"}, "cursor": {"c0"}, "limit": {"10"}}}, "4", 200, []byte(listJSON))
+	defer done()
+	page, err := New(hc, 4).List(context.Background(), ListParams{Status: StatusFilterOpen, Symbol: "005930", Cursor: "c0", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.ConditionalOrders) != 1 || !page.HasNext || page.NextCursor == nil || *page.NextCursor != "cur-2" {
+		t.Fatalf("page = %+v", page)
+	}
+	if page.ConditionalOrders[0].Second != nil {
+		t.Errorf("second must be nil for SINGLE: %+v", page.ConditionalOrders[0].Second)
+	}
+}
+
+func TestList_RequiresStatus(t *testing.T) {
+	if _, err := New(nil, 4).List(context.Background(), ListParams{}); err == nil {
+		t.Error("want error")
+	}
+}
+
+func TestGet_RequiresID(t *testing.T) {
+	if _, err := New(nil, 4).Get(context.Background(), ""); err == nil {
+		t.Error("want error")
+	}
+}
+
+// --- 쓰기(요청 조립만 검증) ---
+
+func captureBody(t *testing.T, path, method, wantAccount string, status int, respond []byte) (*Client, *string, func()) {
+	t.Helper()
+	var got string
+	hc, done := testutil.NewServerFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != path || r.Method != method {
+			t.Errorf("%s %s, want %s %s", r.Method, r.URL.Path, method, path)
+		}
+		if a := r.Header.Get("X-Tossinvest-Account"); a != wantAccount {
+			t.Errorf("account = %q, want %q", a, wantAccount)
+		}
+		b := make([]byte, r.ContentLength)
+		_, _ = r.Body.Read(b)
+		got = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		if respond != nil {
+			_, _ = w.Write(respond)
+		}
+	})
+	return New(hc, 4), &got, done
+}
+
+func assertJSON(t *testing.T, got, want string) {
+	t.Helper()
+	var g, w any
+	if err := json.Unmarshal([]byte(got), &g); err != nil {
+		t.Fatalf("got is not JSON: %s", got)
+	}
+	if err := json.Unmarshal([]byte(want), &w); err != nil {
+		t.Fatalf("want is not JSON: %s", want)
+	}
+	gb, _ := json.Marshal(g)
+	wb, _ := json.Marshal(w)
+	if string(gb) != string(wb) {
+		t.Errorf("body =\n  %s\nwant\n  %s", gb, wb)
+	}
+}
+
+func TestPlace_Single(t *testing.T) {
+	c, body, done := captureBody(t, "/api/v1/conditional-orders", http.MethodPost, "4", 200, []byte(`{"result":{"conditionalOrderId":"c-9","clientOrderId":"k1"}}`))
+	defer done()
+	res, err := c.Place(context.Background(), Request{
+		Symbol: "005930", Type: TypeSingle, Quantity: d("10"), OrderType: OrderTypeLimit,
+		ExpireDate: "2026-12-31", ClientOrderID: "k1",
+		First: Condition{OrderSide: SideSell, TriggerPrice: d("65000"), OrderPrice: d("64900")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertJSON(t, *body, `{"symbol":"005930","type":"SINGLE","quantity":"10","orderType":"LIMIT","expireDate":"2026-12-31","clientOrderId":"k1","first":{"orderSide":"SELL","triggerPrice":"65000","orderPrice":"64900"}}`)
+	if res.ConditionalOrderID != "c-9" {
+		t.Errorf("res = %+v", res)
+	}
+}
+
+func TestPlace_OCOWithSecond(t *testing.T) {
+	c, body, done := captureBody(t, "/api/v1/conditional-orders", http.MethodPost, "4", 200, []byte(`{"result":{"conditionalOrderId":"c-10"}}`))
+	defer done()
+	second := Condition{OrderSide: SideSell, TriggerPrice: d("80000")}
+	if _, err := c.Place(context.Background(), Request{
+		Symbol: "005930", Type: TypeOCO, Quantity: d("5"), OrderType: OrderTypeMarket, ExpireDate: "2026-10-01",
+		First:  Condition{OrderSide: SideSell, TriggerPrice: d("60000")},
+		Second: &second,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertJSON(t, *body, `{"symbol":"005930","type":"OCO","quantity":"5","orderType":"MARKET","expireDate":"2026-10-01","first":{"orderSide":"SELL","triggerPrice":"60000"},"second":{"orderSide":"SELL","triggerPrice":"80000"}}`)
+}
+
+func TestPlace_Validation(t *testing.T) {
+	c := New(nil, 4) // nil client: 검증이 요청 전에 실패해야 한다
+	ctx := context.Background()
+	ok := Condition{OrderSide: SideSell, TriggerPrice: d("1")}
+	cases := map[string]Request{
+		"empty symbol":  {Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
+		"empty type":    {Symbol: "005930", Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
+		"zero quantity": {Symbol: "005930", Type: TypeSingle, OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
+		"empty orderType": {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), ExpireDate: "2026-12-31", First: ok},
+		"empty expire":  {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, First: ok},
+		"no first side": {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: Condition{TriggerPrice: d("1")}},
+		"no trigger":    {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: Condition{OrderSide: SideSell}},
+	}
+	for name, r := range cases {
+		if _, err := c.Place(ctx, r); err == nil {
+			t.Errorf("%s: want error", name)
+		}
+	}
+}
+
+func TestModify(t *testing.T) {
+	c, body, done := captureBody(t, "/api/v1/conditional-orders/c-1/modify", http.MethodPost, "4", 200, []byte(`{"result":{"conditionalOrderId":"c-1"}}`))
+	defer done()
+	res, err := c.Modify(context.Background(), "c-1", ModifyRequest{
+		Type: TypeSingle, Quantity: d("7"), OrderType: OrderTypeLimit, ExpireDate: "2026-11-30",
+		First: Condition{OrderSide: SideSell, TriggerPrice: d("66000"), OrderPrice: d("65900")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertJSON(t, *body, `{"type":"SINGLE","quantity":"7","orderType":"LIMIT","expireDate":"2026-11-30","first":{"orderSide":"SELL","triggerPrice":"66000","orderPrice":"65900"}}`)
+	if res.ConditionalOrderID != "c-1" {
+		t.Errorf("res = %+v", res)
+	}
+}
+
+func TestCancel_NoContent(t *testing.T) {
+	c, _, done := captureBody(t, "/api/v1/conditional-orders/c-1", http.MethodDelete, "4", 204, nil)
+	defer done()
+	if err := c.Cancel(context.Background(), "c-1"); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+}
+
+func TestCancel_RequiresID(t *testing.T) {
+	if err := New(nil, 4).Cancel(context.Background(), ""); err == nil {
+		t.Error("want error")
+	}
+}
+EOF
+go test ./conditionalorder/ 2>&1 | head -5
+```
+Expected: 컴파일 에러.
+
+- [ ] **Step 2: 구현**
+
+```bash
+cat > conditionalorder/client.go << 'EOF'
+// Package conditionalorder 는 토스 Open API 조건주문 그룹 — 생성·수정·취소·목록·상세.
+// toss.Client.Account(seq).ConditionalOrder 로 접근하며, 모든 요청에 계좌 헤더가 실린다.
+//
+// 조건주문은 트리거 조건(가격 도달·목표 수익률)이 충족되면 실제 주문을 낸다.
+// SDK 는 요청 조립 오류만 사전 검증하고, 호가단위·잔고 등은 서버가 판단한다.
+package conditionalorder
+
+import "github.com/kenshin579/toss-go/internal/httpclient"
+
+// Client 는 조건주문 sub-client. accountSeq 에 고정된다.
+type Client struct {
+	http       *httpclient.Client
+	accountSeq int64
+}
+
+// New 는 internal 용도 — toss.Client.Account 가 호출한다.
+func New(hc *httpclient.Client, accountSeq int64) *Client {
+	return &Client{http: hc, accountSeq: accountSeq}
+}
+EOF
+cat > conditionalorder/types.go << 'EOF'
+package conditionalorder
+
+import (
+	"time"
+
+	"github.com/shopspring/decimal"
+
+	"github.com/kenshin579/toss-go/tosstypes"
+)
+
+// Type 은 조건주문 구성.
+type Type string
+
+const (
+	TypeSingle Type = "SINGLE" // 조건 1개
+	TypeOCO    Type = "OCO"    // 둘 중 하나가 발동하면 나머지 취소(One-Cancels-Other)
+	TypeOTO    Type = "OTO"    // 첫 조건 발동 후 두 번째가 활성화(One-Triggers-Other)
+)
+
+// OrderType 은 조건 충족 시 낼 주문의 호가 유형.
+type OrderType string
+
+const (
+	OrderTypeLimit  OrderType = "LIMIT"
+	OrderTypeMarket OrderType = "MARKET"
+)
+
+// Side 는 조건 충족 시 낼 주문의 방향.
+type Side string
+
+const (
+	SideBuy  Side = "BUY"
+	SideSell Side = "SELL"
+)
+
+// Status 는 조건주문 전체 상태.
+type Status string
+
+const (
+	StatusWatching  Status = "WATCHING"  // 조건 감시 중
+	StatusPaused    Status = "PAUSED"    // 일시 중지
+	StatusOrdering  Status = "ORDERING"  // 주문 접수 중
+	StatusOrdered   Status = "ORDERED"   // 주문 접수 완료
+	StatusCompleted Status = "COMPLETED" // 종료
+	StatusExpired   Status = "EXPIRED"   // 만료
+)
+
+// StatusFilter 는 목록 조회의 라이프사이클 그룹 필터. 개별 Status 와 값 체계가 다르다.
+type StatusFilter string
+
+const (
+	StatusFilterOpen   StatusFilter = "OPEN"
+	StatusFilterClosed StatusFilter = "CLOSED"
+)
+
+// ConditionType 은 개별 조건의 종류.
+type ConditionType string
+
+const (
+	ConditionStop       ConditionType = "STOP"        // 지정 가격 도달
+	ConditionProfitRate ConditionType = "PROFIT_RATE" // 목표 수익률 도달
+)
+
+// ConditionStatus 는 개별 조건의 상태.
+type ConditionStatus string
+
+const (
+	ConditionWatching  ConditionStatus = "WATCHING"
+	ConditionHolding   ConditionStatus = "HOLDING" // OTO 에서 아직 활성화되지 않음
+	ConditionPaused    ConditionStatus = "PAUSED"
+	ConditionOrdering  ConditionStatus = "ORDERING"
+	ConditionOrdered   ConditionStatus = "ORDERED"
+	ConditionCompleted ConditionStatus = "COMPLETED"
+	ConditionExpired   ConditionStatus = "EXPIRED"
+	ConditionCanceled  ConditionStatus = "CANCELED"
+)
+
+// ConditionDetail 은 조회 응답의 개별 조건.
+type ConditionDetail struct {
+	Type             ConditionType    `json:"type"`
+	Status           ConditionStatus  `json:"status"`
+	TriggerPrice     *decimal.Decimal `json:"triggerPrice"`     // STOP 조건에만
+	TargetProfitRate *decimal.Decimal `json:"targetProfitRate"` // PROFIT_RATE 조건에만(소수 비율)
+	OrderPrice       *decimal.Decimal `json:"orderPrice"`       // LIMIT 일 때 발동 주문 가격
+	TriggeredOrderID *string          `json:"triggeredOrderId"` // 발동해서 생성된 주문 id. 미발동이면 nil
+}
+
+// Detail 은 조건주문 1건. 목록·상세가 같은 스키마를 쓴다.
+type Detail struct {
+	ConditionalOrderID string           `json:"conditionalOrderId"`
+	Type               Type             `json:"type"`
+	Status             Status           `json:"status"`
+	Symbol             string           `json:"symbol"`
+	Market             string           `json:"market"` // KR / US
+	Quantity           decimal.Decimal  `json:"quantity"`
+	OrderType          OrderType        `json:"orderType"`
+	ExpireDate         *tosstypes.Date  `json:"expireDate"`
+	First              ConditionDetail  `json:"first"`
+	Second             *ConditionDetail `json:"second"` // SINGLE 이면 nil
+	CreatedAt          time.Time        `json:"createdAt"`
+}
+
+// Page 는 조건주문 목록 한 페이지.
+type Page struct {
+	ConditionalOrders []Detail `json:"conditionalOrders"`
+	NextCursor        *string  `json:"nextCursor"` // 더 없으면 nil
+	HasNext           bool     `json:"hasNext"`
+}
+
+// PlaceResult 는 조건주문 생성 결과.
+type PlaceResult struct {
+	ConditionalOrderID string  `json:"conditionalOrderId"`
+	ClientOrderID      *string `json:"clientOrderId"`
+}
+
+// Result 는 조건주문 수정 결과.
+type Result struct {
+	ConditionalOrderID string `json:"conditionalOrderId"`
+}
+EOF
+cat > conditionalorder/place.go << 'EOF'
+package conditionalorder
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+
+	"github.com/shopspring/decimal"
+
+	"github.com/kenshin579/toss-go/internal/fetch"
+	"github.com/kenshin579/toss-go/internal/params"
+	"github.com/kenshin579/toss-go/tosstypes"
+)
+
+// Condition 은 생성·수정 요청의 조건 1개.
+type Condition struct {
+	OrderSide    Side            // 필수
+	TriggerPrice decimal.Decimal // 필수. 이 가격에 도달하면 발동
+	OrderPrice   decimal.Decimal // LIMIT 일 때 발동 주문 가격. 0 이면 미전송
+}
+
+type conditionBody struct {
+	OrderSide    Side   `json:"orderSide"`
+	TriggerPrice string `json:"triggerPrice"`
+	OrderPrice   string `json:"orderPrice,omitempty"`
+}
+
+func (c Condition) validate(field string) error {
+	if c.OrderSide == "" {
+		return fmt.Errorf("toss: %s.orderSide is required", field)
+	}
+	if !c.TriggerPrice.IsPositive() {
+		return fmt.Errorf("toss: %s.triggerPrice must be positive (got %s)", field, c.TriggerPrice)
+	}
+	return nil
+}
+
+func (c Condition) body() conditionBody {
+	b := conditionBody{OrderSide: c.OrderSide, TriggerPrice: c.TriggerPrice.String()}
+	if c.OrderPrice.IsPositive() {
+		b.OrderPrice = c.OrderPrice.String()
+	}
+	return b
+}
+
+// Request 는 조건주문 생성 요청.
+type Request struct {
+	Symbol           string          // 필수
+	Type             Type            // 필수. SINGLE/OCO/OTO
+	Quantity         decimal.Decimal // 필수
+	OrderType        OrderType       // 필수
+	ExpireDate       tosstypes.Date  // 필수. 이 날짜까지 감시
+	First            Condition       // 필수
+	Second           *Condition      // OCO/OTO 에서 사용
+	ClientOrderID    string          // 멱등성 키. 설정하면 401 토큰 오류에 1회 재시도한다
+	ConfirmHighValue bool
+}
+
+type placeBody struct {
+	Symbol                string         `json:"symbol"`
+	Type                  Type           `json:"type"`
+	Quantity              string         `json:"quantity"`
+	OrderType             OrderType      `json:"orderType"`
+	ExpireDate            string         `json:"expireDate"`
+	First                 conditionBody  `json:"first"`
+	Second                *conditionBody `json:"second,omitempty"`
+	ClientOrderID         string         `json:"clientOrderId,omitempty"`
+	ConfirmHighValueOrder bool           `json:"confirmHighValueOrder,omitempty"`
+}
+
+// ModifyRequest 는 조건주문 수정 요청. 생성과 같은 필드를 쓰되 clientOrderId 는 받지 않는다.
+type ModifyRequest struct {
+	Type             Type
+	Quantity         decimal.Decimal
+	OrderType        OrderType
+	ExpireDate       tosstypes.Date
+	First            Condition
+	Second           *Condition
+	ConfirmHighValue bool
+}
+
+type modifyBody struct {
+	Type                  Type           `json:"type"`
+	Quantity              string         `json:"quantity"`
+	OrderType             OrderType      `json:"orderType"`
+	ExpireDate            string         `json:"expireDate"`
+	First                 conditionBody  `json:"first"`
+	Second                *conditionBody `json:"second,omitempty"`
+	ConfirmHighValueOrder bool           `json:"confirmHighValueOrder,omitempty"`
+}
+
+func validateCommon(symbol string, typ Type, qty decimal.Decimal, ot OrderType, expire tosstypes.Date, first Condition) error {
+	if err := params.Symbol(symbol); err != nil {
+		return err
+	}
+	if typ == "" {
+		return errors.New("toss: type is required")
+	}
+	if !qty.IsPositive() {
+		return fmt.Errorf("toss: quantity must be positive (got %s)", qty)
+	}
+	if ot == "" {
+		return errors.New("toss: orderType is required")
+	}
+	if expire.IsZero() {
+		return errors.New("toss: expireDate is required")
+	}
+	return first.validate("first")
+}
+
+// Place 는 조건주문을 생성한다(POST /api/v1/conditional-orders).
+// 대표 에러: invalid-order-side, invalid-trigger-price, invalid-tick-size, stock-restricted.
+func (c *Client) Place(ctx context.Context, r Request) (*PlaceResult, error) {
+	if err := validateCommon(r.Symbol, r.Type, r.Quantity, r.OrderType, r.ExpireDate, r.First); err != nil {
+		return nil, err
+	}
+	body := placeBody{
+		Symbol: r.Symbol, Type: r.Type, Quantity: r.Quantity.String(), OrderType: r.OrderType,
+		ExpireDate: r.ExpireDate.String(), First: r.First.body(),
+		ClientOrderID: r.ClientOrderID, ConfirmHighValueOrder: r.ConfirmHighValue,
+	}
+	if r.Second != nil {
+		if err := r.Second.validate("second"); err != nil {
+			return nil, err
+		}
+		sb := r.Second.body()
+		body.Second = &sb
+	}
+	return fetch.PostOne[PlaceResult](ctx, c.http, "/api/v1/conditional-orders", body, c.accountSeq, r.ClientOrderID != "")
+}
+
+// Modify 는 조건주문을 수정한다(POST /api/v1/conditional-orders/{id}/modify).
+// 멱등성 키를 받지 않으므로 401 재시도를 하지 않는다.
+func (c *Client) Modify(ctx context.Context, id string, r ModifyRequest) (*Result, error) {
+	if err := params.Require("conditionalOrderId", id); err != nil {
+		return nil, err
+	}
+	if r.Type == "" {
+		return nil, errors.New("toss: type is required")
+	}
+	if !r.Quantity.IsPositive() {
+		return nil, fmt.Errorf("toss: quantity must be positive (got %s)", r.Quantity)
+	}
+	if r.OrderType == "" {
+		return nil, errors.New("toss: orderType is required")
+	}
+	if r.ExpireDate.IsZero() {
+		return nil, errors.New("toss: expireDate is required")
+	}
+	if err := r.First.validate("first"); err != nil {
+		return nil, err
+	}
+	body := modifyBody{
+		Type: r.Type, Quantity: r.Quantity.String(), OrderType: r.OrderType,
+		ExpireDate: r.ExpireDate.String(), First: r.First.body(), ConfirmHighValueOrder: r.ConfirmHighValue,
+	}
+	if r.Second != nil {
+		if err := r.Second.validate("second"); err != nil {
+			return nil, err
+		}
+		sb := r.Second.body()
+		body.Second = &sb
+	}
+	return fetch.PostOne[Result](ctx, c.http, "/api/v1/conditional-orders/"+url.PathEscape(id)+"/modify", body, c.accountSeq, false)
+}
+
+// Cancel 은 조건주문을 취소한다(DELETE /api/v1/conditional-orders/{id}). 성공 시 본문이 없다(204).
+// 대표 에러: conditional-order-not-found.
+func (c *Client) Cancel(ctx context.Context, id string) error {
+	if err := params.Require("conditionalOrderId", id); err != nil {
+		return err
+	}
+	return fetch.Send(ctx, c.http, http.MethodDelete, "/api/v1/conditional-orders/"+url.PathEscape(id), nil, c.accountSeq)
+}
+EOF
+cat > conditionalorder/history.go << 'EOF'
+package conditionalorder
+
+import (
+	"context"
+	"net/url"
+
+	"github.com/kenshin579/toss-go/internal/fetch"
+	"github.com/kenshin579/toss-go/internal/params"
+)
+
+// ListParams 는 조건주문 목록 조회 인자. Status 는 필수다.
+type ListParams struct {
+	Status StatusFilter // 필수. OPEN / CLOSED
+	Symbol string       // 특정 종목만. 비우면 전체
+	Cursor string       // 이전 응답의 NextCursor
+	Limit  int          // 최대 100, 0 이면 서버 기본값(20)
+}
+
+// List 는 조건주문 목록을 조회한다(GET /api/v1/conditional-orders).
+func (c *Client) List(ctx context.Context, p ListParams) (*Page, error) {
+	if err := params.Require("status", string(p.Status)); err != nil {
+		return nil, err
+	}
+	q := url.Values{"status": {string(p.Status)}}
+	if p.Symbol != "" {
+		if err := params.Symbol(p.Symbol); err != nil {
+			return nil, err
+		}
+		q.Set("symbol", p.Symbol)
+	}
+	params.Str(q, "cursor", p.Cursor)
+	params.Int(q, "limit", p.Limit)
+	return fetch.One[Page](ctx, c.http, "/api/v1/conditional-orders", q, c.accountSeq)
+}
+
+// Get 은 조건주문 상세를 조회한다(GET /api/v1/conditional-orders/{id}).
+// 없으면 404 conditional-order-not-found.
+func (c *Client) Get(ctx context.Context, id string) (*Detail, error) {
+	if err := params.Require("conditionalOrderId", id); err != nil {
+		return nil, err
+	}
+	return fetch.One[Detail](ctx, c.http, "/api/v1/conditional-orders/"+url.PathEscape(id), nil, c.accountSeq)
+}
+EOF
+```
+
+`account.go` 의 `AccountScope` 에 `ConditionalOrder *conditionalorder.Client // 조건주문` 필드와 `ConditionalOrder: conditionalorder.New(c.http, accountSeq),` 를 추가한다.
+
+```bash
+gofmt -w . && go vet ./... && go test ./conditionalorder/ . -race -v 2>&1 | grep -cE '^--- PASS'
+```
+Expected: conditionalorder 10 + 루트 11 = `21` (실행 결과로 확인, 모두 PASS 인지만 본다).
+
+- [ ] **Step 3: 커밋**
+
+```bash
+git add conditionalorder account.go && git commit -m "feat(conditionalorder): 조건주문 생성·수정·취소·목록·상세 5 ops
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 6: 예시 · integration · README · 워크스페이스 CLAUDE.md
+
+**Files:**
+- Create: `examples/order/main.go`
+- Modify: `integration_test.go`, `README.md`, `/Users/user/src/workspace_moneyflow/CLAUDE.md`
+
+- [ ] **Step 1: 조회 전용 예시**
+
+```bash
+mkdir -p examples/order && cat > examples/order/main.go << 'EOF'
+// 계좌·주문 조회 예시. 실행: TOSS_CLIENT_ID=... TOSS_CLIENT_SECRET=... go run ./examples/order
+//
+// 이 예시는 조회만 한다. 실제 주문을 내는 코드는 주석으로만 두었다 — 실행하면 실제 체결로 이어진다.
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"time"
+
+	toss "github.com/kenshin579/toss-go"
+	"github.com/kenshin579/toss-go/order"
+	"github.com/kenshin579/toss-go/tosstypes"
+)
+
+func main() {
+	c, err := toss.NewClientFromEnv()
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	accts, err := c.Accounts(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if len(accts) == 0 {
+		log.Fatal("no accounts")
+	}
+	a := c.Account(accts[0].AccountSeq)
+	fmt.Printf("account %s (%s)\n", accts[0].AccountNo, accts[0].AccountType)
+
+	h, err := a.Asset.Holdings(ctx, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("평가금액 %s KRW, 손익률 %s\n", h.MarketValue.Amount.KRW, h.ProfitLoss.Rate)
+	for _, it := range h.Items {
+		fmt.Printf("  %s %s: %s주 @ %s\n", it.Symbol, it.Name, it.Quantity, it.LastPrice)
+	}
+
+	bp, err := a.Order.BuyingPower(ctx, tosstypes.CurrencyKRW)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("매수 가능 금액:", bp.CashBuyingPower)
+
+	page, err := a.Order.List(ctx, order.ListParams{Status: order.StatusFilterOpen, Limit: 10})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("진행 중 주문 %d건\n", len(page.Orders))
+	for _, o := range page.Orders {
+		fmt.Printf("  %s %s %s %s주 (%s)\n", o.OrderID[:8], o.Symbol, o.Side, o.Quantity, o.Status)
+	}
+
+	// 실제 주문 예시 — 실행하면 진짜 주문이 나간다. 필요할 때만 주석을 풀 것.
+	//
+	//	res, err := a.Order.Place(ctx, order.Request{
+	//	    Symbol: "005930", Side: order.SideBuy, OrderType: order.TypeLimit,
+	//	    Quantity: decimal.NewFromInt(1), Price: decimal.NewFromInt(50000),
+	//	    ClientOrderID: toss.NewClientOrderID(), // 멱등성 키 권장
+	//	})
+	//	if err != nil { log.Fatal(err) }
+	//	fmt.Println("주문 접수:", res.OrderID)
+	//	if _, err := a.Order.Cancel(ctx, res.OrderID); err != nil { log.Fatal(err) }
+}
+EOF
+go vet ./examples/... && echo VET_OK
+```
+Expected: `VET_OK`.
+
+- [ ] **Step 2: integration 테스트 — 조회 9개만**
+
+`integration_test.go` 끝에 추가한다. **쓰기 메서드는 호출하지 않는다.**
+
+```bash
+cat >> integration_test.go << 'EOF'
+
+// TestIntegration_AccountReadOnly 는 계좌·주문 조회만 호출한다.
+// 주문 생성·정정·취소·조건주문 쓰기는 실제 체결로 이어지므로 integration 테스트에서 절대 호출하지 않는다.
+func TestIntegration_AccountReadOnly(t *testing.T) {
+	c := newIntegrationClient(t)
+	ctx := context.Background()
+
+	accts, err := c.Accounts(ctx)
+	if err != nil {
+		t.Fatalf("Accounts: %v", err)
+	}
+	if len(accts) == 0 {
+		t.Skip("no accounts on this credential")
+	}
+	if accts[0].AccountNo == "" || accts[0].AccountSeq == 0 {
+		t.Errorf("account = %+v", accts[0])
+	}
+	a := c.Account(accts[0].AccountSeq)
+	time.Sleep(1100 * time.Millisecond) // ACCOUNT 그룹 1/s
+
+	if _, err := a.Asset.Holdings(ctx, nil); err != nil {
+		t.Errorf("Holdings: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	if _, err := a.Order.BuyingPower(ctx, tosstypes.CurrencyKRW); err != nil {
+		t.Errorf("BuyingPower: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	if _, err := a.Order.Commissions(ctx); err != nil {
+		t.Errorf("Commissions: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	page, err := a.Order.List(ctx, order.ListParams{Status: order.StatusFilterClosed, Limit: 5})
+	if err != nil {
+		t.Fatalf("Order.List: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if len(page.Orders) > 0 {
+		if _, err := a.Order.Get(ctx, page.Orders[0].OrderID); err != nil {
+			t.Errorf("Order.Get: %v", err)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+
+	cpage, err := a.ConditionalOrder.List(ctx, conditionalorder.ListParams{Status: conditionalorder.StatusFilterOpen, Limit: 5})
+	if err != nil {
+		t.Fatalf("ConditionalOrder.List: %v", err)
+	}
+	if len(cpage.ConditionalOrders) > 0 {
+		time.Sleep(300 * time.Millisecond)
+		if _, err := a.ConditionalOrder.Get(ctx, cpage.ConditionalOrders[0].ConditionalOrderID); err != nil {
+			t.Errorf("ConditionalOrder.Get: %v", err)
+		}
+	}
+}
+EOF
+```
+import 에 `"github.com/kenshin579/toss-go/order"`, `"github.com/kenshin579/toss-go/conditionalorder"` 를 추가한다.
+
+```bash
+gofmt -w . && go vet -tags integration ./... && echo VET_OK
+```
+Expected: `VET_OK`. 실행은 허용 IP 가 등록된 환경에서만 성공한다 — 현재 환경에서는 403 이며 그대로 보고한다.
+
+- [ ] **Step 3: README 갱신**
+
+`## 커버리지` 표 아래에 계좌 스코프 표를 추가한다:
+```markdown
+계좌가 필요한 API 는 `c.Account(accountSeq)` 스코프 아래에 있다(`X-Tossinvest-Account` 헤더 자동 주입).
+
+| 그룹 | 필드 | 메서드 |
+| --- | --- | --- |
+| Account | (루트) | `Accounts` |
+| Asset | `Asset` | `Holdings` |
+| Order | `Order` | `Place` `PlaceAmount` `Modify` `Cancel` `List` `Get` `BuyingPower` `SellableQuantity` `Commissions` |
+| Conditional Order | `ConditionalOrder` | `Place` `Modify` `Cancel` `List` `Get` |
+
+조회 21 + 계좌·주문 15 = 36 ops (v0.2.0). 실시간 웹소켓은 후속 버전.
+```
+
+`## 사용` 섹션 끝에 계좌 예시와 주의사항을 추가한다:
+````markdown
+### 계좌·주문
+
+```go
+accts, _ := c.Accounts(ctx)          // 계좌 헤더가 필요 없는 유일한 계좌 API
+a := c.Account(accts[0].AccountSeq)  // 이후 모든 호출에 계좌 헤더 자동 주입
+
+h, _ := a.Asset.Holdings(ctx, nil)
+bp, _ := a.Order.BuyingPower(ctx, tosstypes.CurrencyKRW)
+
+res, err := a.Order.Place(ctx, order.Request{
+    Symbol: "005930", Side: order.SideBuy, OrderType: order.TypeLimit,
+    Quantity: decimal.NewFromInt(1), Price: decimal.NewFromInt(70000),
+    ClientOrderID: toss.NewClientOrderID(), // 멱등성 키(권장)
+})
+```
+
+**주문 시 주의**
+
+- `ClientOrderID` 를 넣으면 10분간 멱등성이 적용되고(같은 값으로 재요청 시 이전 결과 반환),
+  SDK 가 401 토큰 오류에 요청을 1회 재시도한다. **키가 없으면 쓰기 요청은 재시도하지 않는다** — 중복 주문을 만들지 않기 위해서다.
+- 1억원 이상 주문은 `ConfirmHighValue: true` 가 없으면 `400 confirm-high-value-required`.
+- 금액 주문(`PlaceAmount`)과 소수점 수량 주문은 **미국 주식 전용**이며 정규장 시작~종료 1시간 전에만 접수된다.
+- SDK 는 요청 조립 오류(필수 누락·형식)만 검증한다. 호가단위·잔고·거래시간 같은 상태 의존 규칙은
+  서버가 판단하며 `*toss.APIError` 로 돌아온다.
+````
+
+- [ ] **Step 4: 워크스페이스 CLAUDE.md** — `/Users/user/src/workspace_moneyflow/CLAUDE.md` 의 toss-go 항목 2곳에서 "조회 21 ops, 주문·WS 예정" → "조회 21 + 계좌·주문 15 = 36 ops, WS 예정", `**Module**` 문장의 그룹 목록에 `Account/Asset/Order/ConditionalOrder` 를 추가한다(파일만 수정, 커밋 없음 — git 저장소 아님).
+
+- [ ] **Step 5: 전체 검증 + 커밋**
+
+```bash
+gofmt -l . ; go build ./... && go vet ./... && go vet -tags integration ./... && go test ./... -race -count=1 2>&1 | tail -16 && go mod tidy && git status --short
+git add -A && git commit -m "docs: 계좌·주문 예시·integration(조회 전용)·README
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+Expected: 전 패키지 `ok`, `go mod tidy` 후 변경 없음.
+
+---
+
+### Task 7: PR 생성
+
+- [ ] **Step 1: 푸시 + PR (gh + HEREDOC, 리뷰어 지정 금지)**
+
+```bash
+git push -u origin feature/account-order && gh pr create --title "feat: 계좌·주문 15 ops (v0.2.0)" --body "$(cat <<'EOF'
+## Summary
+- 계좌 스코프 클라이언트 `c.Account(accountSeq)` — `X-Tossinvest-Account` 헤더 자동 주입, 헤더가 필요 없는 `c.Accounts(ctx)` 는 루트
+- `asset` 1 op(보유 주식), `order` 8 ops(생성·정정·취소·목록·상세·매수가능금액·판매가능수량·수수료), `conditionalorder` 5 ops
+- `internal/httpclient` 에 `Request`/`Do` 추가 — POST/DELETE, 계좌 헤더, 204, **멱등성 키가 있을 때만 쓰기 재시도**(중복 주문 방지)
+- 주문 생성은 openapi `oneOf` 를 `Place`(수량)/`PlaceAmount`(금액, US 시장가 전용) 두 메서드로 분리
+- `toss.NewClientOrderID()` 멱등성 키 헬퍼, 자주 쓰는 에러 코드 상수
+- 설계 `docs/superpowers/specs/2026-09-04-account-order-design.md`, 계획 `docs/superpowers/plans/2026-09-04-account-order.md`
+
+## 안전
+- **실주문을 내는 코드는 없다.** integration 테스트는 조회 9개만 호출하고, 예시의 주문 코드는 주석 처리했다.
+- 쓰기 경로는 스텁 서버로 요청 바디·헤더·재시도 정책만 검증한다.
+
+## Test plan
+- [x] `go build ./... && go vet ./... && go vet -tags integration ./... && go test ./... -race` 통과
+- [x] 멱등성 키 없는 쓰기는 401 에 재시도하지 않음(httpclient 테스트)
+- [x] 204(조건주문 취소) 처리, 계좌 헤더 주입/미주입
+- [ ] `go test -tags integration ./...` — 허용 IP 등록 환경에서 재실행 필요(현재 IP 는 403 access_denied)
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+EOF
+)" && gh pr view --json number,title,url,baseRefName,headRefName,reviewRequests
+```
+Expected: PR URL, base `main`, head `feature/account-order`, reviewRequests 비어 있음.
+
+---
+
+## 머지 후 (사용자 머지 뒤 실행)
+
+```bash
+git checkout main && git pull origin main && ./scripts/release.sh v0.2.0
+```
+이후 메모리(`toss_go_library.md`)를 갱신하고, 다음 스펙(WebSocket)을 브레인스토밍한다.
