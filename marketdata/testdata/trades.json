@@ -1,0 +1,16 @@
+{
+  "result": [
+    {
+      "price": "248000",
+      "volume": "1",
+      "timestamp": "2026-09-03T19:59:59.000+09:00",
+      "currency": "KRW"
+    },
+    {
+      "price": "247500",
+      "volume": "200",
+      "timestamp": "2026-09-03T19:59:59.000+09:00",
+      "currency": "KRW"
+    }
+  ]
+}

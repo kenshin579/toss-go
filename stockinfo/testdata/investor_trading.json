@@ -1,0 +1,74 @@
+{
+  "result": {
+    "nextUntil": "2026-09-02",
+    "records": [
+      {
+        "date": "2026-09-03",
+        "updatedAt": "2026-09-03T20:21:28.000+09:00",
+        "individual": {
+          "buyVolume": "9705436",
+          "sellVolume": "10953700",
+          "netBuyVolume": "-1248264"
+        },
+        "foreigner": {
+          "buyVolume": "3898908",
+          "sellVolume": "3784567",
+          "netBuyVolume": "114341"
+        },
+        "institution": {
+          "buyVolume": "5714198",
+          "sellVolume": "6574761",
+          "netBuyVolume": "-860563",
+          "breakdown": {
+            "financialInvestment": {
+              "buyVolume": "1036782",
+              "sellVolume": "1389914",
+              "netBuyVolume": "-353132"
+            },
+            "insurance": {
+              "buyVolume": "44622",
+              "sellVolume": "39091",
+              "netBuyVolume": "5531"
+            },
+            "trust": {
+              "buyVolume": "112108",
+              "sellVolume": "493260",
+              "netBuyVolume": "-381152"
+            },
+            "privateEquityFund": {
+              "buyVolume": "267038",
+              "sellVolume": "144523",
+              "netBuyVolume": "122515"
+            },
+            "bank": {
+              "buyVolume": "40",
+              "sellVolume": "6",
+              "netBuyVolume": "34"
+            },
+            "otherFinancialInstitution": {
+              "buyVolume": "1073",
+              "sellVolume": "9606",
+              "netBuyVolume": "-8533"
+            },
+            "pensionFund": {
+              "buyVolume": "4252535",
+              "sellVolume": "4498361",
+              "netBuyVolume": "-245826"
+            }
+          }
+        },
+        "otherCorporation": {
+          "buyVolume": "2124770",
+          "sellVolume": "129354",
+          "netBuyVolume": "1995416"
+        },
+        "foreignerHolding": {
+          "holdingQuantity": "2730744673",
+          "limitQuantity": "5846278608",
+          "holdingRate": "0.4671"
+        },
+        "cfd": null
+      }
+    ]
+  }
+}
