@@ -9,7 +9,7 @@ import (
 )
 
 // MaxClientOrderIDLen 은 clientOrderId 최대 길이(토스 규칙).
-const MaxClientOrderIDLen = 36
+const MaxClientOrderIDLen = params.MaxClientOrderIDLen
 
 // NewClientOrderID 는 멱등성 키로 쓸 새 clientOrderId 를 만든다(32자, URL-safe).
 //

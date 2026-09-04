@@ -955,7 +955,7 @@ import (
 )
 
 // MaxClientOrderIDLen 은 clientOrderId 최대 길이(토스 규칙).
-const MaxClientOrderIDLen = 36
+const MaxClientOrderIDLen = params.MaxClientOrderIDLen
 
 // NewClientOrderID 는 멱등성 키로 쓸 새 clientOrderId 를 만든다(32자, URL-safe).
 //
@@ -2686,7 +2686,7 @@ cat > conditionalorder/client.go << 'EOF'
 //
 // 조건주문은 트리거 조건(가격 도달)이 충족되면 실제 주문을 낸다. 이 API 로 만들 수 있는 조건은
 // 가격 도달(STOP)뿐이다. 목표 수익률(PROFIT_RATE) 조건은 토스 앱 등에서 만든 것을 조회만 할 수 있다.
-// SDK 는 요청 조립 오류만 사전 검증하고, 호가단위·잔고 등은 서버가 판단한다.
+// SDK 는 요청 조립·구조 오류를 사전 검증하고, 호가단위·잔고 등은 서버가 판단한다.
 //
 // 발동 세션: 국내는 KRX 정규장에서만, 해외는 거래 가능한 모든 시간대에 발동된다.
 //
