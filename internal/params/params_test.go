@@ -12,11 +12,46 @@ func TestRequire(t *testing.T) {
 	if err := Require("symbol", ""); err == nil || err.Error() != "toss: symbol must not be empty" {
 		t.Errorf("got %v", err)
 	}
-	if err := Require("symbol", " "); err == nil {
-		t.Error("whitespace must be rejected")
+	if err := Require("symbol", " "); err != nil {
+		t.Error("whitespace is not empty; format is validated by Symbol")
 	}
 	if err := Require("symbol", "005930"); err != nil {
 		t.Error(err)
+	}
+}
+
+func TestSymbol(t *testing.T) {
+	for _, ok := range []string{"005930", "AAPL", "BRK.B", "BF-B", "aapl"} {
+		if err := Symbol(ok); err != nil {
+			t.Errorf("Symbol(%q) = %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", " 005930", "005930 ", "삼성", "A/B", "a,b"} {
+		if err := Symbol(bad); err == nil {
+			t.Errorf("Symbol(%q) must fail", bad)
+		}
+	}
+}
+
+func TestSymbols(t *testing.T) {
+	if got, err := Symbols([]string{"005930", "AAPL"}); err != nil || got != "005930,AAPL" {
+		t.Errorf("got %q, %v", got, err)
+	}
+	if _, err := Symbols(nil); err == nil {
+		t.Error("empty must fail")
+	}
+	if _, err := Symbols([]string{"005930", ""}); err == nil {
+		t.Error("empty element must fail")
+	}
+	many := make([]string, MaxSymbols+1)
+	for i := range many {
+		many[i] = "A"
+	}
+	if _, err := Symbols(many); err == nil {
+		t.Error("over max must fail")
+	}
+	if _, err := Symbols(many[:MaxSymbols]); err != nil {
+		t.Errorf("exactly max must pass: %v", err)
 	}
 }
 

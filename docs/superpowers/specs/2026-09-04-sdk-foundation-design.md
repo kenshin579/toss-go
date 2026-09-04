@@ -64,7 +64,9 @@ toss-go/
 ├── internal/
 │   ├── auth/               # 토큰 발급 + 메모리 캐시 (mutex, 만료 60초 전 갱신)
 │   ├── httpclient/         # Bearer 주입, {result} 봉투 해제, {error}→APIError, 401 토큰 오류 1회 재발급·재시도
-│   └── strutil/            # 에러 메시지 절단 헬퍼(auth·httpclient 공용)
+│   ├── strutil/            # 에러 메시지 절단 헬퍼(auth·httpclient 공용)
+│   ├── fetch/              # One/List 제네릭 조회 헬퍼
+│   └── params/             # 쿼리 조립·심볼 검증(Symbol/Symbols, 최대 200)
 ├── tosstypes/              # Date, Currency, Market, Interval, SecurityType, ... (문자열 enum + 상수)
 ├── marketdata/             # Prices / Orderbook / Trades / PriceLimits / Candles
 ├── stockinfo/              # Stocks / ListStocks / Warnings / 매매동향 5종
@@ -158,6 +160,7 @@ func IsCode(err error, code string) bool   // errors.As(APIError) && Code == cod
   그대로 보존**(검증으로 거부하지 않음). 정확한 상수 목록은 `openapi.json` enum 에서 구현 시 확정.
 - date-time 은 표준 `time.Time`(RFC3339 `.000+09:00` 파싱 가능), null 가능은 `*time.Time`.
 - 수치는 `decimal.Decimal`, null 가능은 `*decimal.Decimal`.
+- 심볼은 요청 전에 `^[A-Za-z0-9.\-]+$` 로 검증하고 `symbols=` 는 최대 200개(openapi 규칙) — 서버 400 으로 rate limit 을 소모하지 않기 위함.
 
 ## 엔드포인트 매핑 (21 ops)
 

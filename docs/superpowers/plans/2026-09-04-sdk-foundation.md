@@ -24,6 +24,8 @@
 | `internal/httpclient/client.go` (+`_test.go`) | `Client.Get` — Bearer, 봉투 해제, `APIError`, 401 재시도, 429 RetryAfter |
 | `internal/strutil/strutil.go` (+`_test.go`) | 에러 메시지용 rune-safe Truncate (auth·httpclient 공용) |
 | `internal/testutil/server.go` | 테스트용 `httptest` 서버 + 고정 토큰 `httpclient.Client` 생성 |
+| `internal/params/params.go` (+`_test.go`) | 쿼리 조립(zero-value 생략, RFC3339) + 필수값/`Symbol`·`Symbols`(최대 200개, 형식 검증) 헬퍼 |
+| `internal/fetch/fetch.go` (+`_test.go`) | `One`/`List` 제네릭 조회 헬퍼 — `httpclient.Get` 호출과 결과 포인터/슬라이스 반환만 담당 |
 | `client.go` / `config.go` / `from_env.go` / `errors.go` (+`client_test.go`) | 루트 진입점, Option, env, 에러 재수출·`IsCode` |
 | `marketdata/` | `client.go`, `prices.go`, `orderbook.go`, `trades.go`, `price_limits.go`, `candles.go`, 테스트, `testdata/` |
 | `stockinfo/` | `client.go`, `stocks.go`, `warnings.go`, `trend.go`(5종 매매동향 + 제네릭 페이지), 테스트, `testdata/` |
@@ -1410,10 +1412,11 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 4: `internal/params` + `marketdata` (5 ops)
+### Task 4: `internal/params` + `internal/fetch` + `marketdata` (5 ops)
 
 **Files:**
 - Create: `internal/params/params.go`, `internal/params/params_test.go`
+- Create: `internal/fetch/fetch.go`, `internal/fetch/fetch_test.go`
 - Create: `marketdata/client.go`, `marketdata/prices.go`, `marketdata/orderbook.go`, `marketdata/trades.go`, `marketdata/price_limits.go`, `marketdata/candles.go`, `marketdata/marketdata_test.go`
 - Move: `testdata/captured/{prices_symbols_005930_AAPL_,prices_symbols_ZZZZZZ_,orderbook_symbol_005930_,trades_symbol_005930_count_2_,price_limits_symbol_005930_,candles_symbol_005930_interval_1d_count_2_}.json` → `marketdata/testdata/`
 
@@ -1435,11 +1438,46 @@ func TestRequire(t *testing.T) {
 	if err := Require("symbol", ""); err == nil || err.Error() != "toss: symbol must not be empty" {
 		t.Errorf("got %v", err)
 	}
-	if err := Require("symbol", " "); err == nil {
-		t.Error("whitespace must be rejected")
+	if err := Require("symbol", " "); err != nil {
+		t.Error("whitespace is not empty; format is validated by Symbol")
 	}
 	if err := Require("symbol", "005930"); err != nil {
 		t.Error(err)
+	}
+}
+
+func TestSymbol(t *testing.T) {
+	for _, ok := range []string{"005930", "AAPL", "BRK.B", "BF-B", "aapl"} {
+		if err := Symbol(ok); err != nil {
+			t.Errorf("Symbol(%q) = %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", " 005930", "005930 ", "삼성", "A/B", "a,b"} {
+		if err := Symbol(bad); err == nil {
+			t.Errorf("Symbol(%q) must fail", bad)
+		}
+	}
+}
+
+func TestSymbols(t *testing.T) {
+	if got, err := Symbols([]string{"005930", "AAPL"}); err != nil || got != "005930,AAPL" {
+		t.Errorf("got %q, %v", got, err)
+	}
+	if _, err := Symbols(nil); err == nil {
+		t.Error("empty must fail")
+	}
+	if _, err := Symbols([]string{"005930", ""}); err == nil {
+		t.Error("empty element must fail")
+	}
+	many := make([]string, MaxSymbols+1)
+	for i := range many {
+		many[i] = "A"
+	}
+	if _, err := Symbols(many); err == nil {
+		t.Error("over max must fail")
+	}
+	if _, err := Symbols(many[:MaxSymbols]); err != nil {
+		t.Errorf("exactly max must pass: %v", err)
 	}
 }
 
@@ -1475,8 +1513,10 @@ cat > internal/params/params.go << 'EOF'
 package params
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -1484,12 +1524,42 @@ import (
 	"github.com/kenshin579/toss-go/tosstypes"
 )
 
-// Require 는 필수 문자열이 비어 있으면 에러를 돌려준다.
+// Require 는 필수 문자열이 비어 있으면 에러를 돌려준다. 값은 그대로 전송되므로 공백 트리밍은 하지 않는다.
 func Require(name, v string) error {
-	if strings.TrimSpace(v) == "" {
+	if v == "" {
 		return fmt.Errorf("toss: %s must not be empty", name)
 	}
 	return nil
+}
+
+// symbolPattern 은 토스 심볼 규칙(openapi components.parameters.Symbol): 영문 대/소문자, 숫자, '.', '-'.
+var symbolPattern = regexp.MustCompile(`^[A-Za-z0-9.\-]+$`)
+
+// MaxSymbols 는 symbols= 쿼리에 넣을 수 있는 최대 심볼 수(openapi: 최대 200개).
+const MaxSymbols = 200
+
+// Symbol 은 심볼 형식을 검증한다(빈 값·공백·허용 외 문자 거부). 요청을 보내기 전에 실패시켜 rate limit 을 아낀다.
+func Symbol(v string) error {
+	if !symbolPattern.MatchString(v) {
+		return fmt.Errorf("toss: invalid symbol %q (allowed: A-Z a-z 0-9 . -)", v)
+	}
+	return nil
+}
+
+// Symbols 는 symbols= 쿼리 값을 만든다. 빈 목록, 형식 위반 원소, MaxSymbols 초과를 거부한다.
+func Symbols(symbols []string) (string, error) {
+	if len(symbols) == 0 {
+		return "", errors.New("toss: symbols must not be empty")
+	}
+	if len(symbols) > MaxSymbols {
+		return "", fmt.Errorf("toss: too many symbols %d (max %d)", len(symbols), MaxSymbols)
+	}
+	for _, s := range symbols {
+		if err := Symbol(s); err != nil {
+			return "", err
+		}
+	}
+	return strings.Join(symbols, ","), nil
 }
 
 // Str 은 s 가 비어 있지 않으면 설정한다.
@@ -1499,7 +1569,7 @@ func Str(v url.Values, key, s string) {
 	}
 }
 
-// Int 는 n > 0 이면 설정한다.
+// Int 는 n > 0 이면 설정한다. 스펙상 모든 integer 파라미터는 minimum 1 이라 0 은 "미지정" 으로 안전하다.
 func Int(v url.Values, key string, n int) {
 	if n > 0 {
 		v.Set(key, strconv.Itoa(n))
@@ -1530,6 +1600,106 @@ EOF
 gofmt -l internal; go vet ./internal/params/ && go test ./internal/params/ 2>&1 | tail -2
 ```
 Expected: `ok  	github.com/kenshin579/toss-go/internal/params`.
+
+- [ ] **Step 1b: internal/fetch (제네릭 One/List 헬퍼)**
+
+```bash
+mkdir -p internal/fetch && cat > internal/fetch/fetch.go << 'EOF'
+// Package fetch 는 그룹 패키지가 공유하는 제네릭 조회 헬퍼다. 검증·쿼리 조립은 호출 측이 하고,
+// 여기서는 httpclient.Get 호출과 결과 포인터/슬라이스 반환만 담당한다.
+package fetch
+
+import (
+	"context"
+	"net/url"
+
+	"github.com/kenshin579/toss-go/internal/httpclient"
+)
+
+// One 은 result 객체 하나를 *T 로 디코딩한다. 실패 시 nil 과 에러.
+func One[T any](ctx context.Context, hc *httpclient.Client, path string, q url.Values) (*T, error) {
+	var out T
+	if err := hc.Get(ctx, path, q, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// List 는 result 배열을 []T 로 디코딩한다. 빈 배열은 nil 이 아닌 빈 슬라이스, 실패 시 nil 과 에러.
+func List[T any](ctx context.Context, hc *httpclient.Client, path string, q url.Values) ([]T, error) {
+	out := []T{}
+	if err := hc.Get(ctx, path, q, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+EOF
+cat > internal/fetch/fetch_test.go << 'EOF'
+package fetch
+
+import (
+	"context"
+	"errors"
+	"net/url"
+	"testing"
+
+	"github.com/kenshin579/toss-go/internal/httpclient"
+	"github.com/kenshin579/toss-go/internal/testutil"
+)
+
+type item struct {
+	Symbol string `json:"symbol"`
+}
+
+func TestOne(t *testing.T) {
+	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/one", Query: url.Values{"a": {"1"}}}, 200, []byte(`{"result":{"symbol":"X"}}`))
+	defer done()
+	got, err := One[item](context.Background(), hc, "/one", url.Values{"a": {"1"}})
+	if err != nil || got == nil || got.Symbol != "X" {
+		t.Fatalf("got %+v, %v", got, err)
+	}
+}
+
+func TestOne_ErrorReturnsNil(t *testing.T) {
+	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/one"}, 404, []byte(`{"error":{"requestId":"r","code":"stock-not-found","message":""}}`))
+	defer done()
+	got, err := One[item](context.Background(), hc, "/one", nil)
+	var ae *httpclient.APIError
+	if got != nil || !errors.As(err, &ae) || ae.Code != "stock-not-found" {
+		t.Fatalf("got %+v, %v", got, err)
+	}
+}
+
+func TestList(t *testing.T) {
+	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/list"}, 200, []byte(`{"result":[{"symbol":"A"},{"symbol":"B"}]}`))
+	defer done()
+	got, err := List[item](context.Background(), hc, "/list", nil)
+	if err != nil || len(got) != 2 || got[1].Symbol != "B" {
+		t.Fatalf("got %+v, %v", got, err)
+	}
+}
+
+func TestList_EmptyIsNonNil(t *testing.T) {
+	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/list"}, 200, []byte(`{"result":[]}`))
+	defer done()
+	got, err := List[item](context.Background(), hc, "/list", nil)
+	if err != nil || got == nil || len(got) != 0 {
+		t.Fatalf("got %#v, %v", got, err)
+	}
+}
+
+func TestList_ErrorReturnsNil(t *testing.T) {
+	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/list"}, 500, []byte(`oops`))
+	defer done()
+	got, err := List[item](context.Background(), hc, "/list", nil)
+	if got != nil || err == nil {
+		t.Fatalf("got %#v, %v", got, err)
+	}
+}
+EOF
+go test ./internal/fetch/ 2>&1 | tail -2
+```
+Expected: `ok  	github.com/kenshin579/toss-go/internal/fetch`.
 
 - [ ] **Step 2: fixture 이동**
 
@@ -1582,13 +1752,13 @@ func TestPrices_EmptyResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 0 {
+	if got == nil || len(got) != 0 {
 		t.Errorf("want empty, got %+v", got)
 	}
 }
 
 func TestPrices_NoSymbols(t *testing.T) {
-	if _, err := New(nil).Prices(context.Background()); err == nil {
+	if _, err := New(nil).Prices(context.Background()); err == nil { // nil client: 검증이 요청 전에 실패해야 한다
 		t.Error("want error")
 	}
 }
@@ -1670,12 +1840,29 @@ func TestCandles(t *testing.T) {
 }
 
 func TestCandles_Validation(t *testing.T) {
-	c := New(nil)
+	c := New(nil) // nil client: 검증이 요청 전에 실패해야 한다
 	if _, err := c.Candles(context.Background(), CandlesParams{Interval: tosstypes.Interval1d}); err == nil {
 		t.Error("want error for empty symbol")
 	}
 	if _, err := c.Candles(context.Background(), CandlesParams{Symbol: "005930"}); err == nil {
 		t.Error("want error for empty interval")
+	}
+}
+
+func TestEmptySymbolRejected(t *testing.T) {
+	c := New(nil) // nil client: 검증이 요청 전에 실패해야 한다
+	ctx := context.Background()
+	if _, err := c.Orderbook(ctx, ""); err == nil {
+		t.Error("Orderbook")
+	}
+	if _, err := c.Trades(ctx, " 005930", 1); err == nil {
+		t.Error("Trades with whitespace")
+	}
+	if _, err := c.PriceLimits(ctx, "삼성"); err == nil {
+		t.Error("PriceLimits non-ascii")
+	}
+	if _, err := c.Prices(ctx, "005930", ""); err == nil {
+		t.Error("Prices empty element")
 	}
 }
 EOF
@@ -1706,13 +1893,13 @@ package marketdata
 
 import (
 	"context"
-	"errors"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/shopspring/decimal"
 
+	"github.com/kenshin579/toss-go/internal/fetch"
+	"github.com/kenshin579/toss-go/internal/params"
 	"github.com/kenshin579/toss-go/tosstypes"
 )
 
@@ -1724,14 +1911,13 @@ type Price struct {
 	Currency  tosstypes.Currency `json:"currency"`
 }
 
-// Prices 는 여러 종목의 현재가를 조회한다(GET /api/v1/prices). 없는 심볼은 결과에서 빠진다.
+// Prices 는 여러 종목의 현재가를 조회한다(GET /api/v1/prices). 최대 200개. 없는 심볼은 결과에서 빠진다.
 func (c *Client) Prices(ctx context.Context, symbols ...string) ([]Price, error) {
-	if len(symbols) == 0 {
-		return nil, errors.New("toss: symbols must not be empty")
+	joined, err := params.Symbols(symbols)
+	if err != nil {
+		return nil, err
 	}
-	var out []Price
-	err := c.http.Get(ctx, "/api/v1/prices", url.Values{"symbols": {strings.Join(symbols, ",")}}, &out)
-	return out, err
+	return fetch.List[Price](ctx, c.http, "/api/v1/prices", url.Values{"symbols": {joined}})
 }
 EOF
 cat > marketdata/orderbook.go << 'EOF'
@@ -1744,6 +1930,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/kenshin579/toss-go/internal/fetch"
 	"github.com/kenshin579/toss-go/internal/params"
 	"github.com/kenshin579/toss-go/tosstypes"
 )
@@ -1756,7 +1943,7 @@ type OrderbookEntry struct {
 
 // Orderbook 은 매도/매수 호가.
 type Orderbook struct {
-	Timestamp *time.Time         `json:"timestamp"`
+	Timestamp *time.Time         `json:"timestamp"` // 호가 시각. 호가가 없으면(장외 등) nil
 	Currency  tosstypes.Currency `json:"currency"`
 	Asks      []OrderbookEntry   `json:"asks"` // 매도 호가(낮은 가격부터)
 	Bids      []OrderbookEntry   `json:"bids"` // 매수 호가(높은 가격부터)
@@ -1764,14 +1951,10 @@ type Orderbook struct {
 
 // Orderbook 은 호가를 조회한다(GET /api/v1/orderbook).
 func (c *Client) Orderbook(ctx context.Context, symbol string) (*Orderbook, error) {
-	if err := params.Require("symbol", symbol); err != nil {
+	if err := params.Symbol(symbol); err != nil {
 		return nil, err
 	}
-	var out Orderbook
-	if err := c.http.Get(ctx, "/api/v1/orderbook", url.Values{"symbol": {symbol}}, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return fetch.One[Orderbook](ctx, c.http, "/api/v1/orderbook", url.Values{"symbol": {symbol}})
 }
 EOF
 cat > marketdata/trades.go << 'EOF'
@@ -1784,6 +1967,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/kenshin579/toss-go/internal/fetch"
 	"github.com/kenshin579/toss-go/internal/params"
 	"github.com/kenshin579/toss-go/tosstypes"
 )
@@ -1798,14 +1982,12 @@ type Trade struct {
 
 // Trades 는 최근 체결 내역을 조회한다(GET /api/v1/trades). count 는 최대 50, 0 이면 서버 기본값(50).
 func (c *Client) Trades(ctx context.Context, symbol string, count int) ([]Trade, error) {
-	if err := params.Require("symbol", symbol); err != nil {
+	if err := params.Symbol(symbol); err != nil {
 		return nil, err
 	}
 	q := url.Values{"symbol": {symbol}}
 	params.Int(q, "count", count)
-	var out []Trade
-	err := c.http.Get(ctx, "/api/v1/trades", q, &out)
-	return out, err
+	return fetch.List[Trade](ctx, c.http, "/api/v1/trades", q)
 }
 EOF
 cat > marketdata/price_limits.go << 'EOF'
@@ -1818,6 +2000,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/kenshin579/toss-go/internal/fetch"
 	"github.com/kenshin579/toss-go/internal/params"
 	"github.com/kenshin579/toss-go/tosstypes"
 )
@@ -1832,14 +2015,10 @@ type PriceLimits struct {
 
 // PriceLimits 는 상/하한가를 조회한다(GET /api/v1/price-limits).
 func (c *Client) PriceLimits(ctx context.Context, symbol string) (*PriceLimits, error) {
-	if err := params.Require("symbol", symbol); err != nil {
+	if err := params.Symbol(symbol); err != nil {
 		return nil, err
 	}
-	var out PriceLimits
-	if err := c.http.Get(ctx, "/api/v1/price-limits", url.Values{"symbol": {symbol}}, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return fetch.One[PriceLimits](ctx, c.http, "/api/v1/price-limits", url.Values{"symbol": {symbol}})
 }
 EOF
 cat > marketdata/candles.go << 'EOF'
@@ -1852,6 +2031,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/kenshin579/toss-go/internal/fetch"
 	"github.com/kenshin579/toss-go/internal/params"
 	"github.com/kenshin579/toss-go/tosstypes"
 )
@@ -1884,7 +2064,7 @@ type CandlesParams struct {
 
 // Candles 는 캔들 차트를 조회한다(GET /api/v1/candles).
 func (c *Client) Candles(ctx context.Context, p CandlesParams) (*CandlePage, error) {
-	if err := params.Require("symbol", p.Symbol); err != nil {
+	if err := params.Symbol(p.Symbol); err != nil {
 		return nil, err
 	}
 	if err := params.Require("interval", string(p.Interval)); err != nil {
@@ -1894,21 +2074,17 @@ func (c *Client) Candles(ctx context.Context, p CandlesParams) (*CandlePage, err
 	params.Int(q, "count", p.Count)
 	params.Time(q, "before", p.Before)
 	params.Bool(q, "adjusted", p.Adjusted)
-	var out CandlePage
-	if err := c.http.Get(ctx, "/api/v1/candles", q, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return fetch.One[CandlePage](ctx, c.http, "/api/v1/candles", q)
 }
 EOF
-gofmt -l marketdata internal; go vet ./marketdata/ && go test ./marketdata/ -v 2>&1 | tail -12
+gofmt -l marketdata internal; go vet ./marketdata/ && go test ./marketdata/ -v 2>&1 | tail -14
 ```
-Expected: gofmt 출력 없음, 9 tests PASS.
+Expected: gofmt 출력 없음, 10 tests PASS.
 
 - [ ] **Step 5: 커밋**
 
 ```bash
-git add internal/params marketdata testdata && git commit -m "feat(marketdata): 현재가·호가·체결·상하한가·캔들 5 ops + params 헬퍼
+git add internal/params internal/fetch marketdata testdata && git commit -m "feat(marketdata): 현재가·호가·체결·상하한가·캔들 5 ops + params 헬퍼
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -2138,8 +2314,15 @@ func TestTrend_SymbolEscaped(t *testing.T) {
 }
 
 func TestTrend_RequiresSymbol(t *testing.T) {
-	if _, err := New(nil).InvestorTrading(context.Background(), "", TrendParams{}); err == nil {
-		t.Error("want error")
+	c := New(nil) // nil client: 검증이 요청 전에 실패해야 한다
+	if _, err := c.InvestorTrading(context.Background(), "", TrendParams{}); err == nil {
+		t.Error("InvestorTrading empty symbol")
+	}
+	if _, err := c.InvestorTrading(context.Background(), " 005930", TrendParams{}); err == nil {
+		t.Error("InvestorTrading symbol with whitespace")
+	}
+	if _, err := c.Warnings(context.Background(), ""); err == nil {
+		t.Error("Warnings empty symbol")
 	}
 }
 EOF
@@ -2170,12 +2353,11 @@ package stockinfo
 
 import (
 	"context"
-	"errors"
 	"net/url"
-	"strings"
 
 	"github.com/shopspring/decimal"
 
+	"github.com/kenshin579/toss-go/internal/fetch"
 	"github.com/kenshin579/toss-go/internal/params"
 	"github.com/kenshin579/toss-go/tosstypes"
 )
@@ -2206,14 +2388,13 @@ type Stock struct {
 	KoreanMarketDetail *KRMarketDetail        `json:"koreanMarketDetail"`
 }
 
-// Stocks 는 여러 종목의 기본 정보를 조회한다(GET /api/v1/stocks). 없는 심볼은 결과에서 빠진다.
+// Stocks 는 여러 종목의 기본 정보를 조회한다(GET /api/v1/stocks). 최대 200개. 없는 심볼은 결과에서 빠진다.
 func (c *Client) Stocks(ctx context.Context, symbols ...string) ([]Stock, error) {
-	if len(symbols) == 0 {
-		return nil, errors.New("toss: symbols must not be empty")
+	joined, err := params.Symbols(symbols)
+	if err != nil {
+		return nil, err
 	}
-	var out []Stock
-	err := c.http.Get(ctx, "/api/v1/stocks", url.Values{"symbols": {strings.Join(symbols, ",")}}, &out)
-	return out, err
+	return fetch.List[Stock](ctx, c.http, "/api/v1/stocks", url.Values{"symbols": {joined}})
 }
 
 // ListedStock 은 마켓별 전체 종목 목록의 항목.
@@ -2242,9 +2423,7 @@ func (c *Client) ListStocks(ctx context.Context, p ListStocksParams) ([]ListedSt
 	params.Str(q, "status", string(p.Status))
 	params.Str(q, "securityType", string(p.SecurityType))
 	params.Bool(q, "commonShare", p.CommonShare)
-	var out []ListedStock
-	err := c.http.Get(ctx, "/api/v1/stocks/all", q, &out)
-	return out, err
+	return fetch.List[ListedStock](ctx, c.http, "/api/v1/stocks/all", q)
 }
 EOF
 cat > stockinfo/warnings.go << 'EOF'
@@ -2254,6 +2433,7 @@ import (
 	"context"
 	"net/url"
 
+	"github.com/kenshin579/toss-go/internal/fetch"
 	"github.com/kenshin579/toss-go/internal/params"
 	"github.com/kenshin579/toss-go/tosstypes"
 )
@@ -2268,12 +2448,10 @@ type Warning struct {
 
 // Warnings 는 종목의 매수 유의사항을 조회한다(GET /api/v1/stocks/{symbol}/warnings). 없으면 빈 슬라이스.
 func (c *Client) Warnings(ctx context.Context, symbol string) ([]Warning, error) {
-	if err := params.Require("symbol", symbol); err != nil {
+	if err := params.Symbol(symbol); err != nil {
 		return nil, err
 	}
-	var out []Warning
-	err := c.http.Get(ctx, "/api/v1/stocks/"+url.PathEscape(symbol)+"/warnings", nil, &out)
-	return out, err
+	return fetch.List[Warning](ctx, c.http, "/api/v1/stocks/"+url.PathEscape(symbol)+"/warnings", nil)
 }
 EOF
 cat > stockinfo/trend.go << 'EOF'
@@ -2286,6 +2464,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/kenshin579/toss-go/internal/fetch"
 	"github.com/kenshin579/toss-go/internal/httpclient"
 	"github.com/kenshin579/toss-go/internal/params"
 	"github.com/kenshin579/toss-go/tosstypes"
@@ -2434,17 +2613,13 @@ func (c *Client) SecuritiesLending(ctx context.Context, symbol string, p TrendPa
 }
 
 func fetchTrend[T any](ctx context.Context, hc *httpclient.Client, symbol, segment string, p TrendParams) (*TrendPage[T], error) {
-	if err := params.Require("symbol", symbol); err != nil {
+	if err := params.Symbol(symbol); err != nil {
 		return nil, err
 	}
 	q := url.Values{}
 	params.Int(q, "count", p.Count)
 	params.Date(q, "until", p.Until)
-	var out TrendPage[T]
-	if err := hc.Get(ctx, "/api/v1/stocks/"+url.PathEscape(symbol)+"/"+segment, q, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return fetch.One[TrendPage[T]](ctx, hc, "/api/v1/stocks/"+url.PathEscape(symbol)+"/"+segment, q)
 }
 EOF
 gofmt -l stockinfo; go vet ./stockinfo/ && go test ./stockinfo/ -v 2>&1 | tail -16
@@ -2526,10 +2701,11 @@ func TestExchangeRate_At(t *testing.T) {
 }
 
 func TestExchangeRate_Validation(t *testing.T) {
-	if _, err := New(nil).ExchangeRate(context.Background(), "", tosstypes.CurrencyKRW, nil); err == nil {
+	c := New(nil) // nil client: 검증이 요청 전에 실패해야 한다
+	if _, err := c.ExchangeRate(context.Background(), "", tosstypes.CurrencyKRW, nil); err == nil {
 		t.Error("want error for empty base")
 	}
-	if _, err := New(nil).ExchangeRate(context.Background(), tosstypes.CurrencyUSD, "", nil); err == nil {
+	if _, err := c.ExchangeRate(context.Background(), tosstypes.CurrencyUSD, "", nil); err == nil {
 		t.Error("want error for empty quote")
 	}
 }
@@ -2624,6 +2800,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/kenshin579/toss-go/internal/fetch"
 	"github.com/kenshin579/toss-go/internal/params"
 	"github.com/kenshin579/toss-go/tosstypes"
 )
@@ -2650,11 +2827,7 @@ func (c *Client) ExchangeRate(ctx context.Context, base, quote tosstypes.Currenc
 	}
 	q := url.Values{"baseCurrency": {string(base)}, "quoteCurrency": {string(quote)}}
 	params.Time(q, "dateTime", at)
-	var out ExchangeRate
-	if err := c.http.Get(ctx, "/api/v1/exchange-rate", q, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return fetch.One[ExchangeRate](ctx, c.http, "/api/v1/exchange-rate", q)
 }
 EOF
 cat > marketinfo/calendar.go << 'EOF'
@@ -2665,6 +2838,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/kenshin579/toss-go/internal/fetch"
 	"github.com/kenshin579/toss-go/internal/params"
 	"github.com/kenshin579/toss-go/tosstypes"
 )
@@ -2729,22 +2903,14 @@ type USMarketCalendar struct {
 func (c *Client) KRMarketCalendar(ctx context.Context, date tosstypes.Date) (*KRMarketCalendar, error) {
 	q := url.Values{}
 	params.Date(q, "date", date)
-	var out KRMarketCalendar
-	if err := c.http.Get(ctx, "/api/v1/market-calendar/KR", q, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return fetch.One[KRMarketCalendar](ctx, c.http, "/api/v1/market-calendar/KR", q)
 }
 
 // USMarketCalendar 는 해외 장 운영 정보를 조회한다(GET /api/v1/market-calendar/US). date 가 비면 오늘.
 func (c *Client) USMarketCalendar(ctx context.Context, date tosstypes.Date) (*USMarketCalendar, error) {
 	q := url.Values{}
 	params.Date(q, "date", date)
-	var out USMarketCalendar
-	if err := c.http.Get(ctx, "/api/v1/market-calendar/US", q, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return fetch.One[USMarketCalendar](ctx, c.http, "/api/v1/market-calendar/US", q)
 }
 EOF
 gofmt -l marketinfo; go vet ./marketinfo/ && go test ./marketinfo/ -v 2>&1 | tail -10
@@ -2829,7 +2995,7 @@ func TestRankings(t *testing.T) {
 }
 
 func TestRankings_Validation(t *testing.T) {
-	c := New(nil)
+	c := New(nil) // nil client: 검증이 요청 전에 실패해야 한다
 	cases := []RankingsParams{
 		{MarketCountry: tosstypes.MarketCountryKR, Duration: tosstypes.RankingDuration1d},
 		{Type: tosstypes.RankingTypeTopGainers, Duration: tosstypes.RankingDuration1d},
@@ -2867,7 +3033,7 @@ func TestPrices(t *testing.T) {
 }
 
 func TestPrices_NoSymbols(t *testing.T) {
-	if _, err := New(nil).Prices(context.Background()); err == nil {
+	if _, err := New(nil).Prices(context.Background()); err == nil { // nil client: 검증이 요청 전에 실패해야 한다
 		t.Error("want error")
 	}
 }
@@ -2885,9 +3051,12 @@ func TestCandles(t *testing.T) {
 }
 
 func TestCandles_Validation(t *testing.T) {
-	c := New(nil)
+	c := New(nil) // nil client: 검증이 요청 전에 실패해야 한다
 	if _, err := c.Candles(context.Background(), "", CandlesParams{Interval: tosstypes.Interval1d}); err == nil {
 		t.Error("want error for empty symbol")
+	}
+	if _, err := c.Candles(context.Background(), "삼성", CandlesParams{Interval: tosstypes.Interval1d}); err == nil {
+		t.Error("want error for non-ascii symbol")
 	}
 	if _, err := c.Candles(context.Background(), "KOSPI", CandlesParams{}); err == nil {
 		t.Error("want error for empty interval")
@@ -2911,7 +3080,11 @@ func TestInvestorTrading(t *testing.T) {
 }
 
 func TestInvestorTrading_Validation(t *testing.T) {
-	if _, err := New(nil).InvestorTrading(context.Background(), "KOSPI", InvestorTradingParams{}); err == nil {
+	c := New(nil) // nil client: 검증이 요청 전에 실패해야 한다
+	if _, err := c.InvestorTrading(context.Background(), "", InvestorTradingParams{Interval: tosstypes.IndicatorInterval1d}); err == nil {
+		t.Error("want error for empty symbol")
+	}
+	if _, err := c.InvestorTrading(context.Background(), "KOSPI", InvestorTradingParams{}); err == nil {
 		t.Error("want error for empty interval")
 	}
 }
@@ -2947,6 +3120,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/kenshin579/toss-go/internal/fetch"
 	"github.com/kenshin579/toss-go/internal/params"
 	"github.com/kenshin579/toss-go/tosstypes"
 )
@@ -2997,11 +3171,7 @@ func (c *Client) Rankings(ctx context.Context, p RankingsParams) (*Rankings, err
 	q := url.Values{"type": {string(p.Type)}, "marketCountry": {string(p.MarketCountry)}, "duration": {string(p.Duration)}}
 	params.Bool(q, "excludeInvestmentCaution", p.ExcludeInvestmentCaution)
 	params.Int(q, "count", p.Count)
-	var out Rankings
-	if err := c.http.Get(ctx, "/api/v1/rankings", q, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return fetch.One[Rankings](ctx, c.http, "/api/v1/rankings", q)
 }
 EOF
 cat > indicators/client.go << 'EOF'
@@ -3024,12 +3194,13 @@ package indicators
 
 import (
 	"context"
-	"errors"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/shopspring/decimal"
+
+	"github.com/kenshin579/toss-go/internal/fetch"
+	"github.com/kenshin579/toss-go/internal/params"
 )
 
 // Price 는 시장 지표(지수) 현재가.
@@ -3039,14 +3210,13 @@ type Price struct {
 	LastPrice decimal.Decimal `json:"lastPrice"`
 }
 
-// Prices 는 시장 지표 현재가를 조회한다(GET /api/v1/market-indicators/prices). 예: KOSPI, KOSDAQ.
+// Prices 는 시장 지표 현재가를 조회한다(GET /api/v1/market-indicators/prices). 최대 200개. 예: KOSPI, KOSDAQ.
 func (c *Client) Prices(ctx context.Context, symbols ...string) ([]Price, error) {
-	if len(symbols) == 0 {
-		return nil, errors.New("toss: symbols must not be empty")
+	joined, err := params.Symbols(symbols)
+	if err != nil {
+		return nil, err
 	}
-	var out []Price
-	err := c.http.Get(ctx, "/api/v1/market-indicators/prices", url.Values{"symbols": {strings.Join(symbols, ",")}}, &out)
-	return out, err
+	return fetch.List[Price](ctx, c.http, "/api/v1/market-indicators/prices", url.Values{"symbols": {joined}})
 }
 EOF
 cat > indicators/candles.go << 'EOF'
@@ -3059,6 +3229,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/kenshin579/toss-go/internal/fetch"
 	"github.com/kenshin579/toss-go/internal/params"
 	"github.com/kenshin579/toss-go/tosstypes"
 )
@@ -3088,7 +3259,7 @@ type CandlesParams struct {
 
 // Candles 는 시장 지표 캔들을 조회한다(GET /api/v1/market-indicators/{symbol}/candles).
 func (c *Client) Candles(ctx context.Context, symbol string, p CandlesParams) (*CandlePage, error) {
-	if err := params.Require("symbol", symbol); err != nil {
+	if err := params.Symbol(symbol); err != nil {
 		return nil, err
 	}
 	if err := params.Require("interval", string(p.Interval)); err != nil {
@@ -3097,11 +3268,7 @@ func (c *Client) Candles(ctx context.Context, symbol string, p CandlesParams) (*
 	q := url.Values{"interval": {string(p.Interval)}}
 	params.Int(q, "count", p.Count)
 	params.Time(q, "before", p.Before)
-	var out CandlePage
-	if err := c.http.Get(ctx, "/api/v1/market-indicators/"+url.PathEscape(symbol)+"/candles", q, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return fetch.One[CandlePage](ctx, c.http, "/api/v1/market-indicators/"+url.PathEscape(symbol)+"/candles", q)
 }
 EOF
 cat > indicators/investor_trading.go << 'EOF'
@@ -3114,6 +3281,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/kenshin579/toss-go/internal/fetch"
 	"github.com/kenshin579/toss-go/internal/params"
 	"github.com/kenshin579/toss-go/tosstypes"
 )
@@ -3167,7 +3335,7 @@ type InvestorTradingParams struct {
 // InvestorTrading 은 투자자별 매매대금을 조회한다(GET /api/v1/market-indicators/{symbol}/investor-trading).
 // KOSPI, KOSDAQ 만 지원한다.
 func (c *Client) InvestorTrading(ctx context.Context, symbol string, p InvestorTradingParams) (*InvestorTradingPage, error) {
-	if err := params.Require("symbol", symbol); err != nil {
+	if err := params.Symbol(symbol); err != nil {
 		return nil, err
 	}
 	if err := params.Require("interval", string(p.Interval)); err != nil {
@@ -3176,11 +3344,7 @@ func (c *Client) InvestorTrading(ctx context.Context, symbol string, p InvestorT
 	q := url.Values{"interval": {string(p.Interval)}}
 	params.Int(q, "count", p.Count)
 	params.Date(q, "until", p.Until)
-	var out InvestorTradingPage
-	if err := c.http.Get(ctx, "/api/v1/market-indicators/"+url.PathEscape(symbol)+"/investor-trading", q, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return fetch.One[InvestorTradingPage](ctx, c.http, "/api/v1/market-indicators/"+url.PathEscape(symbol)+"/investor-trading", q)
 }
 EOF
 gofmt -l ranking indicators; go vet ./ranking/ ./indicators/ && go test ./ranking/ ./indicators/ -v 2>&1 | grep -E '^(=== RUN|--- (PASS|FAIL)|ok|FAIL)' | grep -c -- '--- PASS'

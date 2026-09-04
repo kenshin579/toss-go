@@ -7,6 +7,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/kenshin579/toss-go/internal/fetch"
 	"github.com/kenshin579/toss-go/internal/params"
 	"github.com/kenshin579/toss-go/tosstypes"
 )
@@ -39,7 +40,7 @@ type CandlesParams struct {
 
 // Candles 는 캔들 차트를 조회한다(GET /api/v1/candles).
 func (c *Client) Candles(ctx context.Context, p CandlesParams) (*CandlePage, error) {
-	if err := params.Require("symbol", p.Symbol); err != nil {
+	if err := params.Symbol(p.Symbol); err != nil {
 		return nil, err
 	}
 	if err := params.Require("interval", string(p.Interval)); err != nil {
@@ -49,9 +50,5 @@ func (c *Client) Candles(ctx context.Context, p CandlesParams) (*CandlePage, err
 	params.Int(q, "count", p.Count)
 	params.Time(q, "before", p.Before)
 	params.Bool(q, "adjusted", p.Adjusted)
-	var out CandlePage
-	if err := c.http.Get(ctx, "/api/v1/candles", q, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return fetch.One[CandlePage](ctx, c.http, "/api/v1/candles", q)
 }

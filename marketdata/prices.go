@@ -2,13 +2,13 @@ package marketdata
 
 import (
 	"context"
-	"errors"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/shopspring/decimal"
 
+	"github.com/kenshin579/toss-go/internal/fetch"
+	"github.com/kenshin579/toss-go/internal/params"
 	"github.com/kenshin579/toss-go/tosstypes"
 )
 
@@ -20,12 +20,11 @@ type Price struct {
 	Currency  tosstypes.Currency `json:"currency"`
 }
 
-// Prices 는 여러 종목의 현재가를 조회한다(GET /api/v1/prices). 없는 심볼은 결과에서 빠진다.
+// Prices 는 여러 종목의 현재가를 조회한다(GET /api/v1/prices). 최대 200개. 없는 심볼은 결과에서 빠진다.
 func (c *Client) Prices(ctx context.Context, symbols ...string) ([]Price, error) {
-	if len(symbols) == 0 {
-		return nil, errors.New("toss: symbols must not be empty")
+	joined, err := params.Symbols(symbols)
+	if err != nil {
+		return nil, err
 	}
-	var out []Price
-	err := c.http.Get(ctx, "/api/v1/prices", url.Values{"symbols": {strings.Join(symbols, ",")}}, &out)
-	return out, err
+	return fetch.List[Price](ctx, c.http, "/api/v1/prices", url.Values{"symbols": {joined}})
 }

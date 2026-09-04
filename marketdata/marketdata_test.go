@@ -38,13 +38,13 @@ func TestPrices_EmptyResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 0 {
+	if got == nil || len(got) != 0 {
 		t.Errorf("want empty, got %+v", got)
 	}
 }
 
 func TestPrices_NoSymbols(t *testing.T) {
-	if _, err := New(nil).Prices(context.Background()); err == nil {
+	if _, err := New(nil).Prices(context.Background()); err == nil { // nil client: 검증이 요청 전에 실패해야 한다
 		t.Error("want error")
 	}
 }
@@ -126,11 +126,28 @@ func TestCandles(t *testing.T) {
 }
 
 func TestCandles_Validation(t *testing.T) {
-	c := New(nil)
+	c := New(nil) // nil client: 검증이 요청 전에 실패해야 한다
 	if _, err := c.Candles(context.Background(), CandlesParams{Interval: tosstypes.Interval1d}); err == nil {
 		t.Error("want error for empty symbol")
 	}
 	if _, err := c.Candles(context.Background(), CandlesParams{Symbol: "005930"}); err == nil {
 		t.Error("want error for empty interval")
+	}
+}
+
+func TestEmptySymbolRejected(t *testing.T) {
+	c := New(nil) // nil client: 검증이 요청 전에 실패해야 한다
+	ctx := context.Background()
+	if _, err := c.Orderbook(ctx, ""); err == nil {
+		t.Error("Orderbook")
+	}
+	if _, err := c.Trades(ctx, " 005930", 1); err == nil {
+		t.Error("Trades with whitespace")
+	}
+	if _, err := c.PriceLimits(ctx, "삼성"); err == nil {
+		t.Error("PriceLimits non-ascii")
+	}
+	if _, err := c.Prices(ctx, "005930", ""); err == nil {
+		t.Error("Prices empty element")
 	}
 }

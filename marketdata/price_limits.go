@@ -7,6 +7,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/kenshin579/toss-go/internal/fetch"
 	"github.com/kenshin579/toss-go/internal/params"
 	"github.com/kenshin579/toss-go/tosstypes"
 )
@@ -21,12 +22,8 @@ type PriceLimits struct {
 
 // PriceLimits 는 상/하한가를 조회한다(GET /api/v1/price-limits).
 func (c *Client) PriceLimits(ctx context.Context, symbol string) (*PriceLimits, error) {
-	if err := params.Require("symbol", symbol); err != nil {
+	if err := params.Symbol(symbol); err != nil {
 		return nil, err
 	}
-	var out PriceLimits
-	if err := c.http.Get(ctx, "/api/v1/price-limits", url.Values{"symbol": {symbol}}, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return fetch.One[PriceLimits](ctx, c.http, "/api/v1/price-limits", url.Values{"symbol": {symbol}})
 }
