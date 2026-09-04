@@ -35,13 +35,14 @@
 | `scripts/release.sh` | fmp-go 복사본 |
 | `README.md` | 설치·인증·사용·커버리지 |
 
-캡처된 fixture 는 `testdata/captured/*.json` 에 있다(봉투 포함 `{"result": ...}` 원문). 각 태스크에서 해당 패키지 `testdata/` 로 `git mv` 한다. 없는 fixture 는 아래 공통 명령으로 캡처한다(허용 IP 등록된 머신에서만 동작):
+캡처된 fixture 는 `testdata/captured/*.json` 에 있다(봉투 포함 `{"result": ...}` 원문). 각 태스크에서 해당 패키지 `testdata/` 로 `git mv` 한다. 없는 fixture 는 아래 공통 명령으로 캡처한다. 허용 IP 가 등록되지 않아 토큰이 403 이면 각 태스크의 캡처 스텝이 `openapi.json` 의 응답 예시(`examples`)로 자동 대체한다 — 예시도 토스가 작성한 실제 구조라 디코딩 테스트에는 충분하며, 나중에 허용 IP 에서 재캡처해 교체할 수 있다:
 
 ```bash
 # 공통: 토큰 발급 → $TOKEN. 각 태스크의 캡처 스텝에서 이 3줄을 먼저 실행한다.
 eval "$(grep -E '^export TOSS_CLIENT_(ID|SECRET)=' ~/.zshrc)"
 TOKEN=$(curl -s --compressed -X POST https://openapi.tossinvest.com/oauth2/token -H 'Content-Type: application/x-www-form-urlencoded' -d grant_type=client_credentials -d "client_id=$TOSS_CLIENT_ID" -d "client_secret=$TOSS_CLIENT_SECRET" | jq -r .access_token)
-test "$TOKEN" != "null" && echo TOKEN_OK
+if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then echo TOKEN_OK; else echo "TOKEN_UNAVAILABLE → openapi.json 예시로 대체"; fi
+J=docs/api/openapi.json; ex() { jq --arg p "$1" --arg n "$2" '.paths[$p].get.responses."200".content."application/json".examples[$n].value' $J; }
 ```
 
 커밋 메시지는 항상 아래 트레일러로 끝낸다:
@@ -1927,14 +1928,22 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 mkdir -p stockinfo/testdata && git mv testdata/captured/stocks_symbols_005930_AAPL_.json stockinfo/testdata/stocks.json && git mv testdata/captured/stocks_005930_warnings_.json stockinfo/testdata/warnings_empty.json && git mv testdata/captured/stocks_005930_investor_trading_count_1_.json stockinfo/testdata/investor_trading.json && git mv testdata/captured/stocks_005930_program_trades_count_1_.json stockinfo/testdata/program_trades.json && git mv testdata/captured/stocks_005930_short_selling_count_1_.json stockinfo/testdata/short_selling.json
 eval "$(grep -E '^export TOSS_CLIENT_(ID|SECRET)=' ~/.zshrc)"
 TOKEN=$(curl -s --compressed -X POST https://openapi.tossinvest.com/oauth2/token -H 'Content-Type: application/x-www-form-urlencoded' -d grant_type=client_credentials -d "client_id=$TOSS_CLIENT_ID" -d "client_secret=$TOSS_CLIENT_SECRET" | jq -r .access_token)
-test "$TOKEN" != "null" && echo TOKEN_OK
+if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then echo TOKEN_OK; else echo "TOKEN_UNAVAILABLE → openapi.json 예시로 대체"; fi
+J=docs/api/openapi.json; ex() { jq --arg p "$1" --arg n "$2" '.paths[$p].get.responses."200".content."application/json".examples[$n].value' $J; }
 B=https://openapi.tossinvest.com/api/v1
-curl -s --compressed -H "Authorization: Bearer $TOKEN" "$B/stocks/all?market=KOSPI&securityType=REIT" | jq '.result |= .[:3]' > stockinfo/testdata/stocks_all.json; sleep 1
-curl -s --compressed -H "Authorization: Bearer $TOKEN" "$B/stocks/005930/credit-trades?count=1" | jq . > stockinfo/testdata/credit_trades.json; sleep 0.3
-curl -s --compressed -H "Authorization: Bearer $TOKEN" "$B/stocks/005930/securities-lending?count=1" | jq . > stockinfo/testdata/securities_lending.json
+if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then
+  curl -s --compressed -H "Authorization: Bearer $TOKEN" "$B/stocks/all?market=KOSPI&securityType=REIT" | jq '.result |= .[:3]' > stockinfo/testdata/stocks_all.json; sleep 1
+  curl -s --compressed -H "Authorization: Bearer $TOKEN" "$B/stocks/005930/credit-trades?count=1" | jq . > stockinfo/testdata/credit_trades.json; sleep 0.3
+  curl -s --compressed -H "Authorization: Bearer $TOKEN" "$B/stocks/005930/securities-lending?count=1" | jq . > stockinfo/testdata/securities_lending.json
+else
+  # 허용 IP 미등록 등으로 실호출이 안 되면 openapi.json 의 응답 예시(토스 작성)로 대체 — 구조는 동일
+  ex "/api/v1/stocks/all" kospi > stockinfo/testdata/stocks_all.json
+  ex "/api/v1/stocks/{symbol}/credit-trades" daily > stockinfo/testdata/credit_trades.json
+  ex "/api/v1/stocks/{symbol}/securities-lending" daily > stockinfo/testdata/securities_lending.json
+fi
 for f in stockinfo/testdata/*.json; do printf "%s: " "$f"; jq -c 'if .result then (.result|type) else . end' "$f"; done
 ```
-Expected: `TOKEN_OK`, 8개 파일 모두 `"array"` 또는 `"object"`(에러 봉투가 아님). `credit_trades.json` 의 `.result.records[0]` 에 `marginLoan`/`stockLoan` 이, `securities_lending.json` 에 `executionQuantity` 등이 있는지 `jq` 로 눈으로 확인한다. 값이 `null` 인 경우(해당 일자 데이터 없음)도 정상이며 테스트는 nil 허용으로 쓴다.
+Expected: `TOKEN_OK`(또는 대체 안내), 8개 파일 모두 `"array"` 또는 `"object"`(에러 봉투가 아님). `credit_trades.json` 의 `.result.records[0]` 에 `marginLoan`/`stockLoan` 이, `securities_lending.json` 에 `executionQuantity` 등이 있는지 `jq` 로 눈으로 확인한다. 값이 `null` 인 경우(해당 일자 데이터 없음)도 정상이며 테스트는 nil 허용으로 쓴다.
 
 - [ ] **Step 2: 실패 테스트 작성**
 
@@ -2000,7 +2009,7 @@ func TestListStocks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) == 0 || got[0].Symbol == "" || got[0].Name == "" || got[0].ISINCode == "" || got[0].SecurityType != tosstypes.SecurityTypeREIT {
+	if len(got) == 0 || got[0].Symbol == "" || got[0].Name == "" || got[0].ISINCode == "" || got[0].SecurityType == "" {
 		t.Errorf("got = %+v", got)
 	}
 }
@@ -2096,7 +2105,7 @@ func TestCreditTrades(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Records) != 1 || page.Records[0].Date == "" || page.Records[0].UpdatedAt.IsZero() {
+	if len(page.Records) == 0 || page.Records[0].Date == "" || page.Records[0].UpdatedAt.IsZero() {
 		t.Fatalf("page = %+v", page)
 	}
 	if ml := page.Records[0].MarginLoan; ml != nil && ml.BalanceQuantity.IsZero() && ml.NewQuantity.IsZero() {
@@ -2111,7 +2120,7 @@ func TestSecuritiesLending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Records) != 1 || page.Records[0].BalanceQuantity.IsZero() {
+	if len(page.Records) == 0 || page.Records[0].BalanceQuantity.IsZero() {
 		t.Errorf("page = %+v", page)
 	}
 }
@@ -2465,11 +2474,16 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 mkdir -p marketinfo/testdata && git mv testdata/captured/exchange_rate_baseCurrency_USD_quoteCurrency_KRW_.json marketinfo/testdata/exchange_rate.json && git mv testdata/captured/market_calendar_KR_.json marketinfo/testdata/market_calendar_kr.json
 eval "$(grep -E '^export TOSS_CLIENT_(ID|SECRET)=' ~/.zshrc)"
 TOKEN=$(curl -s --compressed -X POST https://openapi.tossinvest.com/oauth2/token -H 'Content-Type: application/x-www-form-urlencoded' -d grant_type=client_credentials -d "client_id=$TOSS_CLIENT_ID" -d "client_secret=$TOSS_CLIENT_SECRET" | jq -r .access_token)
-test "$TOKEN" != "null" && echo TOKEN_OK
-curl -s --compressed -H "Authorization: Bearer $TOKEN" "https://openapi.tossinvest.com/api/v1/market-calendar/US" | jq . > marketinfo/testdata/market_calendar_us.json
+if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then echo TOKEN_OK; else echo "TOKEN_UNAVAILABLE → openapi.json 예시로 대체"; fi
+J=docs/api/openapi.json; ex() { jq --arg p "$1" --arg n "$2" '.paths[$p].get.responses."200".content."application/json".examples[$n].value' $J; }
+if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then
+  curl -s --compressed -H "Authorization: Bearer $TOKEN" "https://openapi.tossinvest.com/api/v1/market-calendar/US" | jq . > marketinfo/testdata/market_calendar_us.json
+else
+  ex "/api/v1/market-calendar/US" businessDay > marketinfo/testdata/market_calendar_us.json
+fi
 jq -c '.result.today | {date, day: (.dayMarket != null), pre: (.preMarket != null), reg: (.regularMarket != null), after: (.afterMarket != null)}' marketinfo/testdata/market_calendar_us.json
 ```
-Expected: `TOKEN_OK` 와 `{"date":"YYYY-MM-DD","day":...,"pre":...}` 형태. 세션이 휴장이면 `false`(null)일 수 있으며 테스트는 `regularMarket` 만 non-nil 가정하지 않고 날짜만 검사한다.
+Expected: `TOKEN_OK`(또는 대체 안내) 와 `{"date":"YYYY-MM-DD","day":...,"pre":...}` 형태. 세션이 휴장이면 `false`(null)일 수 있으며 테스트는 `regularMarket` 만 non-nil 가정하지 않고 날짜만 검사한다.
 
 - [ ] **Step 2: 실패 테스트 작성**
 
@@ -2762,14 +2776,20 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 mkdir -p ranking/testdata indicators/testdata && git mv testdata/captured/rankings_type_TOP_GAINERS_marketCountry_KR_duration_1d_count_2_.json ranking/testdata/rankings.json && git mv testdata/captured/market_indicators_prices_symbols_KOSPI_.json indicators/testdata/prices.json
 eval "$(grep -E '^export TOSS_CLIENT_(ID|SECRET)=' ~/.zshrc)"
 TOKEN=$(curl -s --compressed -X POST https://openapi.tossinvest.com/oauth2/token -H 'Content-Type: application/x-www-form-urlencoded' -d grant_type=client_credentials -d "client_id=$TOSS_CLIENT_ID" -d "client_secret=$TOSS_CLIENT_SECRET" | jq -r .access_token)
-test "$TOKEN" != "null" && echo TOKEN_OK
+if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then echo TOKEN_OK; else echo "TOKEN_UNAVAILABLE → openapi.json 예시로 대체"; fi
+J=docs/api/openapi.json; ex() { jq --arg p "$1" --arg n "$2" '.paths[$p].get.responses."200".content."application/json".examples[$n].value' $J; }
 B=https://openapi.tossinvest.com/api/v1
-curl -s --compressed -H "Authorization: Bearer $TOKEN" "$B/market-indicators/KOSPI/candles?interval=1d&count=2" | jq . > indicators/testdata/candles.json; sleep 0.3
-curl -s --compressed -H "Authorization: Bearer $TOKEN" "$B/market-indicators/KOSPI/investor-trading?interval=1d&count=1" | jq . > indicators/testdata/investor_trading.json
+if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then
+  curl -s --compressed -H "Authorization: Bearer $TOKEN" "$B/market-indicators/KOSPI/candles?interval=1d&count=2" | jq . > indicators/testdata/candles.json; sleep 0.3
+  curl -s --compressed -H "Authorization: Bearer $TOKEN" "$B/market-indicators/KOSPI/investor-trading?interval=1d&count=1" | jq . > indicators/testdata/investor_trading.json
+else
+  ex "/api/v1/market-indicators/{symbol}/candles" dailyCandles > indicators/testdata/candles.json
+  ex "/api/v1/market-indicators/{symbol}/investor-trading" daily > indicators/testdata/investor_trading.json
+fi
 jq -c '.result | {n: (.candles|length), next: .nextBefore}' indicators/testdata/candles.json; jq -c '.result | {n: (.records|length), keys: (.records[0]|keys)}' indicators/testdata/investor_trading.json
 rmdir testdata/captured testdata && echo CAPTURED_DIR_REMOVED
 ```
-Expected: `TOKEN_OK`, candles `n: 2`, investor_trading `n: 1` 에 keys `date, updatedAt, individual, foreigner, institution, otherCorporation`, `CAPTURED_DIR_REMOVED`(모든 fixture 가 이동됐으므로 비어 있어야 함. 남은 파일이 있으면 어느 태스크가 빠뜨렸는지 확인).
+Expected: `TOKEN_OK`(또는 대체 안내), candles `n: 2`, investor_trading `n: 1`(예시 대체 시 2) 에 keys `date, updatedAt, individual, foreigner, institution, otherCorporation`, `CAPTURED_DIR_REMOVED`(모든 fixture 가 이동됐으므로 비어 있어야 함. 남은 파일이 있으면 어느 태스크가 빠뜨렸는지 확인).
 
 - [ ] **Step 2: 실패 테스트 작성**
 
@@ -2881,7 +2901,7 @@ func TestInvestorTrading(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Records) != 1 {
+	if len(page.Records) == 0 {
 		t.Fatalf("page = %+v", page)
 	}
 	r := page.Records[0]
