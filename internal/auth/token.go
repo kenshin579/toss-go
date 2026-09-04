@@ -1,4 +1,5 @@
 // Package auth 는 토스 Open API 의 OAuth2 Client Credentials 토큰을 발급하고 메모리에 캐시한다.
+// 토스는 client 당 유효 토큰이 1개이므로, 같은 client_id 를 여러 프로세스가 쓰면 서로의 토큰을 무효화한다 — 메모리 캐시로는 막을 수 없다.
 package auth
 
 import (
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // refreshMargin 은 만료 이 시간 전부터 새 토큰을 발급한다.
@@ -28,10 +30,14 @@ type Error struct {
 }
 
 func (e *Error) Error() string {
-	if e.Code == "" {
-		return fmt.Sprintf("toss: token request failed (status %d): %s", e.StatusCode, e.Description)
+	msg := fmt.Sprintf("toss: token request failed (status %d)", e.StatusCode)
+	if e.Code != "" {
+		msg += ": " + e.Code
 	}
-	return fmt.Sprintf("toss: token request failed (status %d): %s: %s", e.StatusCode, e.Code, e.Description)
+	if e.Description != "" {
+		msg += ": " + e.Description
+	}
+	return msg
 }
 
 // TokenSource 는 access token 을 발급·캐시한다. 동시 호출에 안전하다.
@@ -39,7 +45,7 @@ type TokenSource struct {
 	clientID     string
 	clientSecret string
 	tokenURL     string
-	http         *http.Client
+	hc           *http.Client
 	now          func() time.Time
 
 	mu        sync.Mutex
@@ -49,11 +55,14 @@ type TokenSource struct {
 
 // New 는 TokenSource 를 만든다. baseURL 은 `https://openapi.tossinvest.com` 형태(끝 슬래시 없음).
 func New(clientID, clientSecret, baseURL string, hc *http.Client) *TokenSource {
+	if hc == nil {
+		hc = http.DefaultClient
+	}
 	return &TokenSource{
 		clientID:     clientID,
 		clientSecret: clientSecret,
 		tokenURL:     strings.TrimRight(baseURL, "/") + "/oauth2/token",
-		http:         hc,
+		hc:           hc,
 		now:          time.Now,
 	}
 }
@@ -65,20 +74,25 @@ func (s *TokenSource) Token(ctx context.Context) (string, error) {
 	if s.token != "" && s.now().Before(s.expiresAt.Add(-refreshMargin)) {
 		return s.token, nil
 	}
+	issuedAt := s.now()
 	tok, expiresIn, err := s.issue(ctx)
 	if err != nil {
 		return "", err
 	}
 	s.token = tok
-	s.expiresAt = s.now().Add(time.Duration(expiresIn) * time.Second)
+	s.expiresAt = issuedAt.Add(time.Duration(expiresIn) * time.Second)
 	return tok, nil
 }
 
-// Invalidate 는 캐시를 비운다. API 가 401 토큰 오류를 돌려줬을 때 호출한다.
-func (s *TokenSource) Invalidate() {
+// Invalidate 는 stale 이 현재 캐시된 토큰일 때만 캐시를 비운다. API 가 401 토큰 오류를 돌려줬을 때
+// 그 요청에 썼던 토큰을 넘긴다. 다른 goroutine 이 이미 새 토큰을 받아 둔 경우를 지우지 않기 위한 비교다
+// (토스는 client 당 유효 토큰이 1개라 재발급이 이전 토큰을 즉시 무효화한다).
+func (s *TokenSource) Invalidate(stale string) {
 	s.mu.Lock()
-	s.token = ""
-	s.expiresAt = time.Time{}
+	if s.token == stale {
+		s.token = ""
+		s.expiresAt = time.Time{}
+	}
 	s.mu.Unlock()
 }
 
@@ -106,7 +120,7 @@ func (s *TokenSource) issue(ctx context.Context) (string, int64, error) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := s.http.Do(req)
+	resp, err := s.hc.Do(req)
 	if err != nil {
 		return "", 0, fmt.Errorf("toss: token request: %w", err)
 	}
@@ -134,12 +148,20 @@ func (s *TokenSource) issue(ctx context.Context) (string, int64, error) {
 	if tr.AccessToken == "" {
 		return "", 0, fmt.Errorf("toss: token response has empty access_token")
 	}
+	if tr.ExpiresIn <= 0 {
+		return "", 0, fmt.Errorf("toss: token response has invalid expires_in %d", tr.ExpiresIn)
+	}
 	return tr.AccessToken, tr.ExpiresIn, nil
 }
 
+// truncate 는 s 를 최대 n 바이트로 자르되 UTF-8 문자 경계를 지키고, 연속 공백·개행은 한 칸으로 합친다.
 func truncate(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
 	if len(s) <= n {
 		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n]
 }

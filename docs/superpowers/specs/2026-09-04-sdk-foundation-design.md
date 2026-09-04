@@ -101,12 +101,13 @@ func (c *Client) AccessToken(ctx context.Context) (string, error) // 유효 토�
 
 - `TokenSource` — `Token(ctx) (string, error)`: 캐시된 토큰이 있고 `expiresAt - 60s` 이전이면
   그대로 반환, 아니면 발급. 발급은 `sync.Mutex` 로 단일화(동시 호출이 몰려도 1회만 발급).
-- `Invalidate()` — httpclient 가 401 토큰 오류를 받았을 때 호출해 캐시를 비운다.
+- `Invalidate(stale)` — httpclient 가 401 토큰 오류를 받았을 때 그 요청에 쓴 토큰을 넘겨 호출한다. 캐시된 토큰이 stale 과 같을 때만 비운다(토스는 client 당 유효 토큰 1개 — 재발급이 이전 토큰을 무효화하므로, 다른 goroutine 이 막 받은 새 토큰을 지우지 않기 위함).
 - 발급 요청: `POST {baseURL}/oauth2/token`, `application/x-www-form-urlencoded`.
   응답 `expires_in` 으로 `expiresAt` 계산.
 - 발급 실패(비-200)는 `AuthError{StatusCode int, Code string, Description string}` (OAuth2
   형식 `error`/`error_description` 매핑; 바디가 그 형식이 아니면 Code 빈 값 + 바디 앞부분을
   Description 에).
+- 발급 응답의 `expires_in` 이 0 이하면 에러(재발급 루프 방지).
 
 ### `internal/httpclient`
 
@@ -119,7 +120,7 @@ func (c *Client) Get(ctx context.Context, path string, query url.Values, out any
 - 2xx: 바디 `{"result": <T>}` 에서 `result` 만 `out` 으로 디코딩(`json.RawMessage` 경유).
 - 4xx/5xx: 바디 `{"error":{...}}` → `APIError`. 바디가 봉투 형식이 아니면(엣지 차단 등)
   `APIError{StatusCode, Code:"", Message: 바디 앞 200자}`.
-- 401 이고 `Code ∈ {expired-token, invalid-token}` 이면 `tokens.Invalidate()` 후 **정확히 1회**
+- 401 이고 `Code ∈ {expired-token, invalid-token}` 이면 `tokens.Invalidate(사용한 토큰)` 후 **정확히 1회**
   재발급·재시도. 재시도도 실패하면 그 에러 반환.
 - 429 는 `Retry-After` 헤더(초)를 `APIError.RetryAfter time.Duration` 에 담는다.
 - 재시도(429/5xx)·스로틀링·캐싱 없음. 네트워크/디코딩 오류는 `%w` 래핑.

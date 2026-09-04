@@ -338,10 +338,12 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // newServer 는 토큰 엔드포인트 스텁. issued 는 발급 요청 횟수.
@@ -355,7 +357,8 @@ func newServer(t *testing.T, status int, body string, issued *int32) *httptest.S
 			t.Errorf("Content-Type = %q", ct)
 		}
 		if err := r.ParseForm(); err != nil {
-			t.Fatal(err)
+			t.Error(err)
+			return
 		}
 		if r.Form.Get("grant_type") != "client_credentials" || r.Form.Get("client_id") != "id" || r.Form.Get("client_secret") != "sec" {
 			t.Errorf("form = %v", r.Form)
@@ -384,8 +387,8 @@ func TestToken_IssuesAndCaches(t *testing.T) {
 			t.Errorf("tok = %q", tok)
 		}
 	}
-	if issued != 1 {
-		t.Errorf("issued %d times, want 1", issued)
+	if got := atomic.LoadInt32(&issued); got != 1 {
+		t.Errorf("issued %d times, want 1", got)
 	}
 }
 
@@ -405,38 +408,50 @@ func TestToken_RefreshesNearExpiry(t *testing.T) {
 	if _, err := s.Token(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if issued != 1 {
-		t.Fatalf("issued %d, want 1 (still valid)", issued)
+	if got := atomic.LoadInt32(&issued); got != 1 {
+		t.Fatalf("issued %d, want 1 (still valid)", got)
 	}
 	// 만료 59초 전: 여유(60s) 안 → 재발급
 	s.now = func() time.Time { return now.Add(86399*time.Second - 59*time.Second) }
 	if _, err := s.Token(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if issued != 2 {
-		t.Errorf("issued %d, want 2 (refreshed)", issued)
+	if got := atomic.LoadInt32(&issued); got != 2 {
+		t.Errorf("issued %d, want 2 (refreshed)", got)
 	}
 }
 
 func TestToken_ConcurrentIssuesOnce(t *testing.T) {
 	var issued int32
-	srv := newServer(t, 200, okBody, &issued)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&issued, 1)
+		<-release // 모든 goroutine 이 Token() 에 진입할 때까지 첫 발급을 붙잡아 둔다
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(okBody))
+	}))
 	defer srv.Close()
 	s := New("id", "sec", srv.URL, srv.Client())
 
-	var wg sync.WaitGroup
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
+	const n = 100
+	var started, wg sync.WaitGroup
+	started.Add(n)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
 		go func() {
 			defer wg.Done()
+			started.Done()
 			if _, err := s.Token(context.Background()); err != nil {
 				t.Error(err)
 			}
 		}()
 	}
+	started.Wait()
+	time.Sleep(20 * time.Millisecond) // goroutine 들이 mutex 대기열에 쌓이도록
+	close(release)
 	wg.Wait()
-	if issued != 1 {
-		t.Errorf("issued %d, want 1", issued)
+	if got := atomic.LoadInt32(&issued); got != 1 {
+		t.Errorf("issued %d, want 1", got)
 	}
 }
 
@@ -448,12 +463,21 @@ func TestToken_InvalidateForcesReissue(t *testing.T) {
 	if _, err := s.Token(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	s.Invalidate()
+	s.Invalidate("tok-1")
 	if _, err := s.Token(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if issued != 2 {
-		t.Errorf("issued %d, want 2", issued)
+	if got := atomic.LoadInt32(&issued); got != 2 {
+		t.Errorf("issued %d, want 2", got)
+	}
+
+	// 캐시된 토큰과 다른 stale 값은 무시해야 한다(다른 goroutine 이 이미 받아 둔 새 토큰을 지우지 않기 위함).
+	s.Invalidate("stale-other")
+	if _, err := s.Token(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&issued); got != 2 {
+		t.Errorf("issued %d, want 2 (mismatch must not clear)", got)
 	}
 }
 
@@ -499,6 +523,39 @@ func TestToken_EmptyAccessToken(t *testing.T) {
 		t.Error("want error for empty access_token")
 	}
 }
+
+func TestToken_InvalidExpiresIn(t *testing.T) {
+	var issued int32
+	srv := newServer(t, 200, `{"access_token":"tok","token_type":"Bearer","expires_in":0}`, &issued)
+	defer srv.Close()
+	s := New("id", "sec", srv.URL, srv.Client())
+	if _, err := s.Token(context.Background()); err == nil || !strings.Contains(err.Error(), "expires_in") {
+		t.Errorf("want expires_in error, got %v", err)
+	}
+}
+
+func TestToken_ErrorBodyTruncatedOnRuneBoundary(t *testing.T) {
+	var issued int32
+	body := strings.Repeat("가", 100) + "\n\n" + strings.Repeat("나", 100) // 3바이트 문자 200개 = 600바이트
+	srv := newServer(t, 500, body, &issued)
+	defer srv.Close()
+	s := New("id", "sec", srv.URL, srv.Client())
+	_, err := s.Token(context.Background())
+	var ae *Error
+	if !errors.As(err, &ae) {
+		t.Fatalf("want *Error, got %v", err)
+	}
+	if !utf8.ValidString(ae.Description) || len(ae.Description) > 200 || strings.Contains(ae.Description, "\n") {
+		t.Errorf("Description = %q (len %d)", ae.Description, len(ae.Description))
+	}
+}
+
+func TestNew_NilHTTPClientDefaults(t *testing.T) {
+	s := New("id", "sec", "https://example.invalid", nil)
+	if s.hc == nil {
+		t.Error("nil hc must default to http.DefaultClient")
+	}
+}
 EOF
 go test ./internal/auth/ 2>&1 | head -5
 ```
@@ -509,6 +566,7 @@ Expected: 컴파일 에러(`undefined: New`, `Error`).
 ```bash
 cat > internal/auth/token.go << 'EOF'
 // Package auth 는 토스 Open API 의 OAuth2 Client Credentials 토큰을 발급하고 메모리에 캐시한다.
+// 토스는 client 당 유효 토큰이 1개이므로, 같은 client_id 를 여러 프로세스가 쓰면 서로의 토큰을 무효화한다 — 메모리 캐시로는 막을 수 없다.
 package auth
 
 import (
@@ -521,6 +579,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // refreshMargin 은 만료 이 시간 전부터 새 토큰을 발급한다.
@@ -538,10 +597,14 @@ type Error struct {
 }
 
 func (e *Error) Error() string {
-	if e.Code == "" {
-		return fmt.Sprintf("toss: token request failed (status %d): %s", e.StatusCode, e.Description)
+	msg := fmt.Sprintf("toss: token request failed (status %d)", e.StatusCode)
+	if e.Code != "" {
+		msg += ": " + e.Code
 	}
-	return fmt.Sprintf("toss: token request failed (status %d): %s: %s", e.StatusCode, e.Code, e.Description)
+	if e.Description != "" {
+		msg += ": " + e.Description
+	}
+	return msg
 }
 
 // TokenSource 는 access token 을 발급·캐시한다. 동시 호출에 안전하다.
@@ -549,7 +612,7 @@ type TokenSource struct {
 	clientID     string
 	clientSecret string
 	tokenURL     string
-	http         *http.Client
+	hc           *http.Client
 	now          func() time.Time
 
 	mu        sync.Mutex
@@ -559,11 +622,14 @@ type TokenSource struct {
 
 // New 는 TokenSource 를 만든다. baseURL 은 `https://openapi.tossinvest.com` 형태(끝 슬래시 없음).
 func New(clientID, clientSecret, baseURL string, hc *http.Client) *TokenSource {
+	if hc == nil {
+		hc = http.DefaultClient
+	}
 	return &TokenSource{
 		clientID:     clientID,
 		clientSecret: clientSecret,
 		tokenURL:     strings.TrimRight(baseURL, "/") + "/oauth2/token",
-		http:         hc,
+		hc:           hc,
 		now:          time.Now,
 	}
 }
@@ -575,20 +641,25 @@ func (s *TokenSource) Token(ctx context.Context) (string, error) {
 	if s.token != "" && s.now().Before(s.expiresAt.Add(-refreshMargin)) {
 		return s.token, nil
 	}
+	issuedAt := s.now()
 	tok, expiresIn, err := s.issue(ctx)
 	if err != nil {
 		return "", err
 	}
 	s.token = tok
-	s.expiresAt = s.now().Add(time.Duration(expiresIn) * time.Second)
+	s.expiresAt = issuedAt.Add(time.Duration(expiresIn) * time.Second)
 	return tok, nil
 }
 
-// Invalidate 는 캐시를 비운다. API 가 401 토큰 오류를 돌려줬을 때 호출한다.
-func (s *TokenSource) Invalidate() {
+// Invalidate 는 stale 이 현재 캐시된 토큰일 때만 캐시를 비운다. API 가 401 토큰 오류를 돌려줬을 때
+// 그 요청에 썼던 토큰을 넘긴다. 다른 goroutine 이 이미 새 토큰을 받아 둔 경우를 지우지 않기 위한 비교다
+// (토스는 client 당 유효 토큰이 1개라 재발급이 이전 토큰을 즉시 무효화한다).
+func (s *TokenSource) Invalidate(stale string) {
 	s.mu.Lock()
-	s.token = ""
-	s.expiresAt = time.Time{}
+	if s.token == stale {
+		s.token = ""
+		s.expiresAt = time.Time{}
+	}
 	s.mu.Unlock()
 }
 
@@ -616,7 +687,7 @@ func (s *TokenSource) issue(ctx context.Context) (string, int64, error) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := s.http.Do(req)
+	resp, err := s.hc.Do(req)
 	if err != nil {
 		return "", 0, fmt.Errorf("toss: token request: %w", err)
 	}
@@ -644,19 +715,27 @@ func (s *TokenSource) issue(ctx context.Context) (string, int64, error) {
 	if tr.AccessToken == "" {
 		return "", 0, fmt.Errorf("toss: token response has empty access_token")
 	}
+	if tr.ExpiresIn <= 0 {
+		return "", 0, fmt.Errorf("toss: token response has invalid expires_in %d", tr.ExpiresIn)
+	}
 	return tr.AccessToken, tr.ExpiresIn, nil
 }
 
+// truncate 는 s 를 최대 n 바이트로 자르되 UTF-8 문자 경계를 지키고, 연속 공백·개행은 한 칸으로 합친다.
 func truncate(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
 	if len(s) <= n {
 		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n]
 }
 EOF
 gofmt -l internal; go vet ./internal/auth/ && go test ./internal/auth/ -race -v 2>&1 | tail -10
 ```
-Expected: gofmt 출력 없음, 7 tests PASS (`-race` 포함).
+Expected: gofmt 출력 없음, 10 tests PASS (`-race` 포함).
 
 - [ ] **Step 3: 커밋**
 
@@ -705,7 +784,7 @@ func (s *stubTokens) Token(context.Context) (string, error) {
 	}
 	return s.tokens[i], nil
 }
-func (s *stubTokens) Invalidate() { atomic.AddInt32(&s.invalidated, 1) }
+func (s *stubTokens) Invalidate(string) { atomic.AddInt32(&s.invalidated, 1) }
 
 func newClient(t *testing.T, h http.HandlerFunc, tokens ...string) (*Client, *stubTokens, func()) {
 	t.Helper()
@@ -934,7 +1013,7 @@ const maxErrorBody = 200
 // TokenProvider 는 access token 공급자(internal/auth.TokenSource 가 구현).
 type TokenProvider interface {
 	Token(ctx context.Context) (string, error)
-	Invalidate()
+	Invalidate(stale string)
 }
 
 // APIError 는 토스 API 의 4xx/5xx 응답이다. Code 는 flat string 이며 unknown 값을 허용한다.
@@ -1062,7 +1141,7 @@ func (c *Client) do(ctx context.Context, path string, query url.Values, retried 
 
 	apiErr := parseError(resp, body)
 	if resp.StatusCode == http.StatusUnauthorized && !retried && isTokenError(apiErr.Code) {
-		c.tokens.Invalidate()
+		c.tokens.Invalidate(tok)
 		return c.do(ctx, path, query, true)
 	}
 	return nil, apiErr
@@ -1121,7 +1200,7 @@ import (
 type staticTokens struct{}
 
 func (staticTokens) Token(context.Context) (string, error) { return "test-token", nil }
-func (staticTokens) Invalidate()                            {}
+func (staticTokens) Invalidate(string) {}
 
 // Expect 는 스텁 서버가 검증할 요청 조건.
 type Expect struct {
