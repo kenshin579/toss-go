@@ -33,9 +33,9 @@ func NewServer(t *testing.T, want Expect, status int, body []byte) (*httpclient.
 			t.Errorf("path = %q, want %q", r.URL.Path, want.Path)
 		}
 		got := r.URL.Query()
-		for k, v := range want.Query {
-			if got.Get(k) != v[0] {
-				t.Errorf("query %s = %q, want %q", k, got.Get(k), v[0])
+		for k := range want.Query {
+			if got.Get(k) != want.Query.Get(k) {
+				t.Errorf("query %s = %q, want %q", k, got.Get(k), want.Query.Get(k))
 			}
 		}
 		for k := range got {

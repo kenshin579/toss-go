@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kenshin579/toss-go/internal/strutil"
 )
 
 // DefaultBaseURL 은 토스 Open API 서버.
@@ -101,7 +103,7 @@ type errorEnvelope struct {
 }
 
 // Get 은 GET {baseURL}{path}?{query} 를 호출해 `result` 를 out 으로 디코딩한다.
-// out 이 nil 이면 바디를 버린다. 4xx/5xx 는 *APIError.
+// out 이 nil 이면 바디를 버린다. 2xx 인데 result 가 없거나 null 이면 에러(토스는 2xx 에 항상 result 를 채운다). 4xx/5xx 는 *APIError.
 // 401 이고 code 가 expired-token / invalid-token 이면 토큰을 무효화하고 정확히 1회 재시도한다.
 func (c *Client) Get(ctx context.Context, path string, query url.Values, out any) error {
 	body, err := c.do(ctx, path, query, false)
@@ -116,7 +118,7 @@ func (c *Client) Get(ctx context.Context, path string, query url.Values, out any
 		return fmt.Errorf("toss: decode envelope %s: %w", path, err)
 	}
 	if len(env.Result) == 0 || string(env.Result) == "null" {
-		return nil
+		return fmt.Errorf("toss: %s: response has no result", path)
 	}
 	if err := json.Unmarshal(env.Result, out); err != nil {
 		return fmt.Errorf("toss: decode result %s: %w", path, err)
@@ -154,9 +156,12 @@ func (c *Client) do(ctx context.Context, path string, query url.Values, retried 
 	}
 
 	apiErr := parseError(resp, body)
-	if resp.StatusCode == http.StatusUnauthorized && !retried && isTokenError(apiErr.Code) {
+	if resp.StatusCode == http.StatusUnauthorized && isTokenError(apiErr.Code) {
+		// 서버가 거부한 토큰은 재시도 여부와 무관하게 캐시에서 제거한다(재시도 후 401 이어도 하루 동안 남지 않도록).
 		c.tokens.Invalidate(tok)
-		return c.do(ctx, path, query, true)
+		if !retried {
+			return c.do(ctx, path, query, true)
+		}
 	}
 	return nil, apiErr
 }
@@ -167,11 +172,7 @@ func isTokenError(code string) bool {
 
 func parseError(resp *http.Response, body []byte) *APIError {
 	e := &APIError{StatusCode: resp.StatusCode, RequestID: resp.Header.Get("X-Request-Id")}
-	if ra := resp.Header.Get("Retry-After"); ra != "" {
-		if secs, err := strconv.Atoi(ra); err == nil {
-			e.RetryAfter = time.Duration(secs) * time.Second
-		}
-	}
+	e.RetryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
 	var env errorEnvelope
 	if json.Unmarshal(body, &env) == nil && env.Error != nil {
 		if env.Error.RequestID != "" {
@@ -180,10 +181,26 @@ func parseError(resp *http.Response, body []byte) *APIError {
 		e.Code, e.Message, e.Data = env.Error.Code, env.Error.Message, env.Error.Data
 		return e
 	}
-	msg := strings.TrimSpace(string(body))
-	if len(msg) > maxErrorBody {
-		msg = msg[:maxErrorBody]
-	}
-	e.Message = msg
+	e.Message = strutil.Truncate(string(body), maxErrorBody)
 	return e
+}
+
+// parseRetryAfter 는 Retry-After 헤더(초 또는 HTTP-date)를 Duration 으로 바꾼다. 없거나 해석 불가면 0.
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs < 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }

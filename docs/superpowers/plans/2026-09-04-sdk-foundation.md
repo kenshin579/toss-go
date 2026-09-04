@@ -22,6 +22,7 @@
 | `tosstypes/types.go` (+`_test.go`) | `Date`, `Currency`, `Market`, `SecurityType`, `StockStatus`, `Interval`, `IndicatorInterval`, `RankingType`, `RankingDuration`, `MarketCountry`, `RateChangeType`, `WarningType` |
 | `internal/auth/token.go` (+`_test.go`) | `TokenSource` — 발급·캐시·`Invalidate`, `Error`(OAuth2 에러 형식) |
 | `internal/httpclient/client.go` (+`_test.go`) | `Client.Get` — Bearer, 봉투 해제, `APIError`, 401 재시도, 429 RetryAfter |
+| `internal/strutil/strutil.go` (+`_test.go`) | 에러 메시지용 rune-safe Truncate (auth·httpclient 공용) |
 | `internal/testutil/server.go` | 테스트용 `httptest` 서버 + 고정 토큰 `httpclient.Client` 생성 |
 | `client.go` / `config.go` / `from_env.go` / `errors.go` (+`client_test.go`) | 루트 진입점, Option, env, 에러 재수출·`IsCode` |
 | `marketdata/` | `client.go`, `prices.go`, `orderbook.go`, `trades.go`, `price_limits.go`, `candles.go`, 테스트, `testdata/` |
@@ -579,7 +580,8 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
+
+	"github.com/kenshin579/toss-go/internal/strutil"
 )
 
 // refreshMargin 은 만료 이 시간 전부터 새 토큰을 발급한다.
@@ -703,7 +705,7 @@ func (s *TokenSource) issue(ctx context.Context) (string, int64, error) {
 		if json.Unmarshal(body, &oe) == nil && oe.Error != "" {
 			e.Code, e.Description = oe.Error, oe.Description
 		} else {
-			e.Description = truncate(strings.TrimSpace(string(body)), maxErrorBody)
+			e.Description = strutil.Truncate(string(body), maxErrorBody)
 		}
 		return "", 0, e
 	}
@@ -719,18 +721,6 @@ func (s *TokenSource) issue(ctx context.Context) (string, int64, error) {
 		return "", 0, fmt.Errorf("toss: token response has invalid expires_in %d", tr.ExpiresIn)
 	}
 	return tr.AccessToken, tr.ExpiresIn, nil
-}
-
-// truncate 는 s 를 최대 n 바이트로 자르되 UTF-8 문자 경계를 지키고, 연속 공백·개행은 한 칸으로 합친다.
-func truncate(s string, n int) string {
-	s = strings.Join(strings.Fields(s), " ")
-	if len(s) <= n {
-		return s
-	}
-	for n > 0 && !utf8.RuneStart(s[n]) {
-		n--
-	}
-	return s[:n]
 }
 EOF
 gofmt -l internal; go vet ./internal/auth/ && go test ./internal/auth/ -race -v 2>&1 | tail -10
@@ -765,9 +755,11 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // stubTokens 는 고정 토큰 TokenProvider. invalidated 는 Invalidate 호출 횟수.
@@ -775,6 +767,9 @@ type stubTokens struct {
 	tokens      []string // 호출 순서대로 반환, 마지막 값 반복
 	calls       int32
 	invalidated int32
+
+	mu        sync.Mutex
+	lastStale string
 }
 
 func (s *stubTokens) Token(context.Context) (string, error) {
@@ -784,7 +779,12 @@ func (s *stubTokens) Token(context.Context) (string, error) {
 	}
 	return s.tokens[i], nil
 }
-func (s *stubTokens) Invalidate(string) { atomic.AddInt32(&s.invalidated, 1) }
+func (s *stubTokens) Invalidate(stale string) {
+	atomic.AddInt32(&s.invalidated, 1)
+	s.mu.Lock()
+	s.lastStale = stale
+	s.mu.Unlock()
+}
 
 func newClient(t *testing.T, h http.HandlerFunc, tokens ...string) (*Client, *stubTokens, func()) {
 	t.Helper()
@@ -901,13 +901,20 @@ func TestGet_RetriesOnceOnExpiredToken(t *testing.T) {
 		_, _ = w.Write([]byte(`{"result":{"ok":true}}`))
 	}, "tok1", "tok2")
 	defer done()
-	var out struct{ OK bool `json:"ok"` }
+	var out struct {
+		OK bool `json:"ok"`
+	}
 	if err := c.Get(context.Background(), "/x", nil, &out); err != nil {
 		t.Fatal(err)
 	}
-	if !out.OK || n != 2 || st.invalidated != 1 {
+	if !out.OK || atomic.LoadInt32(&n) != 2 || atomic.LoadInt32(&st.invalidated) != 1 {
 		t.Errorf("ok=%v calls=%d invalidated=%d", out.OK, n, st.invalidated)
 	}
+	st.mu.Lock()
+	if st.lastStale != "tok1" {
+		t.Errorf("Invalidate called with %q, want tok1", st.lastStale)
+	}
+	st.mu.Unlock()
 }
 
 func TestGet_DoesNotRetryTwice(t *testing.T) {
@@ -923,8 +930,8 @@ func TestGet_DoesNotRetryTwice(t *testing.T) {
 	if !errors.As(err, &ae) || ae.Code != "invalid-token" {
 		t.Fatalf("want invalid-token APIError, got %v", err)
 	}
-	if n != 2 || st.invalidated != 1 {
-		t.Errorf("calls=%d invalidated=%d, want 2/1", n, st.invalidated)
+	if atomic.LoadInt32(&n) != 2 || atomic.LoadInt32(&st.invalidated) != 2 {
+		t.Errorf("calls=%d invalidated=%d, want 2/2", n, st.invalidated)
 	}
 }
 
@@ -937,7 +944,7 @@ func TestGet_401OtherCodeNoRetry(t *testing.T) {
 	})
 	defer done()
 	_ = c.Get(context.Background(), "/x", nil, nil)
-	if n != 1 || st.invalidated != 0 {
+	if atomic.LoadInt32(&n) != 1 || atomic.LoadInt32(&st.invalidated) != 0 {
 		t.Errorf("calls=%d invalidated=%d, want 1/0", n, st.invalidated)
 	}
 }
@@ -960,7 +967,9 @@ func TestGet_DecodeError(t *testing.T) {
 		_, _ = w.Write([]byte(`{"result":{"n":"notanumber"}}`))
 	})
 	defer done()
-	var out struct{ N int `json:"n"` }
+	var out struct {
+		N int `json:"n"`
+	}
 	if err := c.Get(context.Background(), "/x", nil, &out); err == nil || !strings.Contains(err.Error(), "decode") {
 		t.Errorf("want decode error, got %v", err)
 	}
@@ -973,6 +982,67 @@ func TestNew_Defaults(t *testing.T) {
 	}
 	if c.http.Timeout != 30*time.Second {
 		t.Errorf("timeout = %v", c.http.Timeout)
+	}
+}
+
+type failingTokens struct{ err error }
+
+func (f failingTokens) Token(context.Context) (string, error) { return "", f.err }
+func (failingTokens) Invalidate(string)                       {}
+
+func TestGet_TokenErrorSurfaces(t *testing.T) {
+	want := errors.New("boom")
+	c := New(Config{BaseURL: "http://127.0.0.1:0", Tokens: failingTokens{err: want}})
+	if err := c.Get(context.Background(), "/x", nil, nil); !errors.Is(err, want) {
+		t.Errorf("want token error passthrough, got %v", err)
+	}
+}
+
+func TestGet_NullResultIsError(t *testing.T) {
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"result":null}`))
+	})
+	defer done()
+	var out struct{ A int }
+	if err := c.Get(context.Background(), "/x", nil, &out); err == nil || !strings.Contains(err.Error(), "no result") {
+		t.Errorf("want no-result error, got %v", err)
+	}
+	// out == nil 이면 바디를 보지 않으므로 에러 없음
+	if err := c.Get(context.Background(), "/x", nil, nil); err != nil {
+		t.Errorf("nil out must not error: %v", err)
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	if d := parseRetryAfter(" 3 "); d != 3*time.Second {
+		t.Errorf("seconds = %v", d)
+	}
+	if d := parseRetryAfter("-1"); d != 0 {
+		t.Errorf("negative = %v", d)
+	}
+	if d := parseRetryAfter("garbage"); d != 0 {
+		t.Errorf("garbage = %v", d)
+	}
+	future := time.Now().Add(90 * time.Second).UTC().Format(http.TimeFormat)
+	if d := parseRetryAfter(future); d < 80*time.Second || d > 91*time.Second {
+		t.Errorf("http-date = %v", d)
+	}
+	past := time.Now().Add(-90 * time.Second).UTC().Format(http.TimeFormat)
+	if d := parseRetryAfter(past); d != 0 {
+		t.Errorf("past date = %v", d)
+	}
+}
+
+func TestGet_NonEnvelopeErrorBodyRuneSafe(t *testing.T) {
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(502)
+		_, _ = w.Write([]byte(strings.Repeat("가", 100)))
+	})
+	defer done()
+	err := c.Get(context.Background(), "/x", nil, nil)
+	var ae *APIError
+	if !errors.As(err, &ae) || !utf8.ValidString(ae.Message) || len(ae.Message) > 200 {
+		t.Errorf("got %+v (%v)", ae, err)
 	}
 }
 EOF
@@ -999,6 +1069,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kenshin579/toss-go/internal/strutil"
 )
 
 // DefaultBaseURL 은 토스 Open API 서버.
@@ -1087,7 +1159,7 @@ type errorEnvelope struct {
 }
 
 // Get 은 GET {baseURL}{path}?{query} 를 호출해 `result` 를 out 으로 디코딩한다.
-// out 이 nil 이면 바디를 버린다. 4xx/5xx 는 *APIError.
+// out 이 nil 이면 바디를 버린다. 2xx 인데 result 가 없거나 null 이면 에러(토스는 2xx 에 항상 result 를 채운다). 4xx/5xx 는 *APIError.
 // 401 이고 code 가 expired-token / invalid-token 이면 토큰을 무효화하고 정확히 1회 재시도한다.
 func (c *Client) Get(ctx context.Context, path string, query url.Values, out any) error {
 	body, err := c.do(ctx, path, query, false)
@@ -1102,7 +1174,7 @@ func (c *Client) Get(ctx context.Context, path string, query url.Values, out any
 		return fmt.Errorf("toss: decode envelope %s: %w", path, err)
 	}
 	if len(env.Result) == 0 || string(env.Result) == "null" {
-		return nil
+		return fmt.Errorf("toss: %s: response has no result", path)
 	}
 	if err := json.Unmarshal(env.Result, out); err != nil {
 		return fmt.Errorf("toss: decode result %s: %w", path, err)
@@ -1140,9 +1212,12 @@ func (c *Client) do(ctx context.Context, path string, query url.Values, retried 
 	}
 
 	apiErr := parseError(resp, body)
-	if resp.StatusCode == http.StatusUnauthorized && !retried && isTokenError(apiErr.Code) {
+	if resp.StatusCode == http.StatusUnauthorized && isTokenError(apiErr.Code) {
+		// 서버가 거부한 토큰은 재시도 여부와 무관하게 캐시에서 제거한다(재시도 후 401 이어도 하루 동안 남지 않도록).
 		c.tokens.Invalidate(tok)
-		return c.do(ctx, path, query, true)
+		if !retried {
+			return c.do(ctx, path, query, true)
+		}
 	}
 	return nil, apiErr
 }
@@ -1153,11 +1228,7 @@ func isTokenError(code string) bool {
 
 func parseError(resp *http.Response, body []byte) *APIError {
 	e := &APIError{StatusCode: resp.StatusCode, RequestID: resp.Header.Get("X-Request-Id")}
-	if ra := resp.Header.Get("Retry-After"); ra != "" {
-		if secs, err := strconv.Atoi(ra); err == nil {
-			e.RetryAfter = time.Duration(secs) * time.Second
-		}
-	}
+	e.RetryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
 	var env errorEnvelope
 	if json.Unmarshal(body, &env) == nil && env.Error != nil {
 		if env.Error.RequestID != "" {
@@ -1166,17 +1237,33 @@ func parseError(resp *http.Response, body []byte) *APIError {
 		e.Code, e.Message, e.Data = env.Error.Code, env.Error.Message, env.Error.Data
 		return e
 	}
-	msg := strings.TrimSpace(string(body))
-	if len(msg) > maxErrorBody {
-		msg = msg[:maxErrorBody]
-	}
-	e.Message = msg
+	e.Message = strutil.Truncate(string(body), maxErrorBody)
 	return e
+}
+
+// parseRetryAfter 는 Retry-After 헤더(초 또는 HTTP-date)를 Duration 으로 바꾼다. 없거나 해석 불가면 0.
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs < 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 EOF
 gofmt -l internal; go vet ./internal/httpclient/ && go test ./internal/httpclient/ -race -v 2>&1 | tail -14
 ```
-Expected: gofmt 출력 없음, 11 tests PASS. (`TestGet_EmptyResultArray` 는 `{"result":[]}` 가 `[]T{}` 로 디코딩되어 non-nil 빈 슬라이스여야 한다 — `json.Unmarshal` 의 표준 동작.)
+Expected: gofmt 출력 없음, 15 tests PASS. (`TestGet_EmptyResultArray` 는 `{"result":[]}` 가 `[]T{}` 로 디코딩되어 non-nil 빈 슬라이스여야 한다 — `json.Unmarshal` 의 표준 동작.)
 
 - [ ] **Step 3: testutil 작성** — 그룹 패키지 테스트가 공유하는 스텁 서버.
 
@@ -1200,7 +1287,7 @@ import (
 type staticTokens struct{}
 
 func (staticTokens) Token(context.Context) (string, error) { return "test-token", nil }
-func (staticTokens) Invalidate(string) {}
+func (staticTokens) Invalidate(string)                     {}
 
 // Expect 는 스텁 서버가 검증할 요청 조건.
 type Expect struct {
@@ -1217,9 +1304,9 @@ func NewServer(t *testing.T, want Expect, status int, body []byte) (*httpclient.
 			t.Errorf("path = %q, want %q", r.URL.Path, want.Path)
 		}
 		got := r.URL.Query()
-		for k, v := range want.Query {
-			if got.Get(k) != v[0] {
-				t.Errorf("query %s = %q, want %q", k, got.Get(k), v[0])
+		for k := range want.Query {
+			if got.Get(k) != want.Query.Get(k) {
+				t.Errorf("query %s = %q, want %q", k, got.Get(k), want.Query.Get(k))
 			}
 		}
 		for k := range got {
@@ -1252,10 +1339,70 @@ gofmt -l internal; go vet ./internal/... && echo VET_OK
 ```
 Expected: `VET_OK`.
 
+- [ ] **Step 3b: internal/strutil (auth·httpclient 공용 절단 헬퍼)**
+
+```bash
+mkdir -p internal/strutil && cat > internal/strutil/strutil.go << 'EOF'
+// Package strutil 은 에러 메시지 정리용 소형 문자열 헬퍼다.
+package strutil
+
+import (
+	"strings"
+	"unicode/utf8"
+)
+
+// Truncate 는 s 의 연속 공백·개행을 한 칸으로 합친 뒤 최대 n 바이트로 자른다. UTF-8 문자 경계를 지킨다.
+func Truncate(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+EOF
+gofmt -l internal; echo OK
+```
+
+```bash
+cat > internal/strutil/strutil_test.go << 'EOF'
+package strutil
+
+import (
+	"strings"
+	"testing"
+	"unicode/utf8"
+)
+
+func TestTruncate(t *testing.T) {
+	if got := Truncate("  a \n\n b  ", 100); got != "a b" {
+		t.Errorf("collapse = %q", got)
+	}
+	if got := Truncate("abcdef", 3); got != "abc" {
+		t.Errorf("ascii = %q", got)
+	}
+	s := strings.Repeat("가", 100) // 300 bytes
+	got := Truncate(s, 200)
+	if !utf8.ValidString(got) || len(got) != 198 || utf8.RuneCountInString(got) != 66 {
+		t.Errorf("rune boundary: len=%d runes=%d valid=%v", len(got), utf8.RuneCountInString(got), utf8.ValidString(got))
+	}
+	if got := Truncate("", 5); got != "" {
+		t.Errorf("empty = %q", got)
+	}
+}
+EOF
+go test ./internal/strutil/
+```
+Expected: `ok`.
+
+이어서 `internal/auth/token.go` 의 로컬 `truncate` 를 지우고 `strutil.Truncate` 를 쓰도록, `internal/httpclient/client.go` 의 에러 바디 절단도 `strutil.Truncate` 를 쓰도록 맞춘다(위 두 파일 heredoc 에 이미 반영됨).
+
 - [ ] **Step 4: 커밋**
 
 ```bash
-git add internal/httpclient internal/testutil && git commit -m "feat(httpclient): Bearer 주입·result 봉투 해제·APIError 매핑·401 토큰 재시도 + 테스트 헬퍼
+git add internal/httpclient internal/testutil internal/strutil && git commit -m "feat(httpclient): Bearer 주입·result 봉투 해제·APIError 매핑·401 토큰 재시도 + 테스트 헬퍼
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```

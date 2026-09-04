@@ -12,7 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
+
+	"github.com/kenshin579/toss-go/internal/strutil"
 )
 
 // refreshMargin 은 만료 이 시간 전부터 새 토큰을 발급한다.
@@ -136,7 +137,7 @@ func (s *TokenSource) issue(ctx context.Context) (string, int64, error) {
 		if json.Unmarshal(body, &oe) == nil && oe.Error != "" {
 			e.Code, e.Description = oe.Error, oe.Description
 		} else {
-			e.Description = truncate(strings.TrimSpace(string(body)), maxErrorBody)
+			e.Description = strutil.Truncate(string(body), maxErrorBody)
 		}
 		return "", 0, e
 	}
@@ -152,16 +153,4 @@ func (s *TokenSource) issue(ctx context.Context) (string, int64, error) {
 		return "", 0, fmt.Errorf("toss: token response has invalid expires_in %d", tr.ExpiresIn)
 	}
 	return tr.AccessToken, tr.ExpiresIn, nil
-}
-
-// truncate 는 s 를 최대 n 바이트로 자르되 UTF-8 문자 경계를 지키고, 연속 공백·개행은 한 칸으로 합친다.
-func truncate(s string, n int) string {
-	s = strings.Join(strings.Fields(s), " ")
-	if len(s) <= n {
-		return s
-	}
-	for n > 0 && !utf8.RuneStart(s[n]) {
-		n--
-	}
-	return s[:n]
 }

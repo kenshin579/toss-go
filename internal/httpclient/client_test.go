@@ -7,9 +7,11 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // stubTokens 는 고정 토큰 TokenProvider. invalidated 는 Invalidate 호출 횟수.
@@ -17,6 +19,9 @@ type stubTokens struct {
 	tokens      []string // 호출 순서대로 반환, 마지막 값 반복
 	calls       int32
 	invalidated int32
+
+	mu        sync.Mutex
+	lastStale string
 }
 
 func (s *stubTokens) Token(context.Context) (string, error) {
@@ -26,7 +31,12 @@ func (s *stubTokens) Token(context.Context) (string, error) {
 	}
 	return s.tokens[i], nil
 }
-func (s *stubTokens) Invalidate(string) { atomic.AddInt32(&s.invalidated, 1) }
+func (s *stubTokens) Invalidate(stale string) {
+	atomic.AddInt32(&s.invalidated, 1)
+	s.mu.Lock()
+	s.lastStale = stale
+	s.mu.Unlock()
+}
 
 func newClient(t *testing.T, h http.HandlerFunc, tokens ...string) (*Client, *stubTokens, func()) {
 	t.Helper()
@@ -149,9 +159,14 @@ func TestGet_RetriesOnceOnExpiredToken(t *testing.T) {
 	if err := c.Get(context.Background(), "/x", nil, &out); err != nil {
 		t.Fatal(err)
 	}
-	if !out.OK || n != 2 || st.invalidated != 1 {
+	if !out.OK || atomic.LoadInt32(&n) != 2 || atomic.LoadInt32(&st.invalidated) != 1 {
 		t.Errorf("ok=%v calls=%d invalidated=%d", out.OK, n, st.invalidated)
 	}
+	st.mu.Lock()
+	if st.lastStale != "tok1" {
+		t.Errorf("Invalidate called with %q, want tok1", st.lastStale)
+	}
+	st.mu.Unlock()
 }
 
 func TestGet_DoesNotRetryTwice(t *testing.T) {
@@ -167,8 +182,8 @@ func TestGet_DoesNotRetryTwice(t *testing.T) {
 	if !errors.As(err, &ae) || ae.Code != "invalid-token" {
 		t.Fatalf("want invalid-token APIError, got %v", err)
 	}
-	if n != 2 || st.invalidated != 1 {
-		t.Errorf("calls=%d invalidated=%d, want 2/1", n, st.invalidated)
+	if atomic.LoadInt32(&n) != 2 || atomic.LoadInt32(&st.invalidated) != 2 {
+		t.Errorf("calls=%d invalidated=%d, want 2/2", n, st.invalidated)
 	}
 }
 
@@ -181,7 +196,7 @@ func TestGet_401OtherCodeNoRetry(t *testing.T) {
 	})
 	defer done()
 	_ = c.Get(context.Background(), "/x", nil, nil)
-	if n != 1 || st.invalidated != 0 {
+	if atomic.LoadInt32(&n) != 1 || atomic.LoadInt32(&st.invalidated) != 0 {
 		t.Errorf("calls=%d invalidated=%d, want 1/0", n, st.invalidated)
 	}
 }
@@ -219,5 +234,66 @@ func TestNew_Defaults(t *testing.T) {
 	}
 	if c.http.Timeout != 30*time.Second {
 		t.Errorf("timeout = %v", c.http.Timeout)
+	}
+}
+
+type failingTokens struct{ err error }
+
+func (f failingTokens) Token(context.Context) (string, error) { return "", f.err }
+func (failingTokens) Invalidate(string)                       {}
+
+func TestGet_TokenErrorSurfaces(t *testing.T) {
+	want := errors.New("boom")
+	c := New(Config{BaseURL: "http://127.0.0.1:0", Tokens: failingTokens{err: want}})
+	if err := c.Get(context.Background(), "/x", nil, nil); !errors.Is(err, want) {
+		t.Errorf("want token error passthrough, got %v", err)
+	}
+}
+
+func TestGet_NullResultIsError(t *testing.T) {
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"result":null}`))
+	})
+	defer done()
+	var out struct{ A int }
+	if err := c.Get(context.Background(), "/x", nil, &out); err == nil || !strings.Contains(err.Error(), "no result") {
+		t.Errorf("want no-result error, got %v", err)
+	}
+	// out == nil 이면 바디를 보지 않으므로 에러 없음
+	if err := c.Get(context.Background(), "/x", nil, nil); err != nil {
+		t.Errorf("nil out must not error: %v", err)
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	if d := parseRetryAfter(" 3 "); d != 3*time.Second {
+		t.Errorf("seconds = %v", d)
+	}
+	if d := parseRetryAfter("-1"); d != 0 {
+		t.Errorf("negative = %v", d)
+	}
+	if d := parseRetryAfter("garbage"); d != 0 {
+		t.Errorf("garbage = %v", d)
+	}
+	future := time.Now().Add(90 * time.Second).UTC().Format(http.TimeFormat)
+	if d := parseRetryAfter(future); d < 80*time.Second || d > 91*time.Second {
+		t.Errorf("http-date = %v", d)
+	}
+	past := time.Now().Add(-90 * time.Second).UTC().Format(http.TimeFormat)
+	if d := parseRetryAfter(past); d != 0 {
+		t.Errorf("past date = %v", d)
+	}
+}
+
+func TestGet_NonEnvelopeErrorBodyRuneSafe(t *testing.T) {
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(502)
+		_, _ = w.Write([]byte(strings.Repeat("가", 100)))
+	})
+	defer done()
+	err := c.Get(context.Background(), "/x", nil, nil)
+	var ae *APIError
+	if !errors.As(err, &ae) || !utf8.ValidString(ae.Message) || len(ae.Message) > 200 {
+		t.Errorf("got %+v (%v)", ae, err)
 	}
 }

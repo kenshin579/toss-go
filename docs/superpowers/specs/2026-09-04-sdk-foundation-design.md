@@ -63,7 +63,8 @@ toss-go/
 ├── errors.go               # APIError, AuthError 재수출 + IsCode(err, code) 헬퍼
 ├── internal/
 │   ├── auth/               # 토큰 발급 + 메모리 캐시 (mutex, 만료 60초 전 갱신)
-│   └── httpclient/         # Bearer 주입, {result} 봉투 해제, {error}→APIError, 401 토큰 오류 1회 재발급·재시도
+│   ├── httpclient/         # Bearer 주입, {result} 봉투 해제, {error}→APIError, 401 토큰 오류 1회 재발급·재시도
+│   └── strutil/            # 에러 메시지 절단 헬퍼(auth·httpclient 공용)
 ├── tosstypes/              # Date, Currency, Market, Interval, SecurityType, ... (문자열 enum + 상수)
 ├── marketdata/             # Prices / Orderbook / Trades / PriceLimits / Candles
 ├── stockinfo/              # Stocks / ListStocks / Warnings / 매매동향 5종
@@ -120,8 +121,8 @@ func (c *Client) Get(ctx context.Context, path string, query url.Values, out any
 - 2xx: 바디 `{"result": <T>}` 에서 `result` 만 `out` 으로 디코딩(`json.RawMessage` 경유).
 - 4xx/5xx: 바디 `{"error":{...}}` → `APIError`. 바디가 봉투 형식이 아니면(엣지 차단 등)
   `APIError{StatusCode, Code:"", Message: 바디 앞 200자}`.
-- 401 이고 `Code ∈ {expired-token, invalid-token}` 이면 `tokens.Invalidate(사용한 토큰)` 후 **정확히 1회**
-  재발급·재시도. 재시도도 실패하면 그 에러 반환.
+- 401 이고 `Code ∈ {expired-token, invalid-token}` 이면 사용한 토큰을 `tokens.Invalidate` 로 제거하고, 첫 번째 실패인 경우에만 1회 재발급·재시도한다. 재시도도 실패하면 그 에러 반환.
+- 2xx 인데 result 가 없거나 null 이면 에러(토스는 2xx 에 항상 result 를 채움).
 - 429 는 `Retry-After` 헤더(초)를 `APIError.RetryAfter time.Duration` 에 담는다.
 - 재시도(429/5xx)·스로틀링·캐싱 없음. 네트워크/디코딩 오류는 `%w` 래핑.
 - 기본 baseURL `https://openapi.tossinvest.com`, 타임아웃 30s.
