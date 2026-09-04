@@ -27,6 +27,7 @@ import (
 // Client 와 sub-client 는 여러 goroutine 에서 동시에 사용해도 안전하다.
 type Client struct {
 	tokens *auth.TokenSource
+	http   *httpclient.Client
 
 	MarketData       *marketdata.Client // 시세: 현재가·호가·체결·상하한가·캔들
 	StockInfo        *stockinfo.Client  // 종목: 메타·전체 목록·유의사항·매매동향 5종
@@ -56,6 +57,7 @@ func NewClient(clientID, clientSecret string, opts ...Option) (*Client, error) {
 
 	return &Client{
 		tokens:           tokens,
+		http:             h,
 		MarketData:       marketdata.New(h),
 		StockInfo:        stockinfo.New(h),
 		MarketInfo:       marketinfo.New(h),
