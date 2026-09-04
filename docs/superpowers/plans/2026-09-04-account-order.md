@@ -1032,7 +1032,7 @@ func (a *AccountScope) AccountSeq() int64 { return a.accountSeq }
 //
 //	accts, _ := c.Accounts(ctx)
 //	a := c.Account(accts[0].AccountSeq)
-//	h, _ := a.Asset.Holdings(ctx, nil)
+//	h, _ := a.Asset.Holdings(ctx, asset.HoldingsParams{})
 func (c *Client) Account(accountSeq int64) *AccountScope {
 	return &AccountScope{
 		accountSeq: accountSeq,
