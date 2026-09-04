@@ -3,6 +3,7 @@ package conditionalorder
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/url"
 	"sync/atomic"
@@ -16,7 +17,11 @@ import (
 func d(s string) decimal.Decimal { return decimal.RequireFromString(s) }
 
 // detailJSON 은 ConditionalOrderDetailResponse 스키마를 그대로 옮긴 응답 예시다(openapi 에 2xx 예시가 없다).
-const detailJSON = `{"result":{"conditionalOrderId":"c-1","type":"OCO","status":"WATCHING","symbol":"005930","market":"KR","quantity":"10","orderType":"LIMIT","expireDate":"2026-12-31","first":{"type":"STOP","status":"WATCHING","triggerPrice":"65000","targetProfitRate":null,"orderPrice":"64900","triggeredOrderId":null},"second":{"type":"PROFIT_RATE","status":"HOLDING","triggerPrice":null,"targetProfitRate":"0.1","orderPrice":null,"triggeredOrderId":"o-77"},"createdAt":"2026-09-01T10:00:00+09:00"}}`
+// 그룹(OCO/OTO)의 first/second 는 항상 같은 ConditionType 이므로 둘 다 STOP 이다.
+const detailJSON = `{"result":{"conditionalOrderId":"c-1","type":"OCO","status":"WATCHING","symbol":"005930","market":"KR","quantity":"10","orderType":"LIMIT","expireDate":"2026-12-31","first":{"type":"STOP","status":"WATCHING","triggerPrice":"65000","targetProfitRate":null,"orderPrice":"64900","triggeredOrderId":null},"second":{"type":"STOP","status":"HOLDING","triggerPrice":"63000","targetProfitRate":null,"orderPrice":"62900","triggeredOrderId":"o-77"},"createdAt":"2026-09-01T10:00:00+09:00"}}`
+
+// detailProfitRateJSON 은 PROFIT_RATE 조건(퍼센트 단위 targetProfitRate, triggerPrice 는 null) 응답 예시다.
+const detailProfitRateJSON = `{"result":{"conditionalOrderId":"c-2","type":"SINGLE","status":"WATCHING","symbol":"005930","market":"KR","quantity":"10","orderType":"MARKET","expireDate":"2026-12-31","first":{"type":"PROFIT_RATE","status":"WATCHING","triggerPrice":null,"targetProfitRate":"10.5","orderPrice":null,"triggeredOrderId":null},"second":null,"createdAt":"2026-09-01T10:00:00+09:00"}}`
 
 const listJSON = `{"result":{"conditionalOrders":[{"conditionalOrderId":"c-1","type":"SINGLE","status":"WATCHING","symbol":"005930","market":"KR","quantity":"10","orderType":"MARKET","expireDate":"2026-12-31","first":{"type":"STOP","status":"WATCHING","triggerPrice":"65000","targetProfitRate":null,"orderPrice":null,"triggeredOrderId":null},"second":null,"createdAt":"2026-09-01T10:00:00+09:00"}],"nextCursor":"cur-2","hasNext":true}}`
 
@@ -39,11 +44,29 @@ func TestGet(t *testing.T) {
 	if got.First.OrderPrice == nil || got.First.OrderPrice.String() != "64900" || got.First.TargetProfitRate != nil || got.First.TriggeredOrderID != nil {
 		t.Errorf("first optional = %+v", got.First)
 	}
-	if got.Second == nil || got.Second.Type != ConditionProfitRate || got.Second.TargetProfitRate == nil || got.Second.TargetProfitRate.String() != "0.1" {
+	if got.Second == nil || got.Second.Type != ConditionStop || got.Second.TriggerPrice == nil || got.Second.TriggerPrice.String() != "63000" || got.Second.TargetProfitRate != nil {
 		t.Errorf("second = %+v", got.Second)
 	}
 	if got.Second.TriggeredOrderID == nil || *got.Second.TriggeredOrderID != "o-77" {
 		t.Errorf("triggeredOrderId = %v", got.Second.TriggeredOrderID)
+	}
+}
+
+func TestGet_ProfitRateCondition(t *testing.T) {
+	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/conditional-orders/c-2"}, "4", 200, []byte(detailProfitRateJSON))
+	defer done()
+	got, err := New(hc, 4).Get(context.Background(), "c-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.First.Type != ConditionProfitRate || got.First.TargetProfitRate == nil || got.First.TargetProfitRate.String() != "10.5" {
+		t.Errorf("first = %+v", got.First)
+	}
+	if got.First.TriggerPrice != nil {
+		t.Errorf("triggerPrice must be nil for PROFIT_RATE: %v", got.First.TriggerPrice)
+	}
+	if got.Second != nil {
+		t.Errorf("second must be nil for SINGLE: %+v", got.Second)
 	}
 }
 
@@ -113,8 +136,7 @@ func captureBody(t *testing.T, path, method, wantAccount string, status int, res
 		if a := r.Header.Get("X-Tossinvest-Account"); a != wantAccount {
 			t.Errorf("account = %q, want %q", a, wantAccount)
 		}
-		b := make([]byte, r.ContentLength)
-		_, _ = r.Body.Read(b)
+		b, _ := io.ReadAll(r.Body)
 		got = string(b)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -159,31 +181,39 @@ func TestPlace_Single(t *testing.T) {
 }
 
 func TestPlace_OCOWithSecond(t *testing.T) {
+	// OCO/OTO 는 지정가(LIMIT)만 지원한다 — MARKET 조합은 서버가 거부하므로 fixture 로 쓰지 않는다.
 	c, body, done := captureBody(t, "/api/v1/conditional-orders", http.MethodPost, "4", 200, []byte(`{"result":{"conditionalOrderId":"c-10"}}`))
 	defer done()
-	second := Condition{OrderSide: SideSell, TriggerPrice: d("80000")}
+	second := Condition{OrderSide: SideSell, TriggerPrice: d("70000"), OrderPrice: d("70000")}
 	if _, err := c.Place(context.Background(), PlaceRequest{
-		Symbol: "005930", Type: TypeOCO, Quantity: d("5"), OrderType: OrderTypeMarket, ExpireDate: "2026-10-01",
-		First:  Condition{OrderSide: SideSell, TriggerPrice: d("60000")},
+		Symbol: "005930", Type: TypeOCO, Quantity: d("5"), OrderType: OrderTypeLimit, ExpireDate: "2026-10-01",
+		First:  Condition{OrderSide: SideSell, TriggerPrice: d("80000"), OrderPrice: d("80000")},
 		Second: &second,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	assertJSON(t, *body, `{"symbol":"005930","type":"OCO","quantity":"5","orderType":"MARKET","expireDate":"2026-10-01","first":{"orderSide":"SELL","triggerPrice":"60000"},"second":{"orderSide":"SELL","triggerPrice":"80000"}}`)
+	assertJSON(t, *body, `{"symbol":"005930","type":"OCO","quantity":"5","orderType":"LIMIT","expireDate":"2026-10-01","first":{"orderSide":"SELL","triggerPrice":"80000","orderPrice":"80000"},"second":{"orderSide":"SELL","triggerPrice":"70000","orderPrice":"70000"}}`)
 }
 
 func TestPlace_Validation(t *testing.T) {
 	c := New(nil, 4) // nil client: 검증이 요청 전에 실패해야 한다
 	ctx := context.Background()
-	ok := Condition{OrderSide: SideSell, TriggerPrice: d("1")}
+	ok := Condition{OrderSide: SideSell, TriggerPrice: d("1")}                          // MARKET 과 짝
+	okLimit := Condition{OrderSide: SideSell, TriggerPrice: d("1"), OrderPrice: d("1")} // LIMIT 과 짝
+	second := Condition{OrderSide: SideSell, TriggerPrice: d("1")}
 	cases := map[string]PlaceRequest{
-		"empty symbol":    {Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
-		"empty type":      {Symbol: "005930", Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
-		"zero quantity":   {Symbol: "005930", Type: TypeSingle, OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
-		"empty orderType": {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), ExpireDate: "2026-12-31", First: ok},
-		"empty expire":    {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, First: ok},
-		"no first side":   {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: Condition{TriggerPrice: d("1")}},
-		"no trigger":      {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: Condition{OrderSide: SideSell}},
+		"empty symbol":             {Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
+		"empty type":               {Symbol: "005930", Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
+		"zero quantity":            {Symbol: "005930", Type: TypeSingle, OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
+		"empty orderType":          {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), ExpireDate: "2026-12-31", First: ok},
+		"empty expire":             {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, First: ok},
+		"no first side":            {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: Condition{TriggerPrice: d("1")}},
+		"no trigger":               {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: Condition{OrderSide: SideSell}},
+		"market with orderPrice":   {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: Condition{OrderSide: SideSell, TriggerPrice: d("1"), OrderPrice: d("1")}},
+		"limit without orderPrice": {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeLimit, ExpireDate: "2026-12-31", First: ok},
+		"single with second":       {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok, Second: &second},
+		"oco without second":       {Symbol: "005930", Type: TypeOCO, Quantity: d("1"), OrderType: OrderTypeLimit, ExpireDate: "2026-12-31", First: okLimit},
+		"oco market":               {Symbol: "005930", Type: TypeOCO, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok, Second: &second},
 	}
 	for name, r := range cases {
 		if _, err := c.Place(ctx, r); err == nil {

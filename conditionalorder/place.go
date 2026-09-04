@@ -38,7 +38,7 @@ func validateKey(id string) error {
 type Condition struct {
 	OrderSide    Side            // 필수
 	TriggerPrice decimal.Decimal // 필수. 이 가격에 도달하면 발동
-	OrderPrice   decimal.Decimal // LIMIT 일 때 발동 주문 가격. 0 이면 미전송
+	OrderPrice   decimal.Decimal // 그룹 orderType 이 LIMIT 이면 필수, MARKET 이면 반드시 zero(설정하면 사전 검증에서 거부)
 }
 
 type conditionBody struct {
@@ -47,12 +47,24 @@ type conditionBody struct {
 	OrderPrice   string `json:"orderPrice,omitempty"`
 }
 
-func (c Condition) validate(field string) error {
+// validate 는 조건 1개의 형식을 검증한다. ot 는 그룹 공통 호가유형(orderType) — LIMIT 이면 OrderPrice 가
+// 필수이고, MARKET 이면 OrderPrice 를 보내면 안 된다(openapi ConditionRequest.orderPrice).
+func (c Condition) validate(field string, ot OrderType) error {
 	if c.OrderSide == "" {
 		return fmt.Errorf("toss: %s.orderSide is required", field)
 	}
 	if !c.TriggerPrice.IsPositive() {
 		return fmt.Errorf("toss: %s.triggerPrice must be positive (got %s)", field, c.TriggerPrice)
+	}
+	switch ot {
+	case OrderTypeLimit:
+		if !c.OrderPrice.IsPositive() {
+			return fmt.Errorf("toss: %s.orderPrice is required for LIMIT conditional orders", field)
+		}
+	case OrderTypeMarket:
+		if !c.OrderPrice.IsZero() {
+			return fmt.Errorf("toss: %s.orderPrice must not be set for MARKET conditional orders (got %s)", field, c.OrderPrice)
+		}
 	}
 	return nil
 }
@@ -112,10 +124,12 @@ type modifyBody struct {
 	ConfirmHighValueOrder bool           `json:"confirmHighValueOrder,omitempty"`
 }
 
-func validateCommon(symbol string, typ Type, qty decimal.Decimal, ot OrderType, expire tosstypes.Date, first Condition) error {
-	if err := params.Symbol(symbol); err != nil {
-		return err
-	}
+// validateCommon 은 Place/Modify 가 공유하는 그룹 필드 검증이다. symbol 은 Place 에서만 있으므로
+// 여기서 다루지 않는다(호출부가 별도로 params.Symbol 을 검증한다).
+//
+// type↔second 조합(openapi ConditionalOrderCreateRequest.second/orderType 설명): SINGLE 은 second 를
+// 보내면 안 되고, OCO/OTO 는 second 가 필수이며 지정가(LIMIT)만 지원한다.
+func validateCommon(typ Type, qty decimal.Decimal, ot OrderType, expire tosstypes.Date, first Condition, second *Condition) error {
 	if typ == "" {
 		return errors.New("toss: type is required")
 	}
@@ -128,7 +142,28 @@ func validateCommon(symbol string, typ Type, qty decimal.Decimal, ot OrderType, 
 	if expire.IsZero() {
 		return errors.New("toss: expireDate is required")
 	}
-	return first.validate("first")
+	switch typ {
+	case TypeSingle:
+		if second != nil {
+			return errors.New("toss: second must not be set for SINGLE conditional orders")
+		}
+	case TypeOCO, TypeOTO:
+		if second == nil {
+			return fmt.Errorf("toss: second is required for %s conditional orders", typ)
+		}
+		if ot != OrderTypeLimit {
+			return fmt.Errorf("toss: %s conditional orders support LIMIT only (got %s)", typ, ot)
+		}
+	}
+	if err := first.validate("first", ot); err != nil {
+		return err
+	}
+	if second != nil {
+		if err := second.validate("second", ot); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Place 는 조건주문을 생성한다(POST /api/v1/conditional-orders).
@@ -139,7 +174,10 @@ func (c *Client) Place(ctx context.Context, r PlaceRequest) (*PlaceResult, error
 	if err := params.AccountSeq(c.accountSeq); err != nil {
 		return nil, err
 	}
-	if err := validateCommon(r.Symbol, r.Type, r.Quantity, r.OrderType, r.ExpireDate, r.First); err != nil {
+	if err := params.Symbol(r.Symbol); err != nil {
+		return nil, err
+	}
+	if err := validateCommon(r.Type, r.Quantity, r.OrderType, r.ExpireDate, r.First, r.Second); err != nil {
 		return nil, err
 	}
 	if err := validateKey(r.ClientOrderID); err != nil {
@@ -151,9 +189,6 @@ func (c *Client) Place(ctx context.Context, r PlaceRequest) (*PlaceResult, error
 		ClientOrderID: r.ClientOrderID, ConfirmHighValueOrder: r.ConfirmHighValue,
 	}
 	if r.Second != nil {
-		if err := r.Second.validate("second"); err != nil {
-			return nil, err
-		}
 		sb := r.Second.body()
 		body.Second = &sb
 	}
@@ -171,19 +206,7 @@ func (c *Client) Modify(ctx context.Context, id string, r ModifyRequest) (*Resul
 	if err := params.Require("conditionalOrderId", id); err != nil {
 		return nil, err
 	}
-	if r.Type == "" {
-		return nil, errors.New("toss: type is required")
-	}
-	if !r.Quantity.IsPositive() {
-		return nil, fmt.Errorf("toss: quantity must be positive (got %s)", r.Quantity)
-	}
-	if r.OrderType == "" {
-		return nil, errors.New("toss: orderType is required")
-	}
-	if r.ExpireDate.IsZero() {
-		return nil, errors.New("toss: expireDate is required")
-	}
-	if err := r.First.validate("first"); err != nil {
+	if err := validateCommon(r.Type, r.Quantity, r.OrderType, r.ExpireDate, r.First, r.Second); err != nil {
 		return nil, err
 	}
 	body := modifyBody{
@@ -191,9 +214,6 @@ func (c *Client) Modify(ctx context.Context, id string, r ModifyRequest) (*Resul
 		ExpireDate: r.ExpireDate.String(), First: r.First.body(), ConfirmHighValueOrder: r.ConfirmHighValue,
 	}
 	if r.Second != nil {
-		if err := r.Second.validate("second"); err != nil {
-			return nil, err
-		}
 		sb := r.Second.body()
 		body.Second = &sb
 	}
