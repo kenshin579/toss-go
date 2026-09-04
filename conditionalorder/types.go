@@ -13,8 +13,8 @@ type Type string
 
 const (
 	TypeSingle Type = "SINGLE" // 조건 1개
-	TypeOCO    Type = "OCO"    // 둘 중 하나가 발동하면 나머지 취소(One-Cancels-Other)
-	TypeOTO    Type = "OTO"    // 첫 조건 발동 후 두 번째가 활성화(One-Triggers-Other)
+	TypeOCO    Type = "OCO"    // 둘 중 하나가 충족되면 나머지 자동 취소. 양쪽 모두 매도이며 first 감시가 > 현재가 > second 감시가, 지정가 전용
+	TypeOTO    Type = "OTO"    // first 가 체결되면 그때부터 second 감시 시작. first 는 매수·second 는 매도, 지정가 전용
 )
 
 // OrderType 은 조건 충족 시 낼 주문의 호가 유형.
@@ -61,7 +61,7 @@ type ConditionType string
 
 const (
 	ConditionStop       ConditionType = "STOP"        // 가격 트리거
-	ConditionProfitRate ConditionType = "PROFIT_RATE" // 목표 수익률(%) 트리거
+	ConditionProfitRate ConditionType = "PROFIT_RATE" // 목표 수익률(%) 트리거. 조회 전용 — 이 API 로는 생성할 수 없다
 )
 
 // ConditionStatus 는 개별 조건(leg)의 상태.
@@ -85,7 +85,7 @@ type ConditionDetail struct {
 	TriggerPrice     *decimal.Decimal `json:"triggerPrice"`     // STOP 조건에만
 	TargetProfitRate *decimal.Decimal `json:"targetProfitRate"` // PROFIT_RATE 조건에만. 퍼센트 단위(10.5 = +10.5%)
 	OrderPrice       *decimal.Decimal `json:"orderPrice"`       // 그룹 orderType 이 LIMIT 일 때 발동 주문 가격. MARKET 이면 nil
-	TriggeredOrderID *string          `json:"triggeredOrderId"` // 발동해서 생성된 주문 id. 미발동이면 nil
+	TriggeredOrderID *string          `json:"triggeredOrderId"` // 발동해서 생성된 주문 id. 미발동이면 nil. Account(seq).Order.Get(ctx, *id) 로 조회한다
 }
 
 // Detail 은 조건주문 1건. 목록·상세가 같은 스키마를 쓴다.

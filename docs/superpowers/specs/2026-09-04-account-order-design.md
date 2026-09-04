@@ -226,7 +226,9 @@ type ModifyRequest struct {
   조용히 버리지 않고 사전에 막는다), `Quantity`/`OrderAmount` 0 이하, 정정 `Quantity` 가 양의 정수가
   아님(`IsInteger` 위반), `ClientOrderID` 형식(36자·`^[A-Za-z0-9_-]+$`).
   조건주문은 LIMIT 이면 orderPrice 필수·MARKET 이면 금지, SINGLE 은 second 금지·OCO/OTO 는 second
-  필수이며 LIMIT 만 지원한다.
+  필수이며 LIMIT 만 지원한다. OCO 는 양쪽 매도 + first 감시가 > second 감시가, OTO 는 first 매수·
+  second 매도이며 둘 다 지정가 전용이다. 수정은 전체 재설정이라 유지할 조건을 모두 다시 보내야 하고
+  새 ID 가 발급된다.
   호가단위·잔고·거래시간 등 **상태 의존 규칙은 검증하지 않는다**(서버 권위).
 - `PlaceAmount` 는 `orderType=MARKET` 을 SDK 가 채운다(스키마상 유일값).
 

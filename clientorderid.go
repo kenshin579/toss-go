@@ -4,13 +4,12 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
-	"regexp"
+
+	"github.com/kenshin579/toss-go/internal/params"
 )
 
 // MaxClientOrderIDLen 은 clientOrderId 최대 길이(토스 규칙).
 const MaxClientOrderIDLen = 36
-
-var clientOrderIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 // NewClientOrderID 는 멱등성 키로 쓸 새 clientOrderId 를 만든다(32자, URL-safe).
 //
@@ -33,11 +32,5 @@ func ValidateClientOrderID(id string) error {
 	if id == "" {
 		return fmt.Errorf("toss: clientOrderId must not be empty")
 	}
-	if !clientOrderIDPattern.MatchString(id) {
-		return fmt.Errorf("toss: invalid clientOrderId %q (allowed: A-Z a-z 0-9 - _)", id)
-	}
-	if len(id) > MaxClientOrderIDLen {
-		return fmt.Errorf("toss: clientOrderId too long: %d chars (max %d)", len(id), MaxClientOrderIDLen)
-	}
-	return nil
+	return params.ClientOrderIDFormat(id)
 }

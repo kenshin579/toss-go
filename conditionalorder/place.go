@@ -14,24 +14,12 @@ import (
 	"github.com/kenshin579/toss-go/tosstypes"
 )
 
-// maxClientOrderIDLen 검증은 루트 toss 패키지와 중복을 피하려고(순환 임포트 방지) 여기서 최소 규칙만 확인한다.
-const maxClientOrderIDLen = 36
-
+// validateKey 는 internal/params.ClientOrderIDFormat 에 위임한다(빈 값만 여기서 "멱등성 미적용"으로 통과시킨다).
 func validateKey(id string) error {
 	if id == "" {
 		return nil // 멱등성 미적용
 	}
-	if len(id) > maxClientOrderIDLen {
-		return errors.New("toss: clientOrderId too long (max 36)")
-	}
-	for _, r := range id {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
-		default:
-			return errors.New("toss: invalid clientOrderId (allowed: A-Z a-z 0-9 - _)")
-		}
-	}
-	return nil
+	return params.ClientOrderIDFormat(id)
 }
 
 // Condition 은 생성·수정 요청의 조건 1개.
@@ -79,14 +67,18 @@ func (c Condition) body() conditionBody {
 
 // PlaceRequest 는 조건주문 생성 요청.
 type PlaceRequest struct {
-	Symbol           string          // 필수
-	Type             Type            // 필수. SINGLE/OCO/OTO
-	Quantity         decimal.Decimal // 필수
-	OrderType        OrderType       // 필수
-	ExpireDate       tosstypes.Date  // 필수. 이 날짜까지 감시
-	First            Condition       // 필수
-	Second           *Condition      // OCO/OTO 에서 사용
-	ClientOrderID    string          // 멱등성 키. 설정하면 401 토큰 오류에 1회 재시도한다
+	Symbol     string          // 필수
+	Type       Type            // 필수. SINGLE/OCO/OTO
+	Quantity   decimal.Decimal // 필수. 그룹 공통값 — OCO/OTO 는 동일 포지션이라 두 조건이 같은 수량을 쓴다
+	OrderType  OrderType       // 필수
+	ExpireDate tosstypes.Date  // 필수. 이 날짜까지 감시
+	First      Condition       // 필수
+	Second     *Condition      // OCO/OTO 에서 사용
+	// ClientOrderID 는 멱등성 키다. 같은 값으로 재요청하면 서버가 중복 생성을 막고(10분 유효), 설정하면
+	// SDK 가 401 토큰 오류에 1회 재시도한다. 키가 없으면 재시도하지 않는다. 같은 키로 내용이 다른 요청을
+	// 보내면 400 idempotency-key-conflict.
+	ClientOrderID string
+	// ConfirmHighValue 는 1억원 이상 주문 동의 여부. true 가 아니면 400 confirm-high-value-required.
 	ConfirmHighValue bool
 }
 
@@ -102,15 +94,23 @@ type placeBody struct {
 	ConfirmHighValueOrder bool           `json:"confirmHighValueOrder,omitempty"`
 }
 
-// ModifyRequest 는 조건주문 수정 요청. 생성과 같은 필드를 쓰되 clientOrderId 는 받지 않는다.
-// 수정은 기존 조건주문을 취소하고 새로 생성하는 방식으로 동작해 응답에 새 conditionalOrderId 가 온다.
+// ModifyRequest 는 조건주문 수정 요청.
+//
+// **수정은 부분 변경이 아니라 전체 재설정이다.** 서버는 기존 조건주문을 취소하고 새로 생성하므로,
+// 유지하려는 조건은 모두 다시 보내야 한다. 예를 들어 OCO 의 만료일만 바꾸려고 Type: TypeSingle 과
+// First 하나만 보내면 나머지 한쪽 조건(예: 손절 다리)이 사라진다.
+//
+// 수정 후에는 **새 conditionalOrderId 가 발급되고 기존 ID 는 무효화**된다.
+// 이후 조회·수정·취소에는 반환된 ConditionalOrderID 를 써야 한다.
+// 생성과 달리 ExpireDate 가 필수이며, 종목은 conditionalOrderId 로 식별되므로 Symbol 은 없다.
 type ModifyRequest struct {
-	Type             Type
-	Quantity         decimal.Decimal
-	OrderType        OrderType
-	ExpireDate       tosstypes.Date
-	First            Condition
-	Second           *Condition
+	Type       Type
+	Quantity   decimal.Decimal // 필수. 그룹 공통값 — OCO/OTO 는 동일 포지션이라 두 조건이 같은 수량을 쓴다
+	OrderType  OrderType
+	ExpireDate tosstypes.Date
+	First      Condition
+	Second     *Condition
+	// ConfirmHighValue 는 1억원 이상 주문 동의 여부. true 가 아니면 400 confirm-high-value-required.
 	ConfirmHighValue bool
 }
 
@@ -129,6 +129,7 @@ type modifyBody struct {
 //
 // type↔second 조합(openapi ConditionalOrderCreateRequest.second/orderType 설명): SINGLE 은 second 를
 // 보내면 안 되고, OCO/OTO 는 second 가 필수이며 지정가(LIMIT)만 지원한다.
+// OCO 는 양쪽 다 매도이며 first 감시가 > second 감시가 여야 하고, OTO 는 first 매수·second 매도다.
 func validateCommon(typ Type, qty decimal.Decimal, ot OrderType, expire tosstypes.Date, first Condition, second *Condition) error {
 	if typ == "" {
 		return errors.New("toss: type is required")
@@ -147,12 +148,31 @@ func validateCommon(typ Type, qty decimal.Decimal, ot OrderType, expire tosstype
 		if second != nil {
 			return errors.New("toss: second must not be set for SINGLE conditional orders")
 		}
-	case TypeOCO, TypeOTO:
+	case TypeOCO:
 		if second == nil {
-			return fmt.Errorf("toss: second is required for %s conditional orders", typ)
+			return errors.New("toss: second is required for OCO conditional orders")
 		}
 		if ot != OrderTypeLimit {
-			return fmt.Errorf("toss: %s conditional orders support LIMIT only (got %s)", typ, ot)
+			return fmt.Errorf("toss: OCO conditional orders support LIMIT only (got %s)", ot)
+		}
+		// openapi: "first/second 모두 매도(SELL)이며 first 감시가 > 현재가 > second 감시가 여야 합니다."
+		// 현재가 비교는 상태 의존이라 서버 몫이고, 방향·순서만 사전에 막는다.
+		if first.OrderSide != SideSell || second.OrderSide != SideSell {
+			return fmt.Errorf("toss: OCO requires both conditions to be SELL (got first=%s second=%s)", first.OrderSide, second.OrderSide)
+		}
+		if !first.TriggerPrice.GreaterThan(second.TriggerPrice) {
+			return fmt.Errorf("toss: OCO requires first.triggerPrice > second.triggerPrice (got %s, %s)", first.TriggerPrice, second.TriggerPrice)
+		}
+	case TypeOTO:
+		if second == nil {
+			return errors.New("toss: second is required for OTO conditional orders")
+		}
+		if ot != OrderTypeLimit {
+			return fmt.Errorf("toss: OTO conditional orders support LIMIT only (got %s)", ot)
+		}
+		// openapi: "first 는 매수(BUY), second 는 매도(SELL)입니다."
+		if first.OrderSide != SideBuy || second.OrderSide != SideSell {
+			return fmt.Errorf("toss: OTO requires first=BUY and second=SELL (got first=%s second=%s)", first.OrderSide, second.OrderSide)
 		}
 	}
 	if err := first.validate("first", ot); err != nil {
@@ -196,6 +216,7 @@ func (c *Client) Place(ctx context.Context, r PlaceRequest) (*PlaceResult, error
 }
 
 // Modify 는 조건주문을 수정한다(POST /api/v1/conditional-orders/{id}/modify).
+// 전체 재설정이며 성공 시 새 conditionalOrderId 를 돌려준다(기존 ID 무효).
 // 멱등성 키를 받지 않으므로 401 재시도를 하지 않는다.
 //
 // 대표 에러: invalid-request(호가단위 불일치 등), conditional-order-not-found.

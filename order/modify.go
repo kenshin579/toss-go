@@ -12,24 +12,12 @@ import (
 	"github.com/kenshin579/toss-go/internal/params"
 )
 
-// clientOrderIDPattern 검증은 루트 toss 패키지와 중복을 피하려고 여기서 최소 규칙만 확인한다.
-const maxClientOrderIDLen = 36
-
+// validateKey 는 internal/params.ClientOrderIDFormat 에 위임한다(빈 값만 여기서 "멱등성 미적용"으로 통과시킨다).
 func validateKey(id string) error {
 	if id == "" {
 		return nil // 멱등성 미적용
 	}
-	if len(id) > maxClientOrderIDLen {
-		return errors.New("toss: clientOrderId too long (max 36)")
-	}
-	for _, r := range id {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
-		default:
-			return errors.New("toss: invalid clientOrderId (allowed: A-Z a-z 0-9 - _)")
-		}
-	}
-	return nil
+	return params.ClientOrderIDFormat(id)
 }
 
 // ModifyRequest 는 주문 정정 요청.

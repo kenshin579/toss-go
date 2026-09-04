@@ -950,13 +950,12 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
-	"regexp"
+
+	"github.com/kenshin579/toss-go/internal/params"
 )
 
 // MaxClientOrderIDLen 은 clientOrderId 최대 길이(토스 규칙).
 const MaxClientOrderIDLen = 36
-
-var clientOrderIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 // NewClientOrderID 는 멱등성 키로 쓸 새 clientOrderId 를 만든다(32자, URL-safe).
 //
@@ -979,13 +978,7 @@ func ValidateClientOrderID(id string) error {
 	if id == "" {
 		return fmt.Errorf("toss: clientOrderId must not be empty")
 	}
-	if !clientOrderIDPattern.MatchString(id) {
-		return fmt.Errorf("toss: invalid clientOrderId %q (allowed: A-Z a-z 0-9 - _)", id)
-	}
-	if len(id) > MaxClientOrderIDLen {
-		return fmt.Errorf("toss: clientOrderId too long: %d chars (max %d)", len(id), MaxClientOrderIDLen)
-	}
-	return nil
+	return params.ClientOrderIDFormat(id)
 }
 EOF
 cat > accounts.go << 'EOF'
@@ -2065,24 +2058,12 @@ import (
 	"github.com/kenshin579/toss-go/internal/params"
 )
 
-// clientOrderIDPattern 검증은 루트 toss 패키지와 중복을 피하려고 여기서 최소 규칙만 확인한다.
-const maxClientOrderIDLen = 36
-
+// validateKey 는 internal/params.ClientOrderIDFormat 에 위임한다(빈 값만 여기서 "멱등성 미적용"으로 통과시킨다).
 func validateKey(id string) error {
 	if id == "" {
 		return nil // 멱등성 미적용
 	}
-	if len(id) > maxClientOrderIDLen {
-		return errors.New("toss: clientOrderId too long (max 36)")
-	}
-	for _, r := range id {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
-		default:
-			return errors.New("toss: invalid clientOrderId (allowed: A-Z a-z 0-9 - _)")
-		}
-	}
-	return nil
+	return params.ClientOrderIDFormat(id)
 }
 
 // ModifyRequest 는 주문 정정 요청.
@@ -2324,6 +2305,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -2336,7 +2318,9 @@ func d(s string) decimal.Decimal { return decimal.RequireFromString(s) }
 
 // detailJSON 은 ConditionalOrderDetailResponse 스키마를 그대로 옮긴 응답 예시다(openapi 에 2xx 예시가 없다).
 // 그룹(OCO/OTO)의 first/second 는 항상 같은 ConditionType 이므로 둘 다 STOP 이다.
-const detailJSON = `{"result":{"conditionalOrderId":"c-1","type":"OCO","status":"WATCHING","symbol":"005930","market":"KR","quantity":"10","orderType":"LIMIT","expireDate":"2026-12-31","first":{"type":"STOP","status":"WATCHING","triggerPrice":"65000","targetProfitRate":null,"orderPrice":"64900","triggeredOrderId":null},"second":{"type":"STOP","status":"HOLDING","triggerPrice":"63000","targetProfitRate":null,"orderPrice":"62900","triggeredOrderId":"o-77"},"createdAt":"2026-09-01T10:00:00+09:00"}}`
+// second.status=HOLDING 은 "선행 조건(OTO first) 체결 전 대기(leg 전용)" 이므로 OTO 여야 한다(OCO 에는
+// 나올 수 없는 조합) — type 을 OTO 로, 아직 발동 전이므로 second.triggeredOrderId 는 null 이다.
+const detailJSON = `{"result":{"conditionalOrderId":"c-1","type":"OTO","status":"WATCHING","symbol":"005930","market":"KR","quantity":"10","orderType":"LIMIT","expireDate":"2026-12-31","first":{"type":"STOP","status":"WATCHING","triggerPrice":"65000","targetProfitRate":null,"orderPrice":"64900","triggeredOrderId":null},"second":{"type":"STOP","status":"HOLDING","triggerPrice":"63000","targetProfitRate":null,"orderPrice":"62900","triggeredOrderId":null},"createdAt":"2026-09-01T10:00:00+09:00"}}`
 
 // detailProfitRateJSON 은 PROFIT_RATE 조건(퍼센트 단위 targetProfitRate, triggerPrice 는 null) 응답 예시다.
 const detailProfitRateJSON = `{"result":{"conditionalOrderId":"c-2","type":"SINGLE","status":"WATCHING","symbol":"005930","market":"KR","quantity":"10","orderType":"MARKET","expireDate":"2026-12-31","first":{"type":"PROFIT_RATE","status":"WATCHING","triggerPrice":null,"targetProfitRate":"10.5","orderPrice":null,"triggeredOrderId":null},"second":null,"createdAt":"2026-09-01T10:00:00+09:00"}}`
@@ -2350,7 +2334,7 @@ func TestGet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ConditionalOrderID != "c-1" || got.Type != TypeOCO || got.Status != StatusWatching || got.Market != "KR" {
+	if got.ConditionalOrderID != "c-1" || got.Type != TypeOTO || got.Status != StatusWatching || got.Market != "KR" {
 		t.Errorf("detail = %+v", got)
 	}
 	if got.Quantity.String() != "10" || got.OrderType != OrderTypeLimit || got.ExpireDate == nil || *got.ExpireDate != "2026-12-31" || got.CreatedAt.IsZero() {
@@ -2362,11 +2346,12 @@ func TestGet(t *testing.T) {
 	if got.First.OrderPrice == nil || got.First.OrderPrice.String() != "64900" || got.First.TargetProfitRate != nil || got.First.TriggeredOrderID != nil {
 		t.Errorf("first optional = %+v", got.First)
 	}
-	if got.Second == nil || got.Second.Type != ConditionStop || got.Second.TriggerPrice == nil || got.Second.TriggerPrice.String() != "63000" || got.Second.TargetProfitRate != nil {
+	if got.Second == nil || got.Second.Type != ConditionStop || got.Second.Status != ConditionHolding || got.Second.TriggerPrice == nil || got.Second.TriggerPrice.String() != "63000" || got.Second.TargetProfitRate != nil {
 		t.Errorf("second = %+v", got.Second)
 	}
-	if got.Second.TriggeredOrderID == nil || *got.Second.TriggeredOrderID != "o-77" {
-		t.Errorf("triggeredOrderId = %v", got.Second.TriggeredOrderID)
+	if got.Second.TriggeredOrderID != nil {
+		// HOLDING(OTO 의 second, first 체결 전 대기)은 아직 발동 전이라 triggeredOrderId 가 없다.
+		t.Errorf("triggeredOrderId = %v, want nil (not yet triggered)", *got.Second.TriggeredOrderID)
 	}
 }
 
@@ -2519,19 +2504,25 @@ func TestPlace_Validation(t *testing.T) {
 	ok := Condition{OrderSide: SideSell, TriggerPrice: d("1")}                          // MARKET 과 짝
 	okLimit := Condition{OrderSide: SideSell, TriggerPrice: d("1"), OrderPrice: d("1")} // LIMIT 과 짝
 	second := Condition{OrderSide: SideSell, TriggerPrice: d("1")}
+	sell1 := Condition{OrderSide: SideSell, TriggerPrice: d("1"), OrderPrice: d("1")}
+	sell2 := Condition{OrderSide: SideSell, TriggerPrice: d("2"), OrderPrice: d("2")}
+	buy2 := Condition{OrderSide: SideBuy, TriggerPrice: d("2"), OrderPrice: d("2")}
 	cases := map[string]PlaceRequest{
-		"empty symbol":             {Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
-		"empty type":               {Symbol: "005930", Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
-		"zero quantity":            {Symbol: "005930", Type: TypeSingle, OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
-		"empty orderType":          {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), ExpireDate: "2026-12-31", First: ok},
-		"empty expire":             {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, First: ok},
-		"no first side":            {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: Condition{TriggerPrice: d("1")}},
-		"no trigger":               {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: Condition{OrderSide: SideSell}},
-		"market with orderPrice":   {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: Condition{OrderSide: SideSell, TriggerPrice: d("1"), OrderPrice: d("1")}},
-		"limit without orderPrice": {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeLimit, ExpireDate: "2026-12-31", First: ok},
-		"single with second":       {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok, Second: &second},
-		"oco without second":       {Symbol: "005930", Type: TypeOCO, Quantity: d("1"), OrderType: OrderTypeLimit, ExpireDate: "2026-12-31", First: okLimit},
-		"oco market":               {Symbol: "005930", Type: TypeOCO, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok, Second: &second},
+		"empty symbol":                 {Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
+		"empty type":                   {Symbol: "005930", Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
+		"zero quantity":                {Symbol: "005930", Type: TypeSingle, OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
+		"empty orderType":              {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), ExpireDate: "2026-12-31", First: ok},
+		"empty expire":                 {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, First: ok},
+		"no first side":                {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: Condition{TriggerPrice: d("1")}},
+		"no trigger":                   {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: Condition{OrderSide: SideSell}},
+		"market with orderPrice":       {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: Condition{OrderSide: SideSell, TriggerPrice: d("1"), OrderPrice: d("1")}},
+		"limit without orderPrice":     {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeLimit, ExpireDate: "2026-12-31", First: ok},
+		"single with second":           {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok, Second: &second},
+		"oco without second":           {Symbol: "005930", Type: TypeOCO, Quantity: d("1"), OrderType: OrderTypeLimit, ExpireDate: "2026-12-31", First: okLimit},
+		"oco market":                   {Symbol: "005930", Type: TypeOCO, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok, Second: &second},
+		"oco first buy (must be sell)": {Symbol: "005930", Type: TypeOCO, Quantity: d("1"), OrderType: OrderTypeLimit, ExpireDate: "2026-12-31", First: buy2, Second: &sell1},
+		"oco price order (first must exceed second)": {Symbol: "005930", Type: TypeOCO, Quantity: d("1"), OrderType: OrderTypeLimit, ExpireDate: "2026-12-31", First: sell1, Second: &sell2},
+		"oto first sell (must be buy)":               {Symbol: "005930", Type: TypeOTO, Quantity: d("1"), OrderType: OrderTypeLimit, ExpireDate: "2026-12-31", First: sell1, Second: &sell2},
 	}
 	for name, r := range cases {
 		if _, err := c.Place(ctx, r); err == nil {
@@ -2541,7 +2532,9 @@ func TestPlace_Validation(t *testing.T) {
 }
 
 func TestModify(t *testing.T) {
-	c, body, done := captureBody(t, "/api/v1/conditional-orders/c-1/modify", http.MethodPost, "4", 200, []byte(`{"result":{"conditionalOrderId":"c-1"}}`))
+	// 응답의 conditionalOrderId 는 요청 id 와 다르다 — 수정은 취소 후 재생성이라 새 ID 가 발급되고
+	// 기존 "c-1" 은 무효화된다(ModifyRequest 문서화한 불변식을 실행 가능하게 고정).
+	c, body, done := captureBody(t, "/api/v1/conditional-orders/c-1/modify", http.MethodPost, "4", 200, []byte(`{"result":{"conditionalOrderId":"c-1b"}}`))
 	defer done()
 	res, err := c.Modify(context.Background(), "c-1", ModifyRequest{
 		Type: TypeSingle, Quantity: d("7"), OrderType: OrderTypeLimit, ExpireDate: "2026-11-30",
@@ -2551,8 +2544,79 @@ func TestModify(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertJSON(t, *body, `{"type":"SINGLE","quantity":"7","orderType":"LIMIT","expireDate":"2026-11-30","first":{"orderSide":"SELL","triggerPrice":"66000","orderPrice":"65900"}}`)
-	if res.ConditionalOrderID != "c-1" {
-		t.Errorf("res = %+v", res)
+	if res.ConditionalOrderID != "c-1b" || res.ConditionalOrderID == "c-1" {
+		t.Errorf("res.ConditionalOrderID = %q, want new id %q (not the modified-from id)", res.ConditionalOrderID, "c-1b")
+	}
+}
+
+func TestPlace_WithKeyRetriesAndResendsSameKey(t *testing.T) {
+	// 키가 있으면 1회 재시도하되, 두 요청의 clientOrderId 가 같아야 서버가 중복을 제거할 수 있다
+	var n int32
+	var keys []string
+	var mu sync.Mutex
+	hc, done := testutil.NewServerFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var body struct {
+			ClientOrderID string `json:"clientOrderId"`
+		}
+		_ = json.Unmarshal(b, &body)
+		mu.Lock()
+		keys = append(keys, body.ClientOrderID)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if atomic.AddInt32(&n, 1) == 1 {
+			w.WriteHeader(401)
+			_, _ = w.Write([]byte(`{"error":{"requestId":"r","code":"expired-token","message":""}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"result":{"conditionalOrderId":"c-9","clientOrderId":"k9"}}`))
+	})
+	defer done()
+	if _, err := New(hc, 4).Place(context.Background(), PlaceRequest{
+		Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31",
+		First: Condition{OrderSide: SideSell, TriggerPrice: d("1")}, ClientOrderID: "k9",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keys) != 2 || keys[0] != "k9" || keys[1] != "k9" {
+		t.Errorf("clientOrderId per attempt = %q, want [k9 k9]", keys)
+	}
+}
+
+func TestModify_Validation(t *testing.T) {
+	// Modify 도 Place 와 같은 validateCommon 을 타는지 고정한다(id 자체는 유효해 통과시키고, body 규칙만 어긴다).
+	c := New(nil, 4) // nil client: 검증이 요청 전에 실패해야 한다
+	ctx := context.Background()
+	sell1 := Condition{OrderSide: SideSell, TriggerPrice: d("1"), OrderPrice: d("1")}
+	sell2 := Condition{OrderSide: SideSell, TriggerPrice: d("2"), OrderPrice: d("2")}
+	buy2 := Condition{OrderSide: SideBuy, TriggerPrice: d("2"), OrderPrice: d("2")}
+	cases := map[string]ModifyRequest{
+		"single with second": {
+			Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31",
+			First: Condition{OrderSide: SideSell, TriggerPrice: d("1")}, Second: &sell1,
+		},
+		"oco without second": {
+			Type: TypeOCO, Quantity: d("1"), OrderType: OrderTypeLimit, ExpireDate: "2026-12-31", First: sell2,
+		},
+		"market with orderPrice": {
+			Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: sell1,
+		},
+		"oco first buy": {
+			Type: TypeOCO, Quantity: d("1"), OrderType: OrderTypeLimit, ExpireDate: "2026-12-31", First: buy2, Second: &sell1,
+		},
+		"oco price order (first must exceed second)": {
+			Type: TypeOCO, Quantity: d("1"), OrderType: OrderTypeLimit, ExpireDate: "2026-12-31", First: sell1, Second: &sell2,
+		},
+		"oto first sell (must be buy)": {
+			Type: TypeOTO, Quantity: d("1"), OrderType: OrderTypeLimit, ExpireDate: "2026-12-31", First: sell1, Second: &sell2,
+		},
+	}
+	for name, r := range cases {
+		if _, err := c.Modify(ctx, "c-1", r); err == nil {
+			t.Errorf("%s: want error", name)
+		}
 	}
 }
 
@@ -2620,8 +2684,15 @@ cat > conditionalorder/client.go << 'EOF'
 // Package conditionalorder 는 토스 Open API 조건주문 그룹 — 생성·수정·취소·목록·상세.
 // toss.Client.Account(seq).ConditionalOrder 로 접근하며, 모든 요청에 계좌 헤더가 실린다.
 //
-// 조건주문은 트리거 조건(가격 도달·목표 수익률)이 충족되면 실제 주문을 낸다.
+// 조건주문은 트리거 조건(가격 도달)이 충족되면 실제 주문을 낸다. 이 API 로 만들 수 있는 조건은
+// 가격 도달(STOP)뿐이다. 목표 수익률(PROFIT_RATE) 조건은 토스 앱 등에서 만든 것을 조회만 할 수 있다.
 // SDK 는 요청 조립 오류만 사전 검증하고, 호가단위·잔고 등은 서버가 판단한다.
+//
+// 발동 세션: 국내는 KRX 정규장에서만, 해외는 거래 가능한 모든 시간대에 발동된다.
+//
+// 멱등성: PlaceRequest.ClientOrderID 를 채우면 같은 값으로 재요청할 때 서버가 중복 생성을 막고
+// (10분 유효), SDK 가 401 토큰 오류에 1회 재시도한다. 키가 없으면 재시도하지 않는다. 같은 키로 다른
+// 내용을 보내면 400 idempotency-key-conflict.
 package conditionalorder
 
 import "github.com/kenshin579/toss-go/internal/httpclient"
@@ -2653,8 +2724,8 @@ type Type string
 
 const (
 	TypeSingle Type = "SINGLE" // 조건 1개
-	TypeOCO    Type = "OCO"    // 둘 중 하나가 발동하면 나머지 취소(One-Cancels-Other)
-	TypeOTO    Type = "OTO"    // 첫 조건 발동 후 두 번째가 활성화(One-Triggers-Other)
+	TypeOCO    Type = "OCO"    // 둘 중 하나가 충족되면 나머지 자동 취소. 양쪽 모두 매도이며 first 감시가 > 현재가 > second 감시가, 지정가 전용
+	TypeOTO    Type = "OTO"    // first 가 체결되면 그때부터 second 감시 시작. first 는 매수·second 는 매도, 지정가 전용
 )
 
 // OrderType 은 조건 충족 시 낼 주문의 호가 유형.
@@ -2701,7 +2772,7 @@ type ConditionType string
 
 const (
 	ConditionStop       ConditionType = "STOP"        // 가격 트리거
-	ConditionProfitRate ConditionType = "PROFIT_RATE" // 목표 수익률(%) 트리거
+	ConditionProfitRate ConditionType = "PROFIT_RATE" // 목표 수익률(%) 트리거. 조회 전용 — 이 API 로는 생성할 수 없다
 )
 
 // ConditionStatus 는 개별 조건(leg)의 상태.
@@ -2725,7 +2796,7 @@ type ConditionDetail struct {
 	TriggerPrice     *decimal.Decimal `json:"triggerPrice"`     // STOP 조건에만
 	TargetProfitRate *decimal.Decimal `json:"targetProfitRate"` // PROFIT_RATE 조건에만. 퍼센트 단위(10.5 = +10.5%)
 	OrderPrice       *decimal.Decimal `json:"orderPrice"`       // 그룹 orderType 이 LIMIT 일 때 발동 주문 가격. MARKET 이면 nil
-	TriggeredOrderID *string          `json:"triggeredOrderId"` // 발동해서 생성된 주문 id. 미발동이면 nil
+	TriggeredOrderID *string          `json:"triggeredOrderId"` // 발동해서 생성된 주문 id. 미발동이면 nil. Account(seq).Order.Get(ctx, *id) 로 조회한다
 }
 
 // Detail 은 조건주문 1건. 목록·상세가 같은 스키마를 쓴다.
@@ -2778,24 +2849,12 @@ import (
 	"github.com/kenshin579/toss-go/tosstypes"
 )
 
-// maxClientOrderIDLen 검증은 루트 toss 패키지와 중복을 피하려고(순환 임포트 방지) 여기서 최소 규칙만 확인한다.
-const maxClientOrderIDLen = 36
-
+// validateKey 는 internal/params.ClientOrderIDFormat 에 위임한다(빈 값만 여기서 "멱등성 미적용"으로 통과시킨다).
 func validateKey(id string) error {
 	if id == "" {
 		return nil // 멱등성 미적용
 	}
-	if len(id) > maxClientOrderIDLen {
-		return errors.New("toss: clientOrderId too long (max 36)")
-	}
-	for _, r := range id {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
-		default:
-			return errors.New("toss: invalid clientOrderId (allowed: A-Z a-z 0-9 - _)")
-		}
-	}
-	return nil
+	return params.ClientOrderIDFormat(id)
 }
 
 // Condition 은 생성·수정 요청의 조건 1개.
@@ -2843,14 +2902,18 @@ func (c Condition) body() conditionBody {
 
 // PlaceRequest 는 조건주문 생성 요청.
 type PlaceRequest struct {
-	Symbol           string          // 필수
-	Type             Type            // 필수. SINGLE/OCO/OTO
-	Quantity         decimal.Decimal // 필수
-	OrderType        OrderType       // 필수
-	ExpireDate       tosstypes.Date  // 필수. 이 날짜까지 감시
-	First            Condition       // 필수
-	Second           *Condition      // OCO/OTO 에서 사용
-	ClientOrderID    string          // 멱등성 키. 설정하면 401 토큰 오류에 1회 재시도한다
+	Symbol     string          // 필수
+	Type       Type            // 필수. SINGLE/OCO/OTO
+	Quantity   decimal.Decimal // 필수. 그룹 공통값 — OCO/OTO 는 동일 포지션이라 두 조건이 같은 수량을 쓴다
+	OrderType  OrderType       // 필수
+	ExpireDate tosstypes.Date  // 필수. 이 날짜까지 감시
+	First      Condition       // 필수
+	Second     *Condition      // OCO/OTO 에서 사용
+	// ClientOrderID 는 멱등성 키다. 같은 값으로 재요청하면 서버가 중복 생성을 막고(10분 유효), 설정하면
+	// SDK 가 401 토큰 오류에 1회 재시도한다. 키가 없으면 재시도하지 않는다. 같은 키로 내용이 다른 요청을
+	// 보내면 400 idempotency-key-conflict.
+	ClientOrderID string
+	// ConfirmHighValue 는 1억원 이상 주문 동의 여부. true 가 아니면 400 confirm-high-value-required.
 	ConfirmHighValue bool
 }
 
@@ -2866,15 +2929,23 @@ type placeBody struct {
 	ConfirmHighValueOrder bool           `json:"confirmHighValueOrder,omitempty"`
 }
 
-// ModifyRequest 는 조건주문 수정 요청. 생성과 같은 필드를 쓰되 clientOrderId 는 받지 않는다.
-// 수정은 기존 조건주문을 취소하고 새로 생성하는 방식으로 동작해 응답에 새 conditionalOrderId 가 온다.
+// ModifyRequest 는 조건주문 수정 요청.
+//
+// **수정은 부분 변경이 아니라 전체 재설정이다.** 서버는 기존 조건주문을 취소하고 새로 생성하므로,
+// 유지하려는 조건은 모두 다시 보내야 한다. 예를 들어 OCO 의 만료일만 바꾸려고 Type: TypeSingle 과
+// First 하나만 보내면 나머지 한쪽 조건(예: 손절 다리)이 사라진다.
+//
+// 수정 후에는 **새 conditionalOrderId 가 발급되고 기존 ID 는 무효화**된다.
+// 이후 조회·수정·취소에는 반환된 ConditionalOrderID 를 써야 한다.
+// 생성과 달리 ExpireDate 가 필수이며, 종목은 conditionalOrderId 로 식별되므로 Symbol 은 없다.
 type ModifyRequest struct {
-	Type             Type
-	Quantity         decimal.Decimal
-	OrderType        OrderType
-	ExpireDate       tosstypes.Date
-	First            Condition
-	Second           *Condition
+	Type       Type
+	Quantity   decimal.Decimal // 필수. 그룹 공통값 — OCO/OTO 는 동일 포지션이라 두 조건이 같은 수량을 쓴다
+	OrderType  OrderType
+	ExpireDate tosstypes.Date
+	First      Condition
+	Second     *Condition
+	// ConfirmHighValue 는 1억원 이상 주문 동의 여부. true 가 아니면 400 confirm-high-value-required.
 	ConfirmHighValue bool
 }
 
@@ -2893,6 +2964,7 @@ type modifyBody struct {
 //
 // type↔second 조합(openapi ConditionalOrderCreateRequest.second/orderType 설명): SINGLE 은 second 를
 // 보내면 안 되고, OCO/OTO 는 second 가 필수이며 지정가(LIMIT)만 지원한다.
+// OCO 는 양쪽 다 매도이며 first 감시가 > second 감시가 여야 하고, OTO 는 first 매수·second 매도다.
 func validateCommon(typ Type, qty decimal.Decimal, ot OrderType, expire tosstypes.Date, first Condition, second *Condition) error {
 	if typ == "" {
 		return errors.New("toss: type is required")
@@ -2911,12 +2983,31 @@ func validateCommon(typ Type, qty decimal.Decimal, ot OrderType, expire tosstype
 		if second != nil {
 			return errors.New("toss: second must not be set for SINGLE conditional orders")
 		}
-	case TypeOCO, TypeOTO:
+	case TypeOCO:
 		if second == nil {
-			return fmt.Errorf("toss: second is required for %s conditional orders", typ)
+			return errors.New("toss: second is required for OCO conditional orders")
 		}
 		if ot != OrderTypeLimit {
-			return fmt.Errorf("toss: %s conditional orders support LIMIT only (got %s)", typ, ot)
+			return fmt.Errorf("toss: OCO conditional orders support LIMIT only (got %s)", ot)
+		}
+		// openapi: "first/second 모두 매도(SELL)이며 first 감시가 > 현재가 > second 감시가 여야 합니다."
+		// 현재가 비교는 상태 의존이라 서버 몫이고, 방향·순서만 사전에 막는다.
+		if first.OrderSide != SideSell || second.OrderSide != SideSell {
+			return fmt.Errorf("toss: OCO requires both conditions to be SELL (got first=%s second=%s)", first.OrderSide, second.OrderSide)
+		}
+		if !first.TriggerPrice.GreaterThan(second.TriggerPrice) {
+			return fmt.Errorf("toss: OCO requires first.triggerPrice > second.triggerPrice (got %s, %s)", first.TriggerPrice, second.TriggerPrice)
+		}
+	case TypeOTO:
+		if second == nil {
+			return errors.New("toss: second is required for OTO conditional orders")
+		}
+		if ot != OrderTypeLimit {
+			return fmt.Errorf("toss: OTO conditional orders support LIMIT only (got %s)", ot)
+		}
+		// openapi: "first 는 매수(BUY), second 는 매도(SELL)입니다."
+		if first.OrderSide != SideBuy || second.OrderSide != SideSell {
+			return fmt.Errorf("toss: OTO requires first=BUY and second=SELL (got first=%s second=%s)", first.OrderSide, second.OrderSide)
 		}
 	}
 	if err := first.validate("first", ot); err != nil {
@@ -2960,6 +3051,7 @@ func (c *Client) Place(ctx context.Context, r PlaceRequest) (*PlaceResult, error
 }
 
 // Modify 는 조건주문을 수정한다(POST /api/v1/conditional-orders/{id}/modify).
+// 전체 재설정이며 성공 시 새 conditionalOrderId 를 돌려준다(기존 ID 무효).
 // 멱등성 키를 받지 않으므로 401 재시도를 하지 않는다.
 //
 // 대표 에러: invalid-request(호가단위 불일치 등), conditional-order-not-found.
@@ -3061,7 +3153,7 @@ EOF
 ```bash
 gofmt -w . && go vet ./... && go test ./conditionalorder/ . -race -v 2>&1 | grep -cE '^--- PASS'
 ```
-Expected: conditionalorder 13(`TestZeroAccountSeq`·`TestWrites_WithoutKeyAreNeverRetried`·`TestGet_ProfitRateCondition` 포함) + 루트 13 = `26` (실행 결과로 확인, 모두 PASS 인지만 본다).
+Expected: conditionalorder 15(`TestZeroAccountSeq`·`TestWrites_WithoutKeyAreNeverRetried`·`TestGet_ProfitRateCondition`·`TestModify_Validation`·`TestPlace_WithKeyRetriesAndResendsSameKey` 포함) + 루트 13 = `28` (실행 결과로 확인, 모두 PASS 인지만 본다).
 
 - [ ] **Step 3: 커밋**
 
