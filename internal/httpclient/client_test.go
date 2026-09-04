@@ -341,7 +341,7 @@ func TestDo_NoAccountHeaderWhenZero(t *testing.T) {
 	})
 	defer done()
 	var out []struct{}
-	if err := c.Do(context.Background(), Request{Method: http.MethodGet, Path: "/api/v1/accounts", Out: &out, Idempotent: true}); err != nil {
+	if err := c.Do(context.Background(), Request{Method: http.MethodGet, Path: "/api/v1/accounts", Out: &out}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -367,8 +367,8 @@ func TestDo_NoContentWithOutIsError(t *testing.T) {
 	defer done()
 	var out struct{ A int }
 	err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/x", Out: &out})
-	if err == nil || !strings.Contains(err.Error(), "no result") {
-		t.Errorf("want no-result error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "empty response body") {
+		t.Errorf("want empty-body error, got %v", err)
 	}
 }
 
@@ -405,7 +405,7 @@ func TestDo_IdempotentWriteRetriesOnce(t *testing.T) {
 	var out struct {
 		OrderID string `json:"orderId"`
 	}
-	if err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/api/v1/orders", Body: map[string]string{"a": "b"}, Idempotent: true, Out: &out}); err != nil {
+	if err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/api/v1/orders", Body: map[string]string{"a": "b"}, IdempotencyKey: "k1", Out: &out}); err != nil {
 		t.Fatal(err)
 	}
 	if out.OrderID != "o-2" || atomic.LoadInt32(&n) != 2 {
@@ -433,7 +433,7 @@ func TestDo_BodyIsResentOnRetry(t *testing.T) {
 	var out struct {
 		OK bool `json:"ok"`
 	}
-	if err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/x", Body: map[string]string{"k": "v"}, Idempotent: true, Out: &out}); err != nil {
+	if err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/x", Body: map[string]string{"k": "v"}, IdempotencyKey: "k1", Out: &out}); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()
@@ -459,5 +459,126 @@ func TestGet_StillIdempotent(t *testing.T) {
 	}
 	if err := c.Get(context.Background(), "/x", nil, &out); err != nil || !out.OK {
 		t.Fatalf("GET must still retry: %+v %v", out, err)
+	}
+}
+
+func TestDo_DefaultsToGetAndRetries(t *testing.T) {
+	// Method 를 비우면 GET 이고, GET 은 IdempotencyKey 없이도 재시도한다
+	var n int32
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", r.Method)
+		}
+		if atomic.AddInt32(&n, 1) == 1 {
+			w.WriteHeader(401)
+			_, _ = w.Write([]byte(`{"error":{"requestId":"r","code":"expired-token","message":""}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"result":{"ok":true}}`))
+	}, "tok1", "tok2")
+	defer done()
+	var out struct {
+		OK bool `json:"ok"`
+	}
+	if err := c.Do(context.Background(), Request{Path: "/x", Out: &out}); err != nil {
+		t.Fatal(err)
+	}
+	if !out.OK || atomic.LoadInt32(&n) != 2 {
+		t.Errorf("ok=%v calls=%d", out.OK, atomic.LoadInt32(&n))
+	}
+}
+
+func TestDo_HeadersSurviveRetry(t *testing.T) {
+	// 재시도된 주문에도 계좌 헤더와 Content-Type 이 실려야 한다
+	var accts, cts []string
+	var mu sync.Mutex
+	var n int32
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		accts = append(accts, r.Header.Get("X-Tossinvest-Account"))
+		cts = append(cts, r.Header.Get("Content-Type"))
+		mu.Unlock()
+		if atomic.AddInt32(&n, 1) == 1 {
+			w.WriteHeader(401)
+			_, _ = w.Write([]byte(`{"error":{"requestId":"r","code":"expired-token","message":""}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"result":{"ok":true}}`))
+	}, "tok1", "tok2")
+	defer done()
+	var out struct {
+		OK bool `json:"ok"`
+	}
+	if err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/x", Body: map[string]string{"k": "v"}, AccountSeq: 42, IdempotencyKey: "k1", Out: &out}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(accts) != 2 || accts[0] != "42" || accts[1] != "42" {
+		t.Errorf("account headers = %q", accts)
+	}
+	if cts[0] != "application/json" || cts[1] != "application/json" {
+		t.Errorf("content-types = %q", cts)
+	}
+}
+
+func TestDo_IdempotentWriteDoesNotRetryTwice(t *testing.T) {
+	var n int32
+	c, st, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&n, 1)
+		w.WriteHeader(401)
+		_, _ = w.Write([]byte(`{"error":{"requestId":"r","code":"expired-token","message":""}}`))
+	})
+	defer done()
+	err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/x", Body: map[string]string{"a": "b"}, IdempotencyKey: "k1"})
+	var ae *APIError
+	if !errors.As(err, &ae) || ae.Code != "expired-token" {
+		t.Fatalf("want expired-token, got %v", err)
+	}
+	if atomic.LoadInt32(&n) != 2 || atomic.LoadInt32(&st.invalidated) != 2 {
+		t.Errorf("calls=%d invalidated=%d, want 2/2", atomic.LoadInt32(&n), atomic.LoadInt32(&st.invalidated))
+	}
+}
+
+func TestDo_WriteNonTokenUnauthorizedNoRetry(t *testing.T) {
+	var n int32
+	c, st, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&n, 1)
+		w.WriteHeader(401)
+		_, _ = w.Write([]byte(`{"error":{"requestId":"r","code":"login-user-not-found","message":""}}`))
+	})
+	defer done()
+	_ = c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/x", Body: map[string]string{"a": "b"}, IdempotencyKey: "k1"})
+	if atomic.LoadInt32(&n) != 1 || atomic.LoadInt32(&st.invalidated) != 0 {
+		t.Errorf("calls=%d invalidated=%d, want 1/0", atomic.LoadInt32(&n), atomic.LoadInt32(&st.invalidated))
+	}
+}
+
+func TestDo_MarshalErrorNeverHitsServer(t *testing.T) {
+	var n int32
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&n, 1)
+		_, _ = w.Write([]byte(`{"result":{}}`))
+	})
+	defer done()
+	err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/x", Body: make(chan int)})
+	if err == nil || !strings.Contains(err.Error(), "encode body") {
+		t.Fatalf("want encode error, got %v", err)
+	}
+	if atomic.LoadInt32(&n) != 0 {
+		t.Errorf("server was hit %d times; must be 0", atomic.LoadInt32(&n))
+	}
+}
+
+func TestDo_NoContentTypeWithoutBody(t *testing.T) {
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if ct := r.Header.Get("Content-Type"); ct != "" {
+			t.Errorf("Content-Type = %q, want empty", ct)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	defer done()
+	if err := c.Do(context.Background(), Request{Method: http.MethodDelete, Path: "/x", AccountSeq: 1}); err != nil {
+		t.Fatal(err)
 	}
 }

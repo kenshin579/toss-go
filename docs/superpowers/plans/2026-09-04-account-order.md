@@ -22,7 +22,7 @@
 
 | 경로 | 책임 |
 |---|---|
-| `internal/httpclient/client.go` | (수정) `Request`/`Do` — 메서드·바디·계좌 헤더·204·`Idempotent` 재시도 정책 |
+| `internal/httpclient/client.go` | (수정) `Request`/`Do` — 메서드·바디·계좌 헤더·204·`IdempotencyKey` 재시도 정책 |
 | `internal/fetch/fetch.go` | (수정) `One`/`List` 에 accountSeq 추가, `PostOne`/`Send` 신규 |
 | `tosstypes/types.go` | (수정) `AccountType` 4종 추가 |
 | `accounts.go` | (신규) 루트 `Account` 타입 + `Client.Accounts` |
@@ -50,7 +50,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 - Modify: `internal/httpclient/client.go`
 - Modify: `internal/httpclient/client_test.go`
 
-- [ ] **Step 1: 실패 테스트 추가** — 기존 테스트는 그대로 두고 아래를 파일 끝에 덧붙인다.
+- [x] **Step 1: 실패 테스트 추가** — 기존 테스트는 그대로 두고 아래를 파일 끝에 덧붙인다.
 
 ```bash
 cat >> internal/httpclient/client_test.go << 'EOF'
@@ -97,7 +97,7 @@ func TestDo_NoAccountHeaderWhenZero(t *testing.T) {
 	})
 	defer done()
 	var out []struct{}
-	if err := c.Do(context.Background(), Request{Method: http.MethodGet, Path: "/api/v1/accounts", Out: &out, Idempotent: true}); err != nil {
+	if err := c.Do(context.Background(), Request{Method: http.MethodGet, Path: "/api/v1/accounts", Out: &out}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -123,8 +123,8 @@ func TestDo_NoContentWithOutIsError(t *testing.T) {
 	defer done()
 	var out struct{ A int }
 	err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/x", Out: &out})
-	if err == nil || !strings.Contains(err.Error(), "no result") {
-		t.Errorf("want no-result error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "empty response body") {
+		t.Errorf("want empty-body error, got %v", err)
 	}
 }
 
@@ -161,7 +161,7 @@ func TestDo_IdempotentWriteRetriesOnce(t *testing.T) {
 	var out struct {
 		OrderID string `json:"orderId"`
 	}
-	if err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/api/v1/orders", Body: map[string]string{"a": "b"}, Idempotent: true, Out: &out}); err != nil {
+	if err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/api/v1/orders", Body: map[string]string{"a": "b"}, IdempotencyKey: "k1", Out: &out}); err != nil {
 		t.Fatal(err)
 	}
 	if out.OrderID != "o-2" || atomic.LoadInt32(&n) != 2 {
@@ -189,7 +189,7 @@ func TestDo_BodyIsResentOnRetry(t *testing.T) {
 	var out struct {
 		OK bool `json:"ok"`
 	}
-	if err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/x", Body: map[string]string{"k": "v"}, Idempotent: true, Out: &out}); err != nil {
+	if err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/x", Body: map[string]string{"k": "v"}, IdempotencyKey: "k1", Out: &out}); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()
@@ -217,14 +217,145 @@ func TestGet_StillIdempotent(t *testing.T) {
 		t.Fatalf("GET must still retry: %+v %v", out, err)
 	}
 }
+
+func TestDo_DefaultsToGetAndRetries(t *testing.T) {
+	// Method 를 비우면 GET 이고, GET 은 IdempotencyKey 없이도 재시도한다
+	var n int32
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", r.Method)
+		}
+		if atomic.AddInt32(&n, 1) == 1 {
+			w.WriteHeader(401)
+			_, _ = w.Write([]byte(`{"error":{"requestId":"r","code":"expired-token","message":""}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"result":{"ok":true}}`))
+	}, "tok1", "tok2")
+	defer done()
+	var out struct {
+		OK bool `json:"ok"`
+	}
+	if err := c.Do(context.Background(), Request{Path: "/x", Out: &out}); err != nil {
+		t.Fatal(err)
+	}
+	if !out.OK || atomic.LoadInt32(&n) != 2 {
+		t.Errorf("ok=%v calls=%d", out.OK, atomic.LoadInt32(&n))
+	}
+}
+
+func TestDo_HeadersSurviveRetry(t *testing.T) {
+	// 재시도된 주문에도 계좌 헤더와 Content-Type 이 실려야 한다
+	var accts, cts []string
+	var mu sync.Mutex
+	var n int32
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		accts = append(accts, r.Header.Get("X-Tossinvest-Account"))
+		cts = append(cts, r.Header.Get("Content-Type"))
+		mu.Unlock()
+		if atomic.AddInt32(&n, 1) == 1 {
+			w.WriteHeader(401)
+			_, _ = w.Write([]byte(`{"error":{"requestId":"r","code":"expired-token","message":""}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"result":{"ok":true}}`))
+	}, "tok1", "tok2")
+	defer done()
+	var out struct {
+		OK bool `json:"ok"`
+	}
+	if err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/x", Body: map[string]string{"k": "v"}, AccountSeq: 42, IdempotencyKey: "k1", Out: &out}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(accts) != 2 || accts[0] != "42" || accts[1] != "42" {
+		t.Errorf("account headers = %q", accts)
+	}
+	if cts[0] != "application/json" || cts[1] != "application/json" {
+		t.Errorf("content-types = %q", cts)
+	}
+}
+
+func TestDo_IdempotentWriteDoesNotRetryTwice(t *testing.T) {
+	var n int32
+	c, st, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&n, 1)
+		w.WriteHeader(401)
+		_, _ = w.Write([]byte(`{"error":{"requestId":"r","code":"expired-token","message":""}}`))
+	})
+	defer done()
+	err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/x", Body: map[string]string{"a": "b"}, IdempotencyKey: "k1"})
+	var ae *APIError
+	if !errors.As(err, &ae) || ae.Code != "expired-token" {
+		t.Fatalf("want expired-token, got %v", err)
+	}
+	if atomic.LoadInt32(&n) != 2 || atomic.LoadInt32(&st.invalidated) != 2 {
+		t.Errorf("calls=%d invalidated=%d, want 2/2", atomic.LoadInt32(&n), atomic.LoadInt32(&st.invalidated))
+	}
+}
+
+func TestDo_WriteNonTokenUnauthorizedNoRetry(t *testing.T) {
+	var n int32
+	c, st, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&n, 1)
+		w.WriteHeader(401)
+		_, _ = w.Write([]byte(`{"error":{"requestId":"r","code":"login-user-not-found","message":""}}`))
+	})
+	defer done()
+	_ = c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/x", Body: map[string]string{"a": "b"}, IdempotencyKey: "k1"})
+	if atomic.LoadInt32(&n) != 1 || atomic.LoadInt32(&st.invalidated) != 0 {
+		t.Errorf("calls=%d invalidated=%d, want 1/0", atomic.LoadInt32(&n), atomic.LoadInt32(&st.invalidated))
+	}
+}
+
+func TestDo_MarshalErrorNeverHitsServer(t *testing.T) {
+	var n int32
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&n, 1)
+		_, _ = w.Write([]byte(`{"result":{}}`))
+	})
+	defer done()
+	err := c.Do(context.Background(), Request{Method: http.MethodPost, Path: "/x", Body: make(chan int)})
+	if err == nil || !strings.Contains(err.Error(), "encode body") {
+		t.Fatalf("want encode error, got %v", err)
+	}
+	if atomic.LoadInt32(&n) != 0 {
+		t.Errorf("server was hit %d times; must be 0", atomic.LoadInt32(&n))
+	}
+}
+
+func TestDo_NoContentTypeWithoutBody(t *testing.T) {
+	c, _, done := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if ct := r.Header.Get("Content-Type"); ct != "" {
+			t.Errorf("Content-Type = %q, want empty", ct)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	defer done()
+	if err := c.Do(context.Background(), Request{Method: http.MethodDelete, Path: "/x", AccountSeq: 1}); err != nil {
+		t.Fatal(err)
+	}
+}
 EOF
 go test ./internal/httpclient/ 2>&1 | head -5
 ```
-Expected: 컴파일 에러(`undefined: Request`, `c.Do`). `io`, `sync` import 가 없다면 함께 추가해야 한다(다음 스텝에서 처리).
+Expected: 컴파일 에러(`undefined: Request`, `c.Do`, `undefined: canRetry` 등). `io`, `sync` import 가 없다면 함께 추가해야 한다(다음 스텝에서 처리).
 
-- [ ] **Step 2: 구현** — `client.go` 의 `Get`/`do` 를 `Request`/`Do` 기반으로 바꾼다.
+- [x] **Step 2: 구현** — `client.go` 의 `Get`/`do` 를 `Request`/`Do` 기반으로 바꾼다.
 
-`internal/httpclient/client.go` 에서 `// Get 은 GET ...` 주석부터 `func isTokenError` 앞까지를 아래로 교체한다(Edit 도구로 정확히 치환):
+`internal/httpclient/client.go` 의 패키지 doc(파일 첫 3~4줄)을 재시도 범위가 드러나도록 정정한다:
+
+```go
+// Package httpclient 는 토스 Open API REST 호출의 단일 통로다.
+// Bearer 토큰 주입, `{"result": ...}` 봉투 해제, `{"error": {...}}` → APIError 매핑,
+// 401 토큰 오류 시 1회 재발급·재시도(GET 과 멱등성 키가 있는 쓰기에 한정)를 담당한다.
+// 재시도(429/5xx)·스로틀링·캐싱은 하지 않는다.
+package httpclient
+```
+
+`// Get 은 GET ...` 주석부터 `func isTokenError` 앞까지를 아래로 교체한다(Edit 도구로 정확히 치환). 쓰기의 재시도 여부를 `bool Idempotent` 플래그가 아니라 `IdempotencyKey string` 값으로 표현한다 — "키 없이 재시도를 켠다" 는 잘못된 상태 자체를 만들 수 없게 한다. `isTokenError` 바로 뒤에 `canRetry` 헬퍼를 추가한다:
 
 ```go
 // Request 는 한 번의 HTTP 호출을 기술한다.
@@ -232,16 +363,19 @@ type Request struct {
 	Method     string     // GET/POST/DELETE. 빈 값이면 GET
 	Path       string     // 예: /api/v1/orders
 	Query      url.Values // nil 가능
-	Body       any        // nil 이 아니면 JSON 으로 직렬화해 전송
+	Body       any        // nil 이 아니면 JSON 으로 직렬화해 전송. struct/map 만 — []byte 는 base64 문자열, string 은 따옴표 문자열이 된다
 	AccountSeq int64      // 0 이 아니면 X-Tossinvest-Account 헤더
-	Idempotent bool       // true 면 401 토큰 오류에 1회 재시도. 쓰기는 멱등성 키가 있을 때만 true
-	Out        any        // nil 이면 응답 본문을 읽지 않는다(204 포함)
+	// IdempotencyKey 는 이 요청이 서버 측 멱등성 키(토스 clientOrderId)를 바디에 담고 있음을 뜻한다.
+	// 비어 있지 않을 때만 쓰기 요청을 401 토큰 오류에 1회 재시도한다 — 키 없는 쓰기를 재시도하면
+	// 서버가 이미 접수한 주문이 중복될 수 있다. GET 은 이 값과 무관하게 항상 재시도한다.
+	IdempotencyKey string
+	Out            any // nil 이면 응답 본문을 읽지 않는다(204 포함)
 }
 
 // Do 는 Request 를 실행하고 `result` 를 Out 으로 디코딩한다.
 // Out 이 nil 이면 본문을 버린다(204 정상). Out 이 nil 이 아닌데 본문이 없거나 result 가 null 이면 에러.
 // 4xx/5xx 는 *APIError. 401 이고 code 가 expired-token / invalid-token 이면 토큰을 무효화하고,
-// Idempotent 인 요청만 정확히 1회 재시도한다(멱등성 키 없는 쓰기의 중복 실행 방지).
+// canRetry(GET 또는 IdempotencyKey 있는 쓰기)인 요청만 정확히 1회 재시도한다(멱등성 키 없는 쓰기의 중복 실행 방지).
 func (c *Client) Do(ctx context.Context, r Request) error {
 	if r.Method == "" {
 		r.Method = http.MethodGet
@@ -261,6 +395,9 @@ func (c *Client) Do(ctx context.Context, r Request) error {
 	if r.Out == nil {
 		return nil
 	}
+	if len(body) == 0 {
+		return fmt.Errorf("toss: %s: empty response body", r.Path)
+	}
 	var env resultEnvelope
 	if err := json.Unmarshal(body, &env); err != nil {
 		return fmt.Errorf("toss: decode envelope %s: %w", r.Path, err)
@@ -274,9 +411,9 @@ func (c *Client) Do(ctx context.Context, r Request) error {
 	return nil
 }
 
-// Get 은 GET 조회 단축형이다. GET 은 항상 멱등이므로 401 재시도가 적용된다.
+// Get 은 GET 조회 단축형이다. GET 은 항상 멱등이라 401 토큰 오류에 1회 재시도한다(자세한 규칙은 Do 참고).
 func (c *Client) Get(ctx context.Context, path string, query url.Values, out any) error {
-	return c.Do(ctx, Request{Method: http.MethodGet, Path: path, Query: query, Out: out, Idempotent: true})
+	return c.Do(ctx, Request{Method: http.MethodGet, Path: path, Query: query, Out: out})
 }
 
 func (c *Client) do(ctx context.Context, r Request, payload []byte, retried bool) ([]byte, error) {
@@ -322,28 +459,47 @@ func (c *Client) do(ctx context.Context, r Request, payload []byte, retried bool
 	if resp.StatusCode == http.StatusUnauthorized && isTokenError(apiErr.Code) {
 		// 서버가 거부한 토큰은 재시도 여부와 무관하게 캐시에서 제거한다(재시도 후 401 이어도 하루 동안 남지 않도록).
 		c.tokens.Invalidate(tok)
-		if !retried && r.Idempotent {
+		if !retried && canRetry(r) {
 			return c.do(ctx, r, payload, true)
 		}
 	}
 	return nil, apiErr
 }
+
+func isTokenError(code string) bool {
+	return code == "expired-token" || code == "invalid-token"
+}
+
+// canRetry 는 401 토큰 오류에 요청을 다시 보내도 안전한지 판단한다.
+// GET 은 HTTP 정의상 멱등이고, 쓰기는 서버 멱등성 키가 있을 때만 안전하다.
+func canRetry(r Request) bool {
+	return r.Method == http.MethodGet || r.IdempotencyKey != ""
+}
 ```
 
-import 에 `"bytes"` 를 추가한다. 테스트 파일에는 `"io"`, `"sync"` 를 추가한다(이미 있으면 생략).
+import 에 `"bytes"` 를 추가한다. 테스트 파일에는 `"io"` 를 추가한다(`sync`/`sync/atomic` 은 기존 테스트에 이미 있다).
 
 ```bash
-cd /Users/user/src/workspace_moneyflow/toss-go && gofmt -w internal/httpclient && go vet ./internal/httpclient/ && go test ./internal/httpclient/ -race -v 2>&1 | grep -cE '^--- PASS'
+gofmt -w internal/httpclient && go vet ./internal/httpclient/ && go test ./internal/httpclient/ -race -v 2>&1 | grep -cE '^--- PASS'
 ```
-Expected: `23` (기존 15 + 신규 8).
+Expected: `29` (기존 15 + 신규 14: Step 1 의 8개 + 코드리뷰 반영 후 추가된 6개 — `TestDo_DefaultsToGetAndRetries`, `TestDo_HeadersSurviveRetry`, `TestDo_IdempotentWriteDoesNotRetryTwice`, `TestDo_WriteNonTokenUnauthorizedNoRetry`, `TestDo_MarshalErrorNeverHitsServer`, `TestDo_NoContentTypeWithoutBody`).
 
-- [ ] **Step 3: 커밋**
+**코드리뷰 반영 메모(Task 2 착수 전 적용, 커밋 `03f9927` 이후):**
+- `Idempotent bool` → `IdempotencyKey string`. 콜러가 빈 문자열을 실수로 `true` 로 켤 수 없다.
+- `Get` 은 이제 `IdempotencyKey` 를 넘기지 않는다 — GET 은 `canRetry` 에서 메서드로 판별해 항상 재시도.
+- 204(빈 바디)인데 `Out != nil` 인 에러 메시지를 `"empty response body"` 로, `result:null` 인 에러 메시지는 기존 `"response has no result"` 로 구분.
+- `Body` 필드 주석에 직렬화 함정(`[]byte`→base64, `string`→따옴표 문자열)을 명시.
+- 헤더가 재시도에도 유지되는지, 마샬 실패 시 서버를 아예 안 부르는지, 논-토큰 401 은 재시도 안 하는지 커버하는 테스트 6개 추가.
+
+- [x] **Step 3: 커밋**
 
 ```bash
 git add internal/httpclient && git commit -m "feat(httpclient): Request/Do — POST·DELETE, 계좌 헤더, 204, 멱등성 기반 쓰기 재시도
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
+
+(이후 코드리뷰 반영은 별도 커밋 `fix(httpclient): Idempotent bool → IdempotencyKey, GET 은 항상 재시도 (리뷰 반영)` 로 처리했다.)
 
 ---
 
@@ -371,9 +527,10 @@ import (
 )
 
 // One 은 GET 으로 result 객체 하나를 *T 로 디코딩한다. accountSeq 가 0 이 아니면 계좌 헤더를 붙인다.
+// GET 은 항상 재시도되므로(httpclient.canRetry) IdempotencyKey 를 넘길 필요가 없다.
 func One[T any](ctx context.Context, hc *httpclient.Client, path string, q url.Values, accountSeq int64) (*T, error) {
 	var out T
-	if err := hc.Do(ctx, httpclient.Request{Method: http.MethodGet, Path: path, Query: q, AccountSeq: accountSeq, Idempotent: true, Out: &out}); err != nil {
+	if err := hc.Do(ctx, httpclient.Request{Method: http.MethodGet, Path: path, Query: q, AccountSeq: accountSeq, Out: &out}); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -382,25 +539,25 @@ func One[T any](ctx context.Context, hc *httpclient.Client, path string, q url.V
 // List 는 GET 으로 result 배열을 []T 로 디코딩한다. 빈 배열은 nil 이 아닌 빈 슬라이스, 실패 시 nil 과 에러.
 func List[T any](ctx context.Context, hc *httpclient.Client, path string, q url.Values, accountSeq int64) ([]T, error) {
 	out := []T{}
-	if err := hc.Do(ctx, httpclient.Request{Method: http.MethodGet, Path: path, Query: q, AccountSeq: accountSeq, Idempotent: true, Out: &out}); err != nil {
+	if err := hc.Do(ctx, httpclient.Request{Method: http.MethodGet, Path: path, Query: q, AccountSeq: accountSeq, Out: &out}); err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
 // PostOne 은 POST 로 body 를 보내고 result 를 *T 로 디코딩한다.
-// idempotent 는 멱등성 키(clientOrderId)가 있는 요청에만 true 여야 한다 — 401 재시도 허용 여부를 결정한다.
-func PostOne[T any](ctx context.Context, hc *httpclient.Client, path string, body any, accountSeq int64, idempotent bool) (*T, error) {
+// clientOrderID 는 body 에 실린 멱등성 키를 그대로 넘긴다(없으면 빈 문자열) — 401 재시도 허용 여부를 결정한다.
+func PostOne[T any](ctx context.Context, hc *httpclient.Client, path string, body any, accountSeq int64, clientOrderID string) (*T, error) {
 	var out T
-	if err := hc.Do(ctx, httpclient.Request{Method: http.MethodPost, Path: path, Body: body, AccountSeq: accountSeq, Idempotent: idempotent, Out: &out}); err != nil {
+	if err := hc.Do(ctx, httpclient.Request{Method: http.MethodPost, Path: path, Body: body, AccountSeq: accountSeq, IdempotencyKey: clientOrderID, Out: &out}); err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
 
-// Send 는 응답 본문을 쓰지 않는 요청(예: DELETE 204)을 보낸다.
-func Send(ctx context.Context, hc *httpclient.Client, method, path string, body any, accountSeq int64) error {
-	return hc.Do(ctx, httpclient.Request{Method: method, Path: path, Body: body, AccountSeq: accountSeq})
+// Send 는 응답 본문을 쓰지 않는 요청(예: DELETE 204)을 보낸다. q 는 필요 없으면 nil.
+func Send(ctx context.Context, hc *httpclient.Client, method, path string, q url.Values, body any, accountSeq int64) error {
+	return hc.Do(ctx, httpclient.Request{Method: method, Path: path, Query: q, Body: body, AccountSeq: accountSeq})
 }
 EOF
 ```
@@ -423,7 +580,7 @@ func TestOne_SendsAccountHeader(t *testing.T) {
 func TestPostOne(t *testing.T) {
 	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/p"}, "3", 200, []byte(`{"result":{"symbol":"P"}}`))
 	defer done()
-	got, err := PostOne[item](context.Background(), hc, "/p", map[string]string{"a": "b"}, 3, true)
+	got, err := PostOne[item](context.Background(), hc, "/p", map[string]string{"a": "b"}, 3, "k1")
 	if err != nil || got == nil || got.Symbol != "P" {
 		t.Fatalf("got %+v, %v", got, err)
 	}
@@ -432,7 +589,7 @@ func TestPostOne(t *testing.T) {
 func TestSend_NoContent(t *testing.T) {
 	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/d"}, "2", 204, nil)
 	defer done()
-	if err := Send(context.Background(), hc, http.MethodDelete, "/d", nil, 2); err != nil {
+	if err := Send(context.Background(), hc, http.MethodDelete, "/d", nil, nil, 2); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1551,7 +1708,7 @@ func (c *Client) Place(ctx context.Context, r Request) (*PlaceResult, error) {
 	if r.OrderType == TypeLimit {
 		body.Price = r.Price.String()
 	}
-	return fetch.PostOne[PlaceResult](ctx, c.http, "/api/v1/orders", body, c.accountSeq, r.ClientOrderID != "")
+	return fetch.PostOne[PlaceResult](ctx, c.http, "/api/v1/orders", body, c.accountSeq, r.ClientOrderID)
 }
 
 // PlaceAmount 는 금액 기준 주문을 생성한다(POST /api/v1/orders). 미국 주식 시장가 전용이며
@@ -1577,7 +1734,7 @@ func (c *Client) PlaceAmount(ctx context.Context, r AmountRequest) (*PlaceResult
 		OrderAmount: r.OrderAmount.String(),
 		ClientOrderID: r.ClientOrderID, ConfirmHighValueOrder: r.ConfirmHighValue,
 	}
-	return fetch.PostOne[PlaceResult](ctx, c.http, "/api/v1/orders", body, c.accountSeq, r.ClientOrderID != "")
+	return fetch.PostOne[PlaceResult](ctx, c.http, "/api/v1/orders", body, c.accountSeq, r.ClientOrderID)
 }
 EOF
 cat > order/modify.go << 'EOF'
@@ -1650,7 +1807,7 @@ func (c *Client) Modify(ctx context.Context, orderID string, r ModifyRequest) (*
 	if r.Price.IsPositive() {
 		body.Price = r.Price.String()
 	}
-	return fetch.PostOne[OperationResult](ctx, c.http, "/api/v1/orders/"+url.PathEscape(orderID)+"/modify", body, c.accountSeq, false)
+	return fetch.PostOne[OperationResult](ctx, c.http, "/api/v1/orders/"+url.PathEscape(orderID)+"/modify", body, c.accountSeq, "")
 }
 
 // Cancel 은 주문을 취소한다(POST /api/v1/orders/{orderId}/cancel). 이미 체결된 주문은 취소할 수 없다.
@@ -1662,7 +1819,7 @@ func (c *Client) Cancel(ctx context.Context, orderID string) (*OperationResult, 
 	if err := params.Require("orderId", orderID); err != nil {
 		return nil, err
 	}
-	return fetch.PostOne[OperationResult](ctx, c.http, "/api/v1/orders/"+url.PathEscape(orderID)+"/cancel", struct{}{}, c.accountSeq, false)
+	return fetch.PostOne[OperationResult](ctx, c.http, "/api/v1/orders/"+url.PathEscape(orderID)+"/cancel", struct{}{}, c.accountSeq, "")
 }
 EOF
 cat > order/history.go << 'EOF'
@@ -2278,7 +2435,7 @@ func (c *Client) Place(ctx context.Context, r Request) (*PlaceResult, error) {
 		sb := r.Second.body()
 		body.Second = &sb
 	}
-	return fetch.PostOne[PlaceResult](ctx, c.http, "/api/v1/conditional-orders", body, c.accountSeq, r.ClientOrderID != "")
+	return fetch.PostOne[PlaceResult](ctx, c.http, "/api/v1/conditional-orders", body, c.accountSeq, r.ClientOrderID)
 }
 
 // Modify 는 조건주문을 수정한다(POST /api/v1/conditional-orders/{id}/modify).
@@ -2313,7 +2470,7 @@ func (c *Client) Modify(ctx context.Context, id string, r ModifyRequest) (*Resul
 		sb := r.Second.body()
 		body.Second = &sb
 	}
-	return fetch.PostOne[Result](ctx, c.http, "/api/v1/conditional-orders/"+url.PathEscape(id)+"/modify", body, c.accountSeq, false)
+	return fetch.PostOne[Result](ctx, c.http, "/api/v1/conditional-orders/"+url.PathEscape(id)+"/modify", body, c.accountSeq, "")
 }
 
 // Cancel 은 조건주문을 취소한다(DELETE /api/v1/conditional-orders/{id}). 성공 시 본문이 없다(204).
@@ -2322,7 +2479,7 @@ func (c *Client) Cancel(ctx context.Context, id string) error {
 	if err := params.Require("conditionalOrderId", id); err != nil {
 		return err
 	}
-	return fetch.Send(ctx, c.http, http.MethodDelete, "/api/v1/conditional-orders/"+url.PathEscape(id), nil, c.accountSeq)
+	return fetch.Send(ctx, c.http, http.MethodDelete, "/api/v1/conditional-orders/"+url.PathEscape(id), nil, nil, c.accountSeq)
 }
 EOF
 cat > conditionalorder/history.go << 'EOF'

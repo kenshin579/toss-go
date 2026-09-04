@@ -135,15 +135,15 @@ type Request struct {
     Query      url.Values
     Body       any         // nil 이 아니면 JSON 직렬화
     AccountSeq int64       // 0 이 아니면 X-Tossinvest-Account 헤더
-    Idempotent bool        // true 면 401 토큰 오류에 1회 재시도(멱등성 키 있는 쓰기, 모든 GET)
+    IdempotencyKey string  // 바디에 실린 멱등성 키(clientOrderId). 비어 있지 않은 쓰기만 401 재시도
     Out        any         // nil 이면 응답 본문 무시(204 포함)
 }
 
 func (c *Client) Do(ctx context.Context, r Request) error
-func (c *Client) Get(ctx, path string, q url.Values, out any) error // 기존 시그니처 유지 = Do(GET, Idempotent:true)
+func (c *Client) Get(ctx, path string, q url.Values, out any) error // 기존 시그니처 유지 = Do(GET) — GET 은 IdempotencyKey 없이도 항상 재시도
 ```
 
-- **GET 은 항상 `Idempotent: true`** (기존 동작 유지). 쓰기는 호출부가 `clientOrderId` 유무로 결정한다.
+- **GET 은 항상 재시도**(HTTP 정의상 멱등). 쓰기는 `IdempotencyKey` 가 있을 때만 재시도.
 - **204 / 빈 본문**: `Out == nil` 이면 본문을 읽지 않고 성공 처리. `Out != nil` 인데 204 면 에러.
 - 헤더: `Authorization: Bearer`, `Accept: application/json`, 바디가 있으면
   `Content-Type: application/json`, `AccountSeq != 0` 이면 `X-Tossinvest-Account`.
@@ -152,8 +152,8 @@ func (c *Client) Get(ctx, path string, q url.Values, out any) error // 기존 �
 ### `internal/fetch` 확장
 
 ```go
-func PostOne[T any](ctx, hc, path string, q url.Values, body any, accountSeq int64, idempotent bool) (*T, error)
-func Do(ctx, hc, method, path string, q url.Values, body any, accountSeq int64) error // 본문 없는 응답(204)
+func PostOne[T any](ctx, hc, path string, body any, accountSeq int64, clientOrderID string) (*T, error)
+func Send(ctx, hc, method, path string, q url.Values, body any, accountSeq int64) error // 본문 없는 응답(204)
 ```
 
 기존 `One`/`List` 는 계좌 헤더를 받도록 시그니처를 확장한다(내부 패키지라 호환성 부담 없음).
@@ -231,8 +231,8 @@ type AmountRequest struct {
 ## 테스트
 
 - **`internal/httpclient`**: POST 바디 직렬화·Content-Type, `X-Tossinvest-Account` 주입(0 이면 미주입),
-  204 처리(`Out == nil` 성공 / `Out != nil` 에러), **쓰기 재시도 정책**(Idempotent=false 면 401 에
-  재시도 없이 에러, true 면 1회 재시도), DELETE.
+  204 처리(`Out == nil` 성공 / `Out != nil` 에러), **쓰기 재시도 정책**(IdempotencyKey 없으면 401 에
+  재시도 없이 에러, 있으면 1회 재시도; GET 은 항상 재시도), DELETE.
 - **`asset`/`order`/`conditionalorder`**: openapi `examples` 를 fixture 로 쓰는 조회 테스트 +
   쓰기 요청 조립 테스트(바디 JSON 을 서버 스텁에서 확인). `oneOf` 는 메서드 분리로 강제되므로
   "둘 다 지정" 케이스 자체가 존재하지 않는다.
