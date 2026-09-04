@@ -2779,17 +2779,46 @@ func TestKRMarketCalendar_Holiday(t *testing.T) {
 }
 
 func TestUSMarketCalendar(t *testing.T) {
+	// fixture = openapi 예시(businessDay): 2026-03-25, 4개 세션 모두 존재, 정규장은 KST 자정을 넘김
 	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/market-calendar/US"}, 200, testutil.Fixture(t, "market_calendar_us.json"))
 	defer done()
 	cal, err := New(hc).USMarketCalendar(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cal.Today.Date == "" || cal.PreviousBusinessDay.Date == "" || cal.NextBusinessDay.Date == "" {
-		t.Errorf("cal = %+v", cal)
+	td := cal.Today
+	if td.Date != "2026-03-25" || cal.PreviousBusinessDay.Date == "" || cal.NextBusinessDay.Date == "" {
+		t.Errorf("dates = %s %s %s", td.Date, cal.PreviousBusinessDay.Date, cal.NextBusinessDay.Date)
 	}
-	if s := cal.NextBusinessDay.RegularMarket; s != nil && !s.EndTime.After(s.StartTime) {
-		t.Errorf("RegularMarket = %+v", s)
+	if td.DayMarket == nil || td.DayMarket.StartTime.Hour() != 9 || td.DayMarket.EndTime.Hour() != 16 || td.DayMarket.EndTime.Minute() != 50 {
+		t.Errorf("DayMarket = %+v", td.DayMarket)
+	}
+	if td.PreMarket == nil || td.PreMarket.StartTime.Hour() != 17 || td.PreMarket.EndTime.Hour() != 22 || td.PreMarket.EndTime.Minute() != 30 {
+		t.Errorf("PreMarket = %+v", td.PreMarket)
+	}
+	if td.RegularMarket == nil || td.RegularMarket.StartTime.Hour() != 22 || td.RegularMarket.EndTime.Day() != 26 || td.RegularMarket.EndTime.Hour() != 5 {
+		t.Errorf("RegularMarket = %+v", td.RegularMarket)
+	}
+	if td.AfterMarket == nil || td.AfterMarket.StartTime.Hour() != 5 || td.AfterMarket.EndTime.Hour() != 7 {
+		t.Errorf("AfterMarket = %+v", td.AfterMarket)
+	}
+}
+
+func TestUSMarketCalendar_Holiday(t *testing.T) {
+	// openapi 예시(holidayToday): 오늘은 4개 세션 모두 null
+	body := []byte(`{"result":{"today":{"date":"2026-07-03","dayMarket":null,"preMarket":null,"regularMarket":null,"afterMarket":null},"previousBusinessDay":{"date":"2026-07-02","dayMarket":{"startTime":"2026-07-02T09:00:00+09:00","endTime":"2026-07-02T16:50:00+09:00"},"preMarket":{"startTime":"2026-07-02T17:00:00+09:00","endTime":"2026-07-02T22:30:00+09:00"},"regularMarket":{"startTime":"2026-07-02T22:30:00+09:00","endTime":"2026-07-03T05:00:00+09:00"},"afterMarket":{"startTime":"2026-07-03T05:00:00+09:00","endTime":"2026-07-03T07:00:00+09:00"}},"nextBusinessDay":{"date":"2026-07-06","dayMarket":{"startTime":"2026-07-06T09:00:00+09:00","endTime":"2026-07-06T16:50:00+09:00"},"preMarket":{"startTime":"2026-07-06T17:00:00+09:00","endTime":"2026-07-06T22:30:00+09:00"},"regularMarket":{"startTime":"2026-07-06T22:30:00+09:00","endTime":"2026-07-07T05:00:00+09:00"},"afterMarket":{"startTime":"2026-07-07T05:00:00+09:00","endTime":"2026-07-07T07:00:00+09:00"}}}}`)
+	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/market-calendar/US"}, 200, body)
+	defer done()
+	cal, err := New(hc).USMarketCalendar(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	td := cal.Today
+	if td.Date == "" || td.DayMarket != nil || td.PreMarket != nil || td.RegularMarket != nil || td.AfterMarket != nil {
+		t.Errorf("today = %+v", td)
+	}
+	if cal.NextBusinessDay.RegularMarket == nil {
+		t.Errorf("next business day must have sessions: %+v", cal.NextBusinessDay)
 	}
 }
 EOF
@@ -2834,15 +2863,15 @@ import (
 type ExchangeRate struct {
 	BaseCurrency   tosstypes.Currency       `json:"baseCurrency"`
 	QuoteCurrency  tosstypes.Currency       `json:"quoteCurrency"`
-	Rate           decimal.Decimal          `json:"rate"`
+	Rate           decimal.Decimal          `json:"rate"`       // 매수 환율(1 base = Rate quote). 참고용 표시 환율로 실제 체결 환율과 다를 수 있음
 	MidRate        decimal.Decimal          `json:"midRate"`    // 매매기준율
 	BasisPoint     decimal.Decimal          `json:"basisPoint"` // (rate - midRate) / midRate * 10000
 	RateChangeType tosstypes.RateChangeType `json:"rateChangeType"`
-	ValidFrom      time.Time                `json:"validFrom"`
-	ValidUntil     time.Time                `json:"validUntil"`
+	ValidFrom      time.Time                `json:"validFrom"`  // 고시 유효 시작
+	ValidUntil     time.Time                `json:"validUntil"` // 고시 유효 종료(보통 1분 주기 갱신) — 캐시 TTL 힌트로 사용
 }
 
-// ExchangeRate 는 환율을 조회한다(GET /api/v1/exchange-rate). at 이 nil 이면 현재 고시. 해당 통화쌍/시각의 고시가 없으면 404 exchange-rate-not-found.
+// ExchangeRate 는 환율을 조회한다(GET /api/v1/exchange-rate). at 이 nil 이면 현재 고시. 해당 통화쌍/시각의 고시가 없으면 404 exchange-rate-not-found. KRW/USD 만 지원하며 base == quote 는 400 invalid-request.
 func (c *Client) ExchangeRate(ctx context.Context, base, quote tosstypes.Currency, at *time.Time) (*ExchangeRate, error) {
 	if err := params.Require("baseCurrency", string(base)); err != nil {
 		return nil, err
@@ -2871,7 +2900,7 @@ import (
 // KRSession 은 국내 프리마켓/정규장 세션.
 type KRSession struct {
 	StartTime                   time.Time  `json:"startTime"`
-	SinglePriceAuctionStartTime *time.Time `json:"singlePriceAuctionStartTime"` // 단일가 구간 시작. 결손 시 nil
+	SinglePriceAuctionStartTime *time.Time `json:"singlePriceAuctionStartTime"` // 단일가 구간 시작. 슬롯별 의미는 KRIntegratedHours 필드 주석 참고. nil 이면 결손/휴장
 	EndTime                     time.Time  `json:"endTime"`
 }
 
@@ -2884,14 +2913,14 @@ type KRAfterMarketSession struct {
 
 // KRIntegratedHours 는 통합(KRX+NXT) 거래 가능 시간. 휴장 세션은 nil.
 type KRIntegratedHours struct {
-	PreMarket     *KRSession            `json:"preMarket"`
-	RegularMarket *KRSession            `json:"regularMarket"`
-	AfterMarket   *KRAfterMarketSession `json:"afterMarket"`
+	PreMarket     *KRSession            `json:"preMarket"`     // NXT 프리마켓(접속매매). SinglePriceAuctionStartTime = 시가단일가 시작(결손 시 nil). 휴장이면 nil
+	RegularMarket *KRSession            `json:"regularMarket"` // KRX·NXT 정규장 합집합(가장 이른 시작~가장 늦은 종료). SinglePriceAuctionStartTime = 종가단일가 시작(KRX 기준, KRX 휴장 시 nil). 휴장이면 nil
+	AfterMarket   *KRAfterMarketSession `json:"afterMarket"`   // 애프터마켓. 휴장이면 nil
 }
 
 // KRMarketDay 는 국내 하루 장 운영 정보. 휴장일이면 Integrated 가 nil.
 type KRMarketDay struct {
-	Date       tosstypes.Date     `json:"date"`
+	Date       tosstypes.Date     `json:"date"` // 영업일(KST 기준)
 	Integrated *KRIntegratedHours `json:"integrated"`
 }
 
@@ -2910,7 +2939,7 @@ type USSession struct {
 
 // USMarketDay 는 해외 하루 장 운영 정보. 휴장 세션은 nil.
 type USMarketDay struct {
-	Date          tosstypes.Date `json:"date"`
+	Date          tosstypes.Date `json:"date"`      // 영업일(미국 현지 기준). 세션 시각은 모두 KST 이며 RegularMarket/AfterMarket 은 KST 자정을 넘어간다(예: 22:30 → 익일 05:00)
 	DayMarket     *USSession     `json:"dayMarket"` // 데이마켓(토스증권)
 	PreMarket     *USSession     `json:"preMarket"`
 	RegularMarket *USSession     `json:"regularMarket"`
@@ -2924,14 +2953,14 @@ type USMarketCalendar struct {
 	NextBusinessDay     USMarketDay `json:"nextBusinessDay"`
 }
 
-// KRMarketCalendar 는 국내 장 운영 정보를 조회한다(GET /api/v1/market-calendar/KR). date 가 비면 오늘.
+// KRMarketCalendar 는 국내 장 운영 정보를 조회한다(GET /api/v1/market-calendar/KR). date 는 KST 기준, 비면 오늘. 지원 범위 밖 날짜는 400 unsupported-date.
 func (c *Client) KRMarketCalendar(ctx context.Context, date tosstypes.Date) (*KRMarketCalendar, error) {
 	q := url.Values{}
 	params.Date(q, "date", date)
 	return fetch.One[KRMarketCalendar](ctx, c.http, "/api/v1/market-calendar/KR", q)
 }
 
-// USMarketCalendar 는 해외 장 운영 정보를 조회한다(GET /api/v1/market-calendar/US). date 가 비면 오늘.
+// USMarketCalendar 는 해외 장 운영 정보를 조회한다(GET /api/v1/market-calendar/US). date 는 미국 현지 날짜(비면 오늘). tosstypes.NewDate 는 KST 변환이므로 미국 날짜는 Date(t.In(loc).Format("2006-01-02")) 로 직접 만든다.
 func (c *Client) USMarketCalendar(ctx context.Context, date tosstypes.Date) (*USMarketCalendar, error) {
 	q := url.Values{}
 	params.Date(q, "date", date)
@@ -2940,7 +2969,7 @@ func (c *Client) USMarketCalendar(ctx context.Context, date tosstypes.Date) (*US
 EOF
 gofmt -l marketinfo; go vet ./marketinfo/ && go test ./marketinfo/ -v 2>&1 | tail -10
 ```
-Expected: gofmt 출력 없음, 7 tests PASS.
+Expected: gofmt 출력 없음, 8 tests PASS.
 
 - [ ] **Step 4: 커밋**
 
@@ -3064,14 +3093,25 @@ func TestPrices_NoSymbols(t *testing.T) {
 }
 
 func TestCandles(t *testing.T) {
+	// fixture = openapi 예시(dailyCandles)
 	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/market-indicators/KOSPI/candles", Query: url.Values{"interval": {"1d"}, "count": {"2"}}}, 200, testutil.Fixture(t, "candles.json"))
 	defer done()
 	page, err := New(hc).Candles(context.Background(), "KOSPI", CandlesParams{Interval: tosstypes.Interval1d, Count: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Candles) != 2 || page.Candles[0].Timestamp.IsZero() || page.Candles[0].ClosePrice.IsZero() || page.NextBefore == nil {
-		t.Errorf("page = %+v", page)
+	if len(page.Candles) != 2 {
+		t.Fatalf("page = %+v", page)
+	}
+	c0 := page.Candles[0]
+	if c0.Timestamp.Year() != 2026 || c0.Timestamp.Month() != 6 || c0.Timestamp.Day() != 11 {
+		t.Errorf("Timestamp = %v", c0.Timestamp)
+	}
+	if c0.OpenPrice.String() != "2798.32" || c0.HighPrice.String() != "2820.15" || c0.LowPrice.String() != "2790.1" || c0.ClosePrice.String() != "2812.45" || c0.Volume.String() != "542000000" {
+		t.Errorf("candle = %+v", c0)
+	}
+	if page.NextBefore == nil || page.NextBefore.Day() != 10 {
+		t.Errorf("NextBefore = %v", page.NextBefore)
 	}
 }
 
@@ -3089,17 +3129,18 @@ func TestCandles_Validation(t *testing.T) {
 }
 
 func TestInvestorTrading(t *testing.T) {
+	// fixture = openapi 예시(daily)
 	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/market-indicators/KOSPI/investor-trading", Query: url.Values{"interval": {"1d"}, "count": {"1"}, "until": {"2026-09-03"}}}, 200, testutil.Fixture(t, "investor_trading.json"))
 	defer done()
 	page, err := New(hc).InvestorTrading(context.Background(), "KOSPI", InvestorTradingParams{Interval: tosstypes.IndicatorInterval1d, Count: 1, Until: "2026-09-03"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Records) == 0 {
+	if len(page.Records) != 2 {
 		t.Fatalf("page = %+v", page)
 	}
 	r := page.Records[0]
-	if r.Date == "" || r.UpdatedAt.IsZero() || r.Individual.BuyAmount.IsZero() || r.Foreigner.SellAmount.IsZero() || r.Institution.BuyAmount.IsZero() || r.Institution.Breakdown.PensionFund.BuyAmount.IsZero() {
+	if r.Date != "2026-06-11" || r.Institution.Breakdown.PensionFund.BuyAmount.String() != "500000000000" || r.Institution.Breakdown.PensionFund.SellAmount.String() != "490000000000" {
 		t.Errorf("r = %+v", r)
 	}
 }
@@ -3356,10 +3397,10 @@ type InvestorTradingPage struct {
 type InvestorTradingParams struct {
 	Interval tosstypes.IndicatorInterval // 필수 (1d, 1w, 1mo, 1y)
 	Count    int                         // 최대 100, 0 이면 서버 기본값(10)
-	Until    tosstypes.Date              // 이 날짜 이하의 기록만. 비우면 최신부터
+	Until    tosstypes.Date              // 이 날짜(KST) 이하의 기록만. 비우면 최신부터
 }
 
-// InvestorTrading 은 투자자별 매매대금을 조회한다(GET /api/v1/market-indicators/{symbol}/investor-trading).
+// InvestorTrading 은 투자자별 매매대금을 조회한다(GET /api/v1/market-indicators/{symbol}/investor-trading). Until 은 KST 기준 날짜.
 // KOSPI, KOSDAQ 만 지원한다. 지원하지 않는 심볼은 400 unsupported-symbol, 잘못된 요청은 400 invalid-request.
 func (c *Client) InvestorTrading(ctx context.Context, symbol string, p InvestorTradingParams) (*InvestorTradingPage, error) {
 	if err := params.Symbol(symbol); err != nil {

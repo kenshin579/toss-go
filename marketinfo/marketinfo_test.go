@@ -88,16 +88,45 @@ func TestKRMarketCalendar_Holiday(t *testing.T) {
 }
 
 func TestUSMarketCalendar(t *testing.T) {
+	// fixture = openapi 예시(businessDay): 2026-03-25, 4개 세션 모두 존재, 정규장은 KST 자정을 넘김
 	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/market-calendar/US"}, 200, testutil.Fixture(t, "market_calendar_us.json"))
 	defer done()
 	cal, err := New(hc).USMarketCalendar(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cal.Today.Date == "" || cal.PreviousBusinessDay.Date == "" || cal.NextBusinessDay.Date == "" {
-		t.Errorf("cal = %+v", cal)
+	td := cal.Today
+	if td.Date != "2026-03-25" || cal.PreviousBusinessDay.Date == "" || cal.NextBusinessDay.Date == "" {
+		t.Errorf("dates = %s %s %s", td.Date, cal.PreviousBusinessDay.Date, cal.NextBusinessDay.Date)
 	}
-	if s := cal.NextBusinessDay.RegularMarket; s != nil && !s.EndTime.After(s.StartTime) {
-		t.Errorf("RegularMarket = %+v", s)
+	if td.DayMarket == nil || td.DayMarket.StartTime.Hour() != 9 || td.DayMarket.EndTime.Hour() != 16 || td.DayMarket.EndTime.Minute() != 50 {
+		t.Errorf("DayMarket = %+v", td.DayMarket)
+	}
+	if td.PreMarket == nil || td.PreMarket.StartTime.Hour() != 17 || td.PreMarket.EndTime.Hour() != 22 || td.PreMarket.EndTime.Minute() != 30 {
+		t.Errorf("PreMarket = %+v", td.PreMarket)
+	}
+	if td.RegularMarket == nil || td.RegularMarket.StartTime.Hour() != 22 || td.RegularMarket.EndTime.Day() != 26 || td.RegularMarket.EndTime.Hour() != 5 {
+		t.Errorf("RegularMarket = %+v", td.RegularMarket)
+	}
+	if td.AfterMarket == nil || td.AfterMarket.StartTime.Hour() != 5 || td.AfterMarket.EndTime.Hour() != 7 {
+		t.Errorf("AfterMarket = %+v", td.AfterMarket)
+	}
+}
+
+func TestUSMarketCalendar_Holiday(t *testing.T) {
+	// openapi 예시(holidayToday): 오늘은 4개 세션 모두 null
+	body := []byte(`{"result":{"today":{"date":"2026-07-03","dayMarket":null,"preMarket":null,"regularMarket":null,"afterMarket":null},"previousBusinessDay":{"date":"2026-07-02","dayMarket":{"startTime":"2026-07-02T09:00:00+09:00","endTime":"2026-07-02T16:50:00+09:00"},"preMarket":{"startTime":"2026-07-02T17:00:00+09:00","endTime":"2026-07-02T22:30:00+09:00"},"regularMarket":{"startTime":"2026-07-02T22:30:00+09:00","endTime":"2026-07-03T05:00:00+09:00"},"afterMarket":{"startTime":"2026-07-03T05:00:00+09:00","endTime":"2026-07-03T07:00:00+09:00"}},"nextBusinessDay":{"date":"2026-07-06","dayMarket":{"startTime":"2026-07-06T09:00:00+09:00","endTime":"2026-07-06T16:50:00+09:00"},"preMarket":{"startTime":"2026-07-06T17:00:00+09:00","endTime":"2026-07-06T22:30:00+09:00"},"regularMarket":{"startTime":"2026-07-06T22:30:00+09:00","endTime":"2026-07-07T05:00:00+09:00"},"afterMarket":{"startTime":"2026-07-07T05:00:00+09:00","endTime":"2026-07-07T07:00:00+09:00"}}}}`)
+	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/market-calendar/US"}, 200, body)
+	defer done()
+	cal, err := New(hc).USMarketCalendar(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	td := cal.Today
+	if td.Date == "" || td.DayMarket != nil || td.PreMarket != nil || td.RegularMarket != nil || td.AfterMarket != nil {
+		t.Errorf("today = %+v", td)
+	}
+	if cal.NextBusinessDay.RegularMarket == nil {
+		t.Errorf("next business day must have sessions: %+v", cal.NextBusinessDay)
 	}
 }
