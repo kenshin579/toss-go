@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/kenshin579/toss-go/asset"
+	"github.com/kenshin579/toss-go/conditionalorder"
 	"github.com/kenshin579/toss-go/internal/fetch"
 	"github.com/kenshin579/toss-go/order"
 )
@@ -14,8 +15,9 @@ import (
 type AccountScope struct {
 	accountSeq int64
 
-	Asset *asset.Client // 자산: 보유 주식
-	Order *order.Client // 주문: 생성·정정·취소·조회·주문 정보
+	Asset            *asset.Client            // 자산: 보유 주식
+	Order            *order.Client            // 주문: 생성·정정·취소·조회·주문 정보
+	ConditionalOrder *conditionalorder.Client // 조건주문: 생성·수정·취소·조회
 }
 
 // AccountSeq 는 이 스코프가 고정된 계좌 일련번호를 돌려준다. 생성 후 바뀌지 않는다.
@@ -30,9 +32,10 @@ func (a *AccountScope) AccountSeq() int64 { return a.accountSeq }
 //	h, _ := a.Asset.Holdings(ctx, nil)
 func (c *Client) Account(accountSeq int64) *AccountScope {
 	return &AccountScope{
-		accountSeq: accountSeq,
-		Asset:      asset.New(c.http, accountSeq),
-		Order:      order.New(c.http, accountSeq),
+		accountSeq:       accountSeq,
+		Asset:            asset.New(c.http, accountSeq),
+		Order:            order.New(c.http, accountSeq),
+		ConditionalOrder: conditionalorder.New(c.http, accountSeq),
 	}
 }
 

@@ -2323,6 +2323,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"sync/atomic"
 	"testing"
 
 	"github.com/shopspring/decimal"
@@ -2388,6 +2389,33 @@ func TestList_RequiresStatus(t *testing.T) {
 func TestGet_RequiresID(t *testing.T) {
 	if _, err := New(nil, 4).Get(context.Background(), ""); err == nil {
 		t.Error("want error")
+	}
+}
+
+func TestZeroAccountSeq(t *testing.T) {
+	// http 는 nil — 검증을 통과해 실제로 요청을 보내려 하면 nil pointer dereference 로 즉시 드러난다.
+	c := New(nil, 0)
+	ctx := context.Background()
+	ok := Condition{OrderSide: SideSell, TriggerPrice: d("1")}
+	if _, err := c.List(ctx, ListParams{Status: StatusFilterOpen}); err == nil {
+		t.Error("List: want error for accountSeq=0")
+	}
+	if _, err := c.Get(ctx, "c-1"); err == nil {
+		t.Error("Get: want error for accountSeq=0")
+	}
+	if _, err := c.Place(ctx, PlaceRequest{Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok}); err == nil {
+		t.Error("Place: want error for accountSeq=0")
+	}
+	if _, err := c.Modify(ctx, "c-1", ModifyRequest{Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok}); err == nil {
+		t.Error("Modify: want error for accountSeq=0")
+	}
+	if err := c.Cancel(ctx, "c-1"); err == nil {
+		t.Error("Cancel: want error for accountSeq=0")
+	}
+
+	cNeg := New(nil, -1)
+	if err := cNeg.Cancel(ctx, "c-1"); err == nil {
+		t.Error("Cancel: want error for accountSeq=-1")
 	}
 }
 
@@ -2467,13 +2495,13 @@ func TestPlace_Validation(t *testing.T) {
 	ctx := context.Background()
 	ok := Condition{OrderSide: SideSell, TriggerPrice: d("1")}
 	cases := map[string]PlaceRequest{
-		"empty symbol":  {Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
-		"empty type":    {Symbol: "005930", Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
-		"zero quantity": {Symbol: "005930", Type: TypeSingle, OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
+		"empty symbol":    {Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
+		"empty type":      {Symbol: "005930", Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
+		"zero quantity":   {Symbol: "005930", Type: TypeSingle, OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok},
 		"empty orderType": {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), ExpireDate: "2026-12-31", First: ok},
-		"empty expire":  {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, First: ok},
-		"no first side": {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: Condition{TriggerPrice: d("1")}},
-		"no trigger":    {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: Condition{OrderSide: SideSell}},
+		"empty expire":    {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, First: ok},
+		"no first side":   {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: Condition{TriggerPrice: d("1")}},
+		"no trigger":      {Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: Condition{OrderSide: SideSell}},
 	}
 	for name, r := range cases {
 		if _, err := c.Place(ctx, r); err == nil {
@@ -2509,6 +2537,45 @@ func TestCancel_NoContent(t *testing.T) {
 func TestCancel_RequiresID(t *testing.T) {
 	if err := New(nil, 4).Cancel(context.Background(), ""); err == nil {
 		t.Error("want error")
+	}
+}
+
+// countingUnauthorized 는 항상 401 invalid-token 을 돌려주며 요청 수를 센다.
+func countingUnauthorized(t *testing.T) (*Client, *int32, func()) {
+	t.Helper()
+	var n int32
+	hc, done := testutil.NewServerFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&n, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(401)
+		_, _ = w.Write([]byte(`{"error":{"requestId":"r","code":"invalid-token","message":""}}`))
+	})
+	return New(hc, 4), &n, done
+}
+
+func TestWrites_WithoutKeyAreNeverRetried(t *testing.T) {
+	// 멱등성 키 없는 쓰기는 401 이어도 절대 재전송되지 않는다 — 중복 조건주문 방지의 핵심 불변식
+	ctx := context.Background()
+	ok := Condition{OrderSide: SideSell, TriggerPrice: d("1")}
+	for name, call := range map[string]func(c *Client) error{
+		"Place": func(c *Client) error {
+			_, err := c.Place(ctx, PlaceRequest{Symbol: "005930", Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok})
+			return err
+		},
+		"Modify": func(c *Client) error {
+			_, err := c.Modify(ctx, "c-1", ModifyRequest{Type: TypeSingle, Quantity: d("1"), OrderType: OrderTypeMarket, ExpireDate: "2026-12-31", First: ok})
+			return err
+		},
+		"Cancel": func(c *Client) error { return c.Cancel(ctx, "c-1") },
+	} {
+		c, n, done := countingUnauthorized(t)
+		if err := call(c); err == nil {
+			t.Errorf("%s: want error", name)
+		}
+		if got := atomic.LoadInt32(n); got != 1 {
+			t.Errorf("%s: %d requests, want exactly 1 (재시도 금지)", name, got)
+		}
+		done()
 	}
 }
 EOF
@@ -2576,15 +2643,16 @@ const (
 	SideSell Side = "SELL"
 )
 
-// Status 는 조건주문 전체 상태.
+// Status 는 조건주문 전체 상태 — 살아있는 조건(leg)의 상태를 대표로 따른다.
+// leg 전용 상태인 HOLDING/CANCELED 는 최상위 status 로는 내려오지 않는다.
 type Status string
 
 const (
 	StatusWatching  Status = "WATCHING"  // 조건 감시 중
 	StatusPaused    Status = "PAUSED"    // 일시 중지
-	StatusOrdering  Status = "ORDERING"  // 주문 접수 중
-	StatusOrdered   Status = "ORDERED"   // 주문 접수 완료
-	StatusCompleted Status = "COMPLETED" // 종료
+	StatusOrdering  Status = "ORDERING"  // 조건 충족 — 주문 생성 진행 중
+	StatusOrdered   Status = "ORDERED"   // 주문 생성됨
+	StatusCompleted Status = "COMPLETED" // 완료
 	StatusExpired   Status = "EXPIRED"   // 만료
 )
 
@@ -2592,55 +2660,57 @@ const (
 type StatusFilter string
 
 const (
-	StatusFilterOpen   StatusFilter = "OPEN"
+	// StatusFilterOpen 은 진행 중 — WATCHING, PAUSED, ORDERING, ORDERED.
+	StatusFilterOpen StatusFilter = "OPEN"
+	// StatusFilterClosed 는 종료 — COMPLETED, EXPIRED.
 	StatusFilterClosed StatusFilter = "CLOSED"
 )
 
-// ConditionType 은 개별 조건의 종류.
+// ConditionType 은 개별 조건(leg)의 종류. 그룹(OCO/OTO)의 first/second 는 항상 같은 타입이다.
 type ConditionType string
 
 const (
-	ConditionStop       ConditionType = "STOP"        // 지정 가격 도달
-	ConditionProfitRate ConditionType = "PROFIT_RATE" // 목표 수익률 도달
+	ConditionStop       ConditionType = "STOP"        // 가격 트리거
+	ConditionProfitRate ConditionType = "PROFIT_RATE" // 목표 수익률(%) 트리거
 )
 
-// ConditionStatus 는 개별 조건의 상태.
+// ConditionStatus 는 개별 조건(leg)의 상태.
 type ConditionStatus string
 
 const (
 	ConditionWatching  ConditionStatus = "WATCHING"
-	ConditionHolding   ConditionStatus = "HOLDING" // OTO 에서 아직 활성화되지 않음
+	ConditionHolding   ConditionStatus = "HOLDING" // 선행 조건(OTO first) 체결 전 대기(leg 전용)
 	ConditionPaused    ConditionStatus = "PAUSED"
 	ConditionOrdering  ConditionStatus = "ORDERING"
 	ConditionOrdered   ConditionStatus = "ORDERED"
 	ConditionCompleted ConditionStatus = "COMPLETED"
 	ConditionExpired   ConditionStatus = "EXPIRED"
-	ConditionCanceled  ConditionStatus = "CANCELED"
+	ConditionCanceled  ConditionStatus = "CANCELED" // 완료된 OCO 에서 자동취소된 반대편 조건(leg 전용)
 )
 
-// ConditionDetail 은 조회 응답의 개별 조건.
+// ConditionDetail 은 조회 응답의 개별 조건(leg).
 type ConditionDetail struct {
 	Type             ConditionType    `json:"type"`
 	Status           ConditionStatus  `json:"status"`
 	TriggerPrice     *decimal.Decimal `json:"triggerPrice"`     // STOP 조건에만
-	TargetProfitRate *decimal.Decimal `json:"targetProfitRate"` // PROFIT_RATE 조건에만(소수 비율)
-	OrderPrice       *decimal.Decimal `json:"orderPrice"`       // LIMIT 일 때 발동 주문 가격
+	TargetProfitRate *decimal.Decimal `json:"targetProfitRate"` // PROFIT_RATE 조건에만. 퍼센트 단위(10.5 = +10.5%)
+	OrderPrice       *decimal.Decimal `json:"orderPrice"`       // 그룹 orderType 이 LIMIT 일 때 발동 주문 가격. MARKET 이면 nil
 	TriggeredOrderID *string          `json:"triggeredOrderId"` // 발동해서 생성된 주문 id. 미발동이면 nil
 }
 
 // Detail 은 조건주문 1건. 목록·상세가 같은 스키마를 쓴다.
 type Detail struct {
-	ConditionalOrderID string           `json:"conditionalOrderId"`
-	Type               Type             `json:"type"`
-	Status             Status           `json:"status"`
-	Symbol             string           `json:"symbol"`
-	Market             string           `json:"market"` // KR / US
-	Quantity           decimal.Decimal  `json:"quantity"`
-	OrderType          OrderType        `json:"orderType"`
-	ExpireDate         *tosstypes.Date  `json:"expireDate"`
-	First              ConditionDetail  `json:"first"`
-	Second             *ConditionDetail `json:"second"` // SINGLE 이면 nil
-	CreatedAt          time.Time        `json:"createdAt"`
+	ConditionalOrderID string                  `json:"conditionalOrderId"`
+	Type               Type                    `json:"type"`
+	Status             Status                  `json:"status"`
+	Symbol             string                  `json:"symbol"`
+	Market             tosstypes.MarketCountry `json:"market"` // KR / US
+	Quantity           decimal.Decimal         `json:"quantity"`
+	OrderType          OrderType               `json:"orderType"`
+	ExpireDate         *tosstypes.Date         `json:"expireDate"`
+	First              ConditionDetail         `json:"first"`
+	Second             *ConditionDetail        `json:"second"` // SINGLE 이면 nil
+	CreatedAt          time.Time               `json:"createdAt"`
 }
 
 // Page 는 조건주문 목록 한 페이지.
@@ -2653,7 +2723,7 @@ type Page struct {
 // PlaceResult 는 조건주문 생성 결과.
 type PlaceResult struct {
 	ConditionalOrderID string  `json:"conditionalOrderId"`
-	ClientOrderID      *string `json:"clientOrderId"`
+	ClientOrderID      *string `json:"clientOrderId"` // 요청에 넣었을 때만 설정
 }
 
 // Result 는 조건주문 수정 결과.
@@ -2677,6 +2747,26 @@ import (
 	"github.com/kenshin579/toss-go/internal/params"
 	"github.com/kenshin579/toss-go/tosstypes"
 )
+
+// maxClientOrderIDLen 검증은 루트 toss 패키지와 중복을 피하려고(순환 임포트 방지) 여기서 최소 규칙만 확인한다.
+const maxClientOrderIDLen = 36
+
+func validateKey(id string) error {
+	if id == "" {
+		return nil // 멱등성 미적용
+	}
+	if len(id) > maxClientOrderIDLen {
+		return errors.New("toss: clientOrderId too long (max 36)")
+	}
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return errors.New("toss: invalid clientOrderId (allowed: A-Z a-z 0-9 - _)")
+		}
+	}
+	return nil
+}
 
 // Condition 은 생성·수정 요청의 조건 1개.
 type Condition struct {
@@ -2735,6 +2825,7 @@ type placeBody struct {
 }
 
 // ModifyRequest 는 조건주문 수정 요청. 생성과 같은 필드를 쓰되 clientOrderId 는 받지 않는다.
+// 수정은 기존 조건주문을 취소하고 새로 생성하는 방식으로 동작해 응답에 새 conditionalOrderId 가 온다.
 type ModifyRequest struct {
 	Type             Type
 	Quantity         decimal.Decimal
@@ -2775,9 +2866,17 @@ func validateCommon(symbol string, typ Type, qty decimal.Decimal, ot OrderType, 
 }
 
 // Place 는 조건주문을 생성한다(POST /api/v1/conditional-orders).
-// 대표 에러: invalid-order-side, invalid-trigger-price, invalid-tick-size, stock-restricted.
+//
+// 대표 에러: invalid-request(orderSide·triggerPrice·orderPrice 형식 오류, 호가단위 불일치 등),
+// stock-not-found.
 func (c *Client) Place(ctx context.Context, r PlaceRequest) (*PlaceResult, error) {
+	if err := params.AccountSeq(c.accountSeq); err != nil {
+		return nil, err
+	}
 	if err := validateCommon(r.Symbol, r.Type, r.Quantity, r.OrderType, r.ExpireDate, r.First); err != nil {
+		return nil, err
+	}
+	if err := validateKey(r.ClientOrderID); err != nil {
 		return nil, err
 	}
 	body := placeBody{
@@ -2797,7 +2896,12 @@ func (c *Client) Place(ctx context.Context, r PlaceRequest) (*PlaceResult, error
 
 // Modify 는 조건주문을 수정한다(POST /api/v1/conditional-orders/{id}/modify).
 // 멱등성 키를 받지 않으므로 401 재시도를 하지 않는다.
+//
+// 대표 에러: invalid-request(호가단위 불일치 등), conditional-order-not-found.
 func (c *Client) Modify(ctx context.Context, id string, r ModifyRequest) (*Result, error) {
+	if err := params.AccountSeq(c.accountSeq); err != nil {
+		return nil, err
+	}
 	if err := params.Require("conditionalOrderId", id); err != nil {
 		return nil, err
 	}
@@ -2831,8 +2935,13 @@ func (c *Client) Modify(ctx context.Context, id string, r ModifyRequest) (*Resul
 }
 
 // Cancel 은 조건주문을 취소한다(DELETE /api/v1/conditional-orders/{id}). 성공 시 본문이 없다(204).
+// 취소는 멱등성 키를 받지 않으므로 401 재시도를 하지 않는다.
+//
 // 대표 에러: conditional-order-not-found.
 func (c *Client) Cancel(ctx context.Context, id string) error {
+	if err := params.AccountSeq(c.accountSeq); err != nil {
+		return err
+	}
 	if err := params.Require("conditionalOrderId", id); err != nil {
 		return err
 	}
@@ -2859,7 +2968,13 @@ type ListParams struct {
 }
 
 // List 는 조건주문 목록을 조회한다(GET /api/v1/conditional-orders).
+// 이 API 로 등록한 조건주문뿐 아니라 다른 채널(토스증권 앱 등)에서 등록한 것도 함께 반환된다.
+//
+// 대표 에러: invalid-request(잘못된 status).
 func (c *Client) List(ctx context.Context, p ListParams) (*Page, error) {
+	if err := params.AccountSeq(c.accountSeq); err != nil {
+		return nil, err
+	}
 	if err := params.Require("status", string(p.Status)); err != nil {
 		return nil, err
 	}
@@ -2875,9 +2990,14 @@ func (c *Client) List(ctx context.Context, p ListParams) (*Page, error) {
 	return fetch.One[Page](ctx, c.http, "/api/v1/conditional-orders", q, c.accountSeq)
 }
 
-// Get 은 조건주문 상세를 조회한다(GET /api/v1/conditional-orders/{id}).
-// 없으면 404 conditional-order-not-found.
+// Get 은 조건주문 상세를 조회한다(GET /api/v1/conditional-orders/{id}). 진행 중 + 종료된 조건주문을
+// 모두 조회할 수 있다.
+//
+// 대표 에러: conditional-order-not-found.
 func (c *Client) Get(ctx context.Context, id string) (*Detail, error) {
+	if err := params.AccountSeq(c.accountSeq); err != nil {
+		return nil, err
+	}
 	if err := params.Require("conditionalOrderId", id); err != nil {
 		return nil, err
 	}
@@ -2891,7 +3011,7 @@ EOF
 ```bash
 gofmt -w . && go vet ./... && go test ./conditionalorder/ . -race -v 2>&1 | grep -cE '^--- PASS'
 ```
-Expected: conditionalorder 10 + 루트 11 = `21` (실행 결과로 확인, 모두 PASS 인지만 본다).
+Expected: conditionalorder 12(`TestZeroAccountSeq`·`TestWrites_WithoutKeyAreNeverRetried` 포함) + 루트 13 = `25` (실행 결과로 확인, 모두 PASS 인지만 본다).
 
 - [ ] **Step 3: 커밋**
 
