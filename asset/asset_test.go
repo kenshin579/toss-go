@@ -13,7 +13,7 @@ func TestHoldings(t *testing.T) {
 	// fixture = openapi 예시(withHoldings)
 	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/holdings"}, "5", 200, testutil.Fixture(t, "holdings.json"))
 	defer done()
-	h, err := New(hc, 5).Holdings(context.Background(), nil)
+	h, err := New(hc, 5).Holdings(context.Background(), HoldingsParams{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestHoldings(t *testing.T) {
 func TestHoldings_Empty(t *testing.T) {
 	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/holdings"}, "5", 200, testutil.Fixture(t, "holdings_empty.json"))
 	defer done()
-	h, err := New(hc, 5).Holdings(context.Background(), nil)
+	h, err := New(hc, 5).Holdings(context.Background(), HoldingsParams{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,13 +66,13 @@ func TestHoldings_Empty(t *testing.T) {
 func TestHoldings_SymbolFilter(t *testing.T) {
 	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/holdings", Query: url.Values{"symbol": {"005930"}}}, "5", 200, testutil.Fixture(t, "holdings.json"))
 	defer done()
-	if _, err := New(hc, 5).Holdings(context.Background(), &HoldingsParams{Symbol: "005930"}); err != nil {
+	if _, err := New(hc, 5).Holdings(context.Background(), HoldingsParams{Symbol: "005930"}); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestHoldings_InvalidSymbol(t *testing.T) {
-	if _, err := New(nil, 5).Holdings(context.Background(), &HoldingsParams{Symbol: "삼성"}); err == nil {
+	if _, err := New(nil, 5).Holdings(context.Background(), HoldingsParams{Symbol: "삼성"}); err == nil {
 		t.Error("want validation error")
 	}
 }
@@ -81,7 +81,7 @@ func TestHoldings_NullableTax(t *testing.T) {
 	// fixture = openapi 예시(filteredByUsSymbol): 미국 종목은 매도 세금이 없어 cost.tax 가 null
 	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/holdings", Query: url.Values{"symbol": {"AAPL"}}}, "5", 200, testutil.Fixture(t, "holdings_us.json"))
 	defer done()
-	h, err := New(hc, 5).Holdings(context.Background(), &HoldingsParams{Symbol: "AAPL"})
+	h, err := New(hc, 5).Holdings(context.Background(), HoldingsParams{Symbol: "AAPL"})
 	if err != nil {
 		t.Fatal(err)
 	}

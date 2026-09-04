@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"regexp"
-	"strings"
 )
 
 // MaxClientOrderIDLen 은 clientOrderId 최대 길이(토스 규칙).
@@ -18,6 +17,9 @@ var clientOrderIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 // 주문 생성/조건주문 생성에 이 값을 넣으면 (1) 같은 값으로 재요청할 때 토스가 이전 주문 결과를
 // 그대로 돌려주고(10분 유효), (2) SDK 가 401 토큰 오류에 요청을 1회 재시도한다.
 // 키가 없으면 SDK 는 쓰기 요청을 재시도하지 않는다 — 중복 주문을 만들지 않기 위해서다.
+//
+// crypto/rand 가 실패하면 panic 한다(Go 1.24+ 에서는 발생하지 않는다). 약한 난수로 대체하면
+// 키가 충돌해 서로 다른 주문이 하나로 합쳐질 수 있어 실패를 감추지 않는다.
 func NewClientOrderID() string {
 	var b [24]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -31,11 +33,11 @@ func ValidateClientOrderID(id string) error {
 	if id == "" {
 		return fmt.Errorf("toss: clientOrderId must not be empty")
 	}
+	if !clientOrderIDPattern.MatchString(id) {
+		return fmt.Errorf("toss: invalid clientOrderId %q (allowed: A-Z a-z 0-9 - _)", id)
+	}
 	if len(id) > MaxClientOrderIDLen {
 		return fmt.Errorf("toss: clientOrderId too long: %d chars (max %d)", len(id), MaxClientOrderIDLen)
-	}
-	if !clientOrderIDPattern.MatchString(id) {
-		return fmt.Errorf("toss: invalid clientOrderId %q (allowed: A-Z a-z 0-9 - _)", strings.TrimSpace(id))
 	}
 	return nil
 }

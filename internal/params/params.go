@@ -64,6 +64,15 @@ func Symbols(symbols []string) (string, error) { return joinSymbols(symbols, Sym
 // IndicatorSymbols 는 시장 지표 symbols= 쿼리 값을 만든다(규칙은 IndicatorSymbol).
 func IndicatorSymbols(symbols []string) (string, error) { return joinSymbols(symbols, IndicatorSymbol) }
 
+// AccountSeq 는 계좌 일련번호가 유효한지 검증한다. 0 이하면 계좌 헤더가 실리지 않아
+// 서버가 account-header-required 를 돌려주므로 요청 전에 실패시킨다.
+func AccountSeq(seq int64) error {
+	if seq <= 0 {
+		return fmt.Errorf("toss: accountSeq must be positive (got %d) — Accounts 로 조회한 값을 사용한다", seq)
+	}
+	return nil
+}
+
 // Str 은 s 가 비어 있지 않으면 설정한다.
 func Str(v url.Values, key, s string) {
 	if s != "" {

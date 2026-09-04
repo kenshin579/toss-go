@@ -43,7 +43,7 @@ v0.1.0 은 조회 21 ops 만 담았다. 본 스펙은 **실제 돈이 오가는 
   조건 상태 8종(+HOLDING, CANCELED), 조건 유형 2종(STOP, PROFIT_RATE), 조건주문 유형 3종(SINGLE, OCO, OTO).
 - **페이지네이션**: 주문/조건주문 목록은 `cursor` + `hasNext` + `nextCursor`(조회 21 ops 의
   `nextBefore`/`nextUntil` 과 다른 세 번째 방식).
-- **에러 코드**: 주문 생성만 28종(`insufficient-buying-power`, `outside-order-hours`,
+- **에러 코드**: 주문 생성만 28종(`insufficient-buying-power`, `order-hours-closed`,
   `invalid-tick-size`, `price-out-of-range`, `stock-restricted`, `max-order-amount-exceeded`,
   `opposite-pending-order-exists`, `idempotency-key-conflict`, `request-in-progress` 등),
   정정 21종, 취소 7종. 대부분 상태 의존이라 사전 검증이 불가능하고 **문서화가 유일한 방어**다.
@@ -95,7 +95,7 @@ c, _ := toss.NewClientFromEnv()
 accts, _ := c.Accounts(ctx)                 // 헤더 불필요
 a := c.Account(accts[0].AccountSeq)         // 네트워크 호출 없음, 헤더 고정
 
-h, _ := a.Asset.Holdings(ctx, &asset.HoldingsParams{Symbol: "005930"})
+h, _ := a.Asset.Holdings(ctx, asset.HoldingsParams{Symbol: "005930"})
 bp, _ := a.Order.BuyingPower(ctx, tosstypes.CurrencyKRW)
 
 res, err := a.Order.Place(ctx, order.Request{
@@ -114,6 +114,7 @@ type AccountScope struct {
     Asset            *asset.Client
     Order            *order.Client
     ConditionalOrder *conditionalorder.Client
+    // accountSeq 는 불변이며 AccountSeq() 로만 읽는다.
 }
 
 func (c *Client) Account(accountSeq int64) *AccountScope // 네트워크 호출 없음
@@ -163,7 +164,7 @@ func Send(ctx, hc, method, path string, q url.Values, body any, accountSeq int64
 | 패키지 | 메서드 | HTTP |
 |---|---|---|
 | 루트 | `Accounts(ctx) ([]Account, error)` | GET /accounts |
-| asset | `Holdings(ctx, *HoldingsParams) (*Holdings, error)` — nil 이면 전체 | GET /holdings |
+| asset | `Holdings(ctx, HoldingsParams) (*Holdings, error)` — zero value 면 전체 | GET /holdings |
 | order | `Place(ctx, Request) (*PlaceResult, error)` | POST /orders |
 | order | `PlaceAmount(ctx, AmountRequest) (*PlaceResult, error)` | POST /orders |
 | order | `Modify(ctx, orderID string, ModifyRequest) (*OperationResult, error)` | POST /orders/{id}/modify |
@@ -220,10 +221,10 @@ type AmountRequest struct {
 
 - 기존 `*toss.APIError` 와 `toss.IsCode` 를 그대로 쓴다. 새 타입 없음.
 - 각 메서드 godoc 에 **대표 에러 코드**를 적는다(전수 나열 금지, 상위 5~7개):
-  - `Place`: insufficient-buying-power, outside-order-hours, invalid-tick-size, price-out-of-range,
+  - `Place`: insufficient-buying-power, order-hours-closed, invalid-tick-size, price-out-of-range,
     stock-restricted, confirm-high-value-required, request-in-progress
   - `Modify`/`Cancel`: already-filled, already-canceled, already-modified, already-processing,
-    order-not-found, modify-restricted/cancel-restricted, outside-order-hours
+    order-not-found, modify-restricted/cancel-restricted, order-hours-closed
   - 공통: account-header-required, account-not-found
 - 자주 쓰는 코드는 `toss` 루트에 상수로 노출한다(`toss.CodeInsufficientBuyingPower` 등 8개 내외).
   unknown 코드 허용 원칙은 유지 — 상수는 편의일 뿐 검증 수단이 아니다.

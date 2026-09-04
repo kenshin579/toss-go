@@ -742,7 +742,10 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+
+	"github.com/kenshin579/toss-go/asset"
 )
 
 // 계좌 목록은 헤더 없이, 스코프 호출은 헤더와 함께 나가는지 end-to-end 로 확인한다.
@@ -785,9 +788,56 @@ func TestAccountsAndScope(t *testing.T) {
 	if scope.Asset == nil {
 		t.Fatal("scope.Asset is nil")
 	}
-	if _, err := scope.Asset.Holdings(ctx, nil); err != nil {
+	if _, err := scope.Asset.Holdings(ctx, asset.HoldingsParams{}); err != nil {
 		t.Fatalf("Holdings: %v", err)
 	}
+}
+
+func TestAccount_ZeroSeqIsRejected(t *testing.T) {
+	// accountSeq 0 은 httpclient 가 헤더를 생략해 서버가 account-header-required 를 돌려준다.
+	// 요청 전에 실패시키는 편이 원인을 명확히 한다.
+	c, err := NewClient("i", "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Account(0).Asset.Holdings(context.Background(), asset.HoldingsParams{}); err == nil {
+		t.Error("Account(0) 사용 시 에러를 기대")
+	}
+	if _, err := c.Account(-1).Asset.Holdings(context.Background(), asset.HoldingsParams{}); err == nil {
+		t.Error("음수 accountSeq 사용 시 에러를 기대")
+	}
+}
+
+func TestAccountScope_ConcurrentUse(t *testing.T) {
+	// AccountScope 는 여러 goroutine 에서 동시 사용해도 안전해야 한다(문서화된 약속).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/oauth2/token" {
+			_, _ = w.Write([]byte(`{"access_token":"T","token_type":"Bearer","expires_in":3600}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"result":{"totalPurchaseAmount":{"krw":"1"},"marketValue":{"amount":{"krw":"1"},"amountAfterCost":{"krw":"1"}},"profitLoss":{"amount":{"krw":"0"},"amountAfterCost":{"krw":"0"},"rate":"0","rateAfterCost":"0"},"dailyProfitLoss":{"amount":{"krw":"0"},"rate":"0"},"items":[]}}`))
+	}))
+	defer srv.Close()
+	c, err := NewClient("i", "s", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := c.Account(7)
+	if scope.AccountSeq() != 7 {
+		t.Errorf("AccountSeq() = %d", scope.AccountSeq())
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := scope.Asset.Holdings(context.Background(), asset.HoldingsParams{}); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
 }
 EOF
 cat > asset/asset_test.go << 'EOF'
@@ -806,7 +856,7 @@ func TestHoldings(t *testing.T) {
 	// fixture = openapi 예시(withHoldings)
 	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/holdings"}, "5", 200, testutil.Fixture(t, "holdings.json"))
 	defer done()
-	h, err := New(hc, 5).Holdings(context.Background(), nil)
+	h, err := New(hc, 5).Holdings(context.Background(), HoldingsParams{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -847,7 +897,7 @@ func TestHoldings(t *testing.T) {
 func TestHoldings_Empty(t *testing.T) {
 	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/holdings"}, "5", 200, testutil.Fixture(t, "holdings_empty.json"))
 	defer done()
-	h, err := New(hc, 5).Holdings(context.Background(), nil)
+	h, err := New(hc, 5).Holdings(context.Background(), HoldingsParams{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -859,13 +909,13 @@ func TestHoldings_Empty(t *testing.T) {
 func TestHoldings_SymbolFilter(t *testing.T) {
 	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/holdings", Query: url.Values{"symbol": {"005930"}}}, "5", 200, testutil.Fixture(t, "holdings.json"))
 	defer done()
-	if _, err := New(hc, 5).Holdings(context.Background(), &HoldingsParams{Symbol: "005930"}); err != nil {
+	if _, err := New(hc, 5).Holdings(context.Background(), HoldingsParams{Symbol: "005930"}); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestHoldings_InvalidSymbol(t *testing.T) {
-	if _, err := New(nil, 5).Holdings(context.Background(), &HoldingsParams{Symbol: "삼성"}); err == nil {
+	if _, err := New(nil, 5).Holdings(context.Background(), HoldingsParams{Symbol: "삼성"}); err == nil {
 		t.Error("want validation error")
 	}
 }
@@ -874,7 +924,7 @@ func TestHoldings_NullableTax(t *testing.T) {
 	// fixture = openapi 예시(filteredByUsSymbol): 미국 종목은 매도 세금이 없어 cost.tax 가 null
 	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/holdings", Query: url.Values{"symbol": {"AAPL"}}}, "5", 200, testutil.Fixture(t, "holdings_us.json"))
 	defer done()
-	h, err := New(hc, 5).Holdings(context.Background(), &HoldingsParams{Symbol: "AAPL"})
+	h, err := New(hc, 5).Holdings(context.Background(), HoldingsParams{Symbol: "AAPL"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -901,7 +951,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"regexp"
-	"strings"
 )
 
 // MaxClientOrderIDLen 은 clientOrderId 최대 길이(토스 규칙).
@@ -914,6 +963,9 @@ var clientOrderIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 // 주문 생성/조건주문 생성에 이 값을 넣으면 (1) 같은 값으로 재요청할 때 토스가 이전 주문 결과를
 // 그대로 돌려주고(10분 유효), (2) SDK 가 401 토큰 오류에 요청을 1회 재시도한다.
 // 키가 없으면 SDK 는 쓰기 요청을 재시도하지 않는다 — 중복 주문을 만들지 않기 위해서다.
+//
+// crypto/rand 가 실패하면 panic 한다(Go 1.24+ 에서는 발생하지 않는다). 약한 난수로 대체하면
+// 키가 충돌해 서로 다른 주문이 하나로 합쳐질 수 있어 실패를 감추지 않는다.
 func NewClientOrderID() string {
 	var b [24]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -927,11 +979,11 @@ func ValidateClientOrderID(id string) error {
 	if id == "" {
 		return fmt.Errorf("toss: clientOrderId must not be empty")
 	}
+	if !clientOrderIDPattern.MatchString(id) {
+		return fmt.Errorf("toss: invalid clientOrderId %q (allowed: A-Z a-z 0-9 - _)", id)
+	}
 	if len(id) > MaxClientOrderIDLen {
 		return fmt.Errorf("toss: clientOrderId too long: %d chars (max %d)", len(id), MaxClientOrderIDLen)
-	}
-	if !clientOrderIDPattern.MatchString(id) {
-		return fmt.Errorf("toss: invalid clientOrderId %q (allowed: A-Z a-z 0-9 - _)", strings.TrimSpace(id))
 	}
 	return nil
 }
@@ -973,20 +1025,24 @@ import (
 // 이 아래의 모든 요청에는 X-Tossinvest-Account 헤더가 자동으로 실린다.
 // 여러 goroutine 에서 동시에 사용해도 안전하다.
 type AccountScope struct {
-	AccountSeq int64
+	accountSeq int64
 
 	Asset *asset.Client // 자산: 보유 주식
 }
 
+// AccountSeq 는 이 스코프가 고정된 계좌 일련번호를 돌려준다. 생성 후 바뀌지 않는다.
+func (a *AccountScope) AccountSeq() int64 { return a.accountSeq }
+
 // Account 는 accountSeq 에 고정된 스코프를 만든다. 네트워크 호출은 없다.
-// accountSeq 는 Accounts 로 조회한다.
+// accountSeq 는 Accounts 로 조회한다. 0 이하를 넘기면 스코프의 모든 호출이 요청 전에 에러를 낸다
+// (계좌 헤더 없이 요청하면 서버가 account-header-required 를 돌려주므로 미리 막는다).
 //
 //	accts, _ := c.Accounts(ctx)
 //	a := c.Account(accts[0].AccountSeq)
 //	h, _ := a.Asset.Holdings(ctx, nil)
 func (c *Client) Account(accountSeq int64) *AccountScope {
 	return &AccountScope{
-		AccountSeq: accountSeq,
+		accountSeq: accountSeq,
 		Asset:      asset.New(c.http, accountSeq),
 	}
 }
@@ -1012,16 +1068,18 @@ package toss
 // 토스는 코드를 예고 없이 추가할 수 있으므로 이 목록은 편의일 뿐 전수가 아니다.
 // 알 수 없는 코드도 그대로 *APIError.Code 에 담긴다.
 const (
-	CodeAccountHeaderRequired     = "account-header-required"
-	CodeAccountNotFound           = "account-not-found"
-	CodeAlreadyCanceled           = "already-canceled"
-	CodeAlreadyFilled             = "already-filled"
-	CodeConfirmHighValueRequired  = "confirm-high-value-required"
-	CodeInsufficientBuyingPower   = "insufficient-buying-power"
-	CodeOrderNotFound             = "order-not-found"
-	CodeOutsideOrderHours         = "outside-order-hours"
-	CodePriceOutOfRange           = "price-out-of-range"
-	CodeStockRestricted           = "stock-restricted"
+	CodeAccountHeaderRequired    = "account-header-required"
+	CodeAccountNotFound          = "account-not-found"
+	CodeAlreadyCanceled          = "already-canceled"
+	CodeAlreadyFilled            = "already-filled"
+	CodeConfirmHighValueRequired = "confirm-high-value-required"
+	CodeInsufficientBuyingPower  = "insufficient-buying-power"
+	CodeOrderNotFound            = "order-not-found"
+	CodeOrderHoursClosed         = "order-hours-closed"
+	CodePriceOutOfRange          = "price-out-of-range"
+	CodeStockRestricted          = "stock-restricted"
+	CodeRateLimitExceeded        = "rate-limit-exceeded"
+	CodeIdempotencyKeyConflict   = "idempotency-key-conflict"
 )
 EOF
 mkdir -p asset && cat > asset/client.go << 'EOF'
@@ -1138,11 +1196,14 @@ type HoldingsParams struct {
 	Symbol string // 특정 종목만 조회. 비우면 전체
 }
 
-// Holdings 는 보유 주식을 조회한다(GET /api/v1/holdings). p 가 nil 이면 전체를 조회한다.
+// Holdings 는 보유 주식을 조회한다(GET /api/v1/holdings). 인자의 zero value 면 전체를 조회한다.
 // 보유하지 않은 종목을 지정하면 Items 가 빈 슬라이스로 돌아온다.
-func (c *Client) Holdings(ctx context.Context, p *HoldingsParams) (*Holdings, error) {
+func (c *Client) Holdings(ctx context.Context, p HoldingsParams) (*Holdings, error) {
+	if err := params.AccountSeq(c.accountSeq); err != nil {
+		return nil, err
+	}
 	q := url.Values{}
-	if p != nil && p.Symbol != "" {
+	if p.Symbol != "" {
 		if err := params.Symbol(p.Symbol); err != nil {
 			return nil, err
 		}
@@ -1706,7 +1767,7 @@ type placeBody struct {
 
 // Place 는 수량 기준 주문을 생성한다(POST /api/v1/orders).
 //
-// 대표 에러: insufficient-buying-power, outside-order-hours, invalid-tick-size, price-out-of-range,
+// 대표 에러: insufficient-buying-power, order-hours-closed, invalid-tick-size, price-out-of-range,
 // stock-restricted, confirm-high-value-required, request-in-progress.
 func (c *Client) Place(ctx context.Context, r Request) (*PlaceResult, error) {
 	if err := params.Symbol(r.Symbol); err != nil {
@@ -1819,7 +1880,7 @@ type modifyBody struct {
 // 정정은 멱등성 키를 받지 않으므로 401 재시도를 하지 않는다.
 //
 // 대표 에러: already-filled, already-canceled, already-modified, already-processing,
-// order-not-found, modify-restricted, outside-order-hours, us-modify-quantity-not-supported.
+// order-not-found, modify-restricted, order-hours-closed, us-modify-quantity-not-supported.
 func (c *Client) Modify(ctx context.Context, orderID string, r ModifyRequest) (*OperationResult, error) {
 	if err := params.Require("orderId", orderID); err != nil {
 		return nil, err
@@ -1841,7 +1902,7 @@ func (c *Client) Modify(ctx context.Context, orderID string, r ModifyRequest) (*
 // 취소는 멱등성 키를 받지 않으므로 401 재시도를 하지 않는다.
 //
 // 대표 에러: already-filled, already-canceled, already-processing, order-not-found,
-// cancel-restricted, outside-order-hours.
+// cancel-restricted, order-hours-closed.
 func (c *Client) Cancel(ctx context.Context, orderID string) (*OperationResult, error) {
 	if err := params.Require("orderId", orderID); err != nil {
 		return nil, err

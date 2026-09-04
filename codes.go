@@ -14,7 +14,9 @@ const (
 	CodeConfirmHighValueRequired = "confirm-high-value-required"
 	CodeInsufficientBuyingPower  = "insufficient-buying-power"
 	CodeOrderNotFound            = "order-not-found"
-	CodeOutsideOrderHours        = "outside-order-hours"
+	CodeOrderHoursClosed         = "order-hours-closed"
 	CodePriceOutOfRange          = "price-out-of-range"
 	CodeStockRestricted          = "stock-restricted"
+	CodeRateLimitExceeded        = "rate-limit-exceeded"
+	CodeIdempotencyKeyConflict   = "idempotency-key-conflict"
 )
