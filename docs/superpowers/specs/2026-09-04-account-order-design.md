@@ -95,7 +95,7 @@ c, _ := toss.NewClientFromEnv()
 accts, _ := c.Accounts(ctx)                 // 헤더 불필요
 a := c.Account(accts[0].AccountSeq)         // 네트워크 호출 없음, 헤더 고정
 
-h, _ := a.Asset.Holdings(ctx, asset.HoldingsParams{Symbol: "005930"})
+h, _ := a.Asset.Holdings(ctx, &asset.HoldingsParams{Symbol: "005930"})
 bp, _ := a.Order.BuyingPower(ctx, tosstypes.CurrencyKRW)
 
 res, err := a.Order.Place(ctx, order.Request{
@@ -163,7 +163,7 @@ func Send(ctx, hc, method, path string, q url.Values, body any, accountSeq int64
 | 패키지 | 메서드 | HTTP |
 |---|---|---|
 | 루트 | `Accounts(ctx) ([]Account, error)` | GET /accounts |
-| asset | `Holdings(ctx, HoldingsParams{Symbol}) (*Holdings, error)` | GET /holdings |
+| asset | `Holdings(ctx, *HoldingsParams) (*Holdings, error)` — nil 이면 전체 | GET /holdings |
 | order | `Place(ctx, Request) (*PlaceResult, error)` | POST /orders |
 | order | `PlaceAmount(ctx, AmountRequest) (*PlaceResult, error)` | POST /orders |
 | order | `Modify(ctx, orderID string, ModifyRequest) (*OperationResult, error)` | POST /orders/{id}/modify |

@@ -693,9 +693,9 @@ Expected: 전 패키지 `ok`.
 - [ ] **Step 1: fixture 추출**
 
 ```bash
-mkdir -p asset/testdata && jq '.paths."/api/v1/holdings".get.responses."200".content."application/json".examples.withHoldings.value' docs/api/openapi.json > asset/testdata/holdings.json && jq '.paths."/api/v1/holdings".get.responses."200".content."application/json".examples.emptyHoldings.value' docs/api/openapi.json > asset/testdata/holdings_empty.json && jq -c '.result | {n:(.items|length), krw:.totalPurchaseAmount.krw}' asset/testdata/holdings.json && jq -c '.result | {n:(.items|length)}' asset/testdata/holdings_empty.json
+mkdir -p asset/testdata && jq '.paths."/api/v1/holdings".get.responses."200".content."application/json".examples.withHoldings.value' docs/api/openapi.json > asset/testdata/holdings.json && jq '.paths."/api/v1/holdings".get.responses."200".content."application/json".examples.emptyHoldings.value' docs/api/openapi.json > asset/testdata/holdings_empty.json && jq '.paths."/api/v1/holdings".get.responses."200".content."application/json".examples.filteredByUsSymbol.value' docs/api/openapi.json > asset/testdata/holdings_us.json && jq -c '.result | {n:(.items|length), krw:.totalPurchaseAmount.krw}' asset/testdata/holdings.json && jq -c '.result | {n:(.items|length)}' asset/testdata/holdings_empty.json
 ```
-Expected: `{"n":1,"krw":"6500000"}` 와 `{"n":0}`.
+Expected: `{"n":2,"krw":"6500000"}` 와 `{"n":0}`. (fixture 는 `withHoldings` 예시에 KR+US 2건이 들어 있다; `docs/api/openapi.json` 의 예시 데이터가 계획 작성 시점 이후 갱신되었다.)
 
 - [ ] **Step 2: 실패 테스트 작성**
 
@@ -795,6 +795,7 @@ package asset
 
 import (
 	"context"
+	"net/url"
 	"testing"
 
 	"github.com/kenshin579/toss-go/internal/testutil"
@@ -815,7 +816,7 @@ func TestHoldings(t *testing.T) {
 	if h.MarketValue.Amount.KRW.String() != "7200000" || h.ProfitLoss.Rate.String() != "0.1179" || h.DailyProfitLoss.Rate.String() != "0.0141" {
 		t.Errorf("overview = %+v", h)
 	}
-	if len(h.Items) != 1 {
+	if len(h.Items) != 2 {
 		t.Fatalf("items = %d", len(h.Items))
 	}
 	it := h.Items[0]
@@ -830,6 +831,16 @@ func TestHoldings(t *testing.T) {
 	}
 	if it.Cost.Tax == nil || it.Cost.Tax.String() != "135600" {
 		t.Errorf("tax = %v", it.Cost.Tax)
+	}
+	us := h.Items[1]
+	if us.Symbol != "AAPL" || us.MarketCountry != tosstypes.MarketCountryUS || us.Currency != tosstypes.CurrencyUSD {
+		t.Errorf("us item = %+v", us)
+	}
+	if us.LastPrice.String() != "178.5" || us.MarketValue.AmountAfterCost.String() != "1771.43" {
+		t.Errorf("us decimals = %+v", us)
+	}
+	if us.Cost.Tax == nil {
+		t.Errorf("us tax must be present in this fixture: %+v", us.Cost)
 	}
 }
 
@@ -856,6 +867,22 @@ func TestHoldings_SymbolFilter(t *testing.T) {
 func TestHoldings_InvalidSymbol(t *testing.T) {
 	if _, err := New(nil, 5).Holdings(context.Background(), &HoldingsParams{Symbol: "삼성"}); err == nil {
 		t.Error("want validation error")
+	}
+}
+
+func TestHoldings_NullableTax(t *testing.T) {
+	// fixture = openapi 예시(filteredByUsSymbol): 미국 종목은 매도 세금이 없어 cost.tax 가 null
+	hc, done := testutil.NewServerWithHeader(t, testutil.Expect{Path: "/api/v1/holdings", Query: url.Values{"symbol": {"AAPL"}}}, "5", 200, testutil.Fixture(t, "holdings_us.json"))
+	defer done()
+	h, err := New(hc, 5).Holdings(context.Background(), &HoldingsParams{Symbol: "AAPL"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.Items) != 1 {
+		t.Fatalf("items = %d", len(h.Items))
+	}
+	if h.Items[0].Cost.Tax != nil {
+		t.Errorf("tax must be nil, got %v", h.Items[0].Cost.Tax)
 	}
 }
 EOF
