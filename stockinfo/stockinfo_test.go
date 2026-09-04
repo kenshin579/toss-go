@@ -48,6 +48,7 @@ func TestStocks(t *testing.T) {
 	}
 }
 
+// fixture = openapi 예시(kospi): 요청 파라미터와 무관하게 STOCK+ETF 2건
 func TestListStocks(t *testing.T) {
 	cs := true
 	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/stocks/all", Query: url.Values{
@@ -58,8 +59,11 @@ func TestListStocks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) == 0 || got[0].Symbol == "" || got[0].Name == "" || got[0].ISINCode == "" || got[0].SecurityType == "" {
-		t.Errorf("got = %+v", got)
+	if len(got) != 2 || got[0].Symbol != "005930" || got[0].Name != "삼성전자" || got[0].SecurityType != tosstypes.SecurityTypeStock || !got[0].IsCommonShare || got[0].ISINCode != "KR7005930003" {
+		t.Errorf("got[0] = %+v", got)
+	}
+	if got[1].Symbol != "069500" || got[1].SecurityType != tosstypes.SecurityTypeETF || got[1].ISINCode != "KR7069500007" {
+		t.Errorf("got[1] = %+v", got)
 	}
 }
 
@@ -147,6 +151,7 @@ func TestShortSelling(t *testing.T) {
 	}
 }
 
+// fixture = openapi 예시(daily): 2건, marginLoan/stockLoan 모두 존재
 func TestCreditTrades(t *testing.T) {
 	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/stocks/005930/credit-trades", Query: url.Values{"count": {"1"}}}, 200, testutil.Fixture(t, "credit_trades.json"))
 	defer done()
@@ -154,14 +159,22 @@ func TestCreditTrades(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Records) == 0 || page.Records[0].Date == "" || page.Records[0].UpdatedAt.IsZero() {
+	if page.NextUntil == nil || *page.NextUntil != "2026-07-14" || len(page.Records) != 2 {
 		t.Fatalf("page = %+v", page)
 	}
-	if ml := page.Records[0].MarginLoan; ml != nil && ml.BalanceQuantity.IsZero() && ml.NewQuantity.IsZero() {
-		t.Errorf("MarginLoan present but all zero: %+v", ml)
+	r := page.Records[0]
+	if r.Date != "2026-07-16" || r.UpdatedAt.IsZero() || r.MarginLoan == nil || r.StockLoan == nil {
+		t.Fatalf("r = %+v", r)
+	}
+	if r.MarginLoan.NewQuantity.String() != "125300" || r.MarginLoan.BalanceQuantity.String() != "2513400" || r.MarginLoan.BalanceRate.String() != "0.0042" || r.MarginLoan.TradingRate.String() != "0.09" {
+		t.Errorf("MarginLoan = %+v", r.MarginLoan)
+	}
+	if r.StockLoan.BalanceQuantity.String() != "45200" || r.StockLoan.TradingRate.String() != "0.0004" {
+		t.Errorf("StockLoan = %+v", r.StockLoan)
 	}
 }
 
+// fixture = openapi 예시(daily)
 func TestSecuritiesLending(t *testing.T) {
 	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/stocks/005930/securities-lending", Query: url.Values{"count": {"1"}}}, 200, testutil.Fixture(t, "securities_lending.json"))
 	defer done()
@@ -169,12 +182,17 @@ func TestSecuritiesLending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Records) == 0 || page.Records[0].BalanceQuantity.IsZero() {
-		t.Errorf("page = %+v", page)
+	if page.NextUntil == nil || len(page.Records) != 2 {
+		t.Fatalf("page = %+v", page)
+	}
+	r := page.Records[0]
+	if r.Date != "2026-07-17" || r.ExecutionQuantity.String() != "210500" || r.RepaymentQuantity.String() != "185300" || r.BalanceQuantity.String() != "15234000" || r.BalanceAmount.String() != "1218720000000" {
+		t.Errorf("r = %+v", r)
 	}
 }
 
-func TestTrend_SymbolEscaped(t *testing.T) {
+// params.Symbol 이 [A-Za-z0-9.-] 만 허용하므로 PathEscape 는 방어용 — '.' 이 경로에 그대로 남는지만 확인
+func TestTrend_DottedSymbolPath(t *testing.T) {
 	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/stocks/BRK.B/short-selling"}, 200, []byte(`{"result":{"nextUntil":null,"records":[]}}`))
 	defer done()
 	page, err := New(hc).ShortSelling(context.Background(), "BRK.B", TrendParams{})

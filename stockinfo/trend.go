@@ -21,8 +21,8 @@ type TrendParams struct {
 
 // TrendPage 는 매매동향 한 페이지. NextUntil 을 다음 요청의 Until 로 넘기면 이어서 조회한다.
 type TrendPage[T any] struct {
-	NextUntil *tosstypes.Date `json:"nextUntil"` // 더 없으면 nil
 	Records   []T             `json:"records"`
+	NextUntil *tosstypes.Date `json:"nextUntil"` // 더 없으면 nil
 }
 
 // TradingVolume 은 매수/매도/순매수 거래량.
@@ -121,36 +121,42 @@ type SecuritiesLendingRecord struct {
 	BalanceAmount     decimal.Decimal `json:"balanceAmount"`
 }
 
-// 페이지 타입 별칭.
-type (
-	InvestorTradingPage   = TrendPage[InvestorTradingRecord]
-	ProgramTradesPage     = TrendPage[ProgramTradesRecord]
-	ShortSellingPage      = TrendPage[ShortSellingRecord]
-	CreditTradesPage      = TrendPage[CreditTradesRecord]
-	SecuritiesLendingPage = TrendPage[SecuritiesLendingRecord]
-)
+// InvestorTradingPage 는 InvestorTrading 의 응답 페이지.
+type InvestorTradingPage = TrendPage[InvestorTradingRecord]
 
-// InvestorTrading 은 투자자별 매매동향(GET /api/v1/stocks/{symbol}/investor-trading).
+// ProgramTradesPage 는 ProgramTrades 의 응답 페이지.
+type ProgramTradesPage = TrendPage[ProgramTradesRecord]
+
+// ShortSellingPage 는 ShortSelling 의 응답 페이지.
+type ShortSellingPage = TrendPage[ShortSellingRecord]
+
+// CreditTradesPage 는 CreditTrades 의 응답 페이지.
+type CreditTradesPage = TrendPage[CreditTradesRecord]
+
+// SecuritiesLendingPage 는 SecuritiesLending 의 응답 페이지.
+type SecuritiesLendingPage = TrendPage[SecuritiesLendingRecord]
+
+// InvestorTrading 은 투자자별 매매동향(GET /api/v1/stocks/{symbol}/investor-trading). 국내 종목만 지원(해외 심볼 → 400 unsupported-market).
 func (c *Client) InvestorTrading(ctx context.Context, symbol string, p TrendParams) (*InvestorTradingPage, error) {
 	return fetchTrend[InvestorTradingRecord](ctx, c.http, symbol, "investor-trading", p)
 }
 
-// ProgramTrades 는 프로그램매매 동향(GET /api/v1/stocks/{symbol}/program-trades).
+// ProgramTrades 는 프로그램매매 동향(GET /api/v1/stocks/{symbol}/program-trades). 국내 종목만 지원(해외 심볼 → 400 unsupported-market).
 func (c *Client) ProgramTrades(ctx context.Context, symbol string, p TrendParams) (*ProgramTradesPage, error) {
 	return fetchTrend[ProgramTradesRecord](ctx, c.http, symbol, "program-trades", p)
 }
 
-// ShortSelling 은 공매도 동향(GET /api/v1/stocks/{symbol}/short-selling).
+// ShortSelling 은 공매도 동향(GET /api/v1/stocks/{symbol}/short-selling). 국내 종목만 지원(해외 심볼 → 400 unsupported-market).
 func (c *Client) ShortSelling(ctx context.Context, symbol string, p TrendParams) (*ShortSellingPage, error) {
 	return fetchTrend[ShortSellingRecord](ctx, c.http, symbol, "short-selling", p)
 }
 
-// CreditTrades 는 신용거래 동향(GET /api/v1/stocks/{symbol}/credit-trades).
+// CreditTrades 는 신용거래 동향(GET /api/v1/stocks/{symbol}/credit-trades). 국내 종목만 지원(해외 심볼 → 400 unsupported-market).
 func (c *Client) CreditTrades(ctx context.Context, symbol string, p TrendParams) (*CreditTradesPage, error) {
 	return fetchTrend[CreditTradesRecord](ctx, c.http, symbol, "credit-trades", p)
 }
 
-// SecuritiesLending 은 대차거래 동향(GET /api/v1/stocks/{symbol}/securities-lending).
+// SecuritiesLending 은 대차거래 동향(GET /api/v1/stocks/{symbol}/securities-lending). 국내 종목만 지원(해외 심볼 → 400 unsupported-market).
 func (c *Client) SecuritiesLending(ctx context.Context, symbol string, p TrendParams) (*SecuritiesLendingPage, error) {
 	return fetchTrend[SecuritiesLendingRecord](ctx, c.http, symbol, "securities-lending", p)
 }

@@ -2175,6 +2175,7 @@ func TestStocks(t *testing.T) {
 	}
 }
 
+// fixture = openapi 예시(kospi): 요청 파라미터와 무관하게 STOCK+ETF 2건
 func TestListStocks(t *testing.T) {
 	cs := true
 	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/stocks/all", Query: url.Values{
@@ -2185,8 +2186,11 @@ func TestListStocks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) == 0 || got[0].Symbol == "" || got[0].Name == "" || got[0].ISINCode == "" || got[0].SecurityType == "" {
-		t.Errorf("got = %+v", got)
+	if len(got) != 2 || got[0].Symbol != "005930" || got[0].Name != "삼성전자" || got[0].SecurityType != tosstypes.SecurityTypeStock || !got[0].IsCommonShare || got[0].ISINCode != "KR7005930003" {
+		t.Errorf("got[0] = %+v", got)
+	}
+	if got[1].Symbol != "069500" || got[1].SecurityType != tosstypes.SecurityTypeETF || got[1].ISINCode != "KR7069500007" {
+		t.Errorf("got[1] = %+v", got)
 	}
 }
 
@@ -2274,6 +2278,7 @@ func TestShortSelling(t *testing.T) {
 	}
 }
 
+// fixture = openapi 예시(daily): 2건, marginLoan/stockLoan 모두 존재
 func TestCreditTrades(t *testing.T) {
 	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/stocks/005930/credit-trades", Query: url.Values{"count": {"1"}}}, 200, testutil.Fixture(t, "credit_trades.json"))
 	defer done()
@@ -2281,14 +2286,22 @@ func TestCreditTrades(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Records) == 0 || page.Records[0].Date == "" || page.Records[0].UpdatedAt.IsZero() {
+	if page.NextUntil == nil || *page.NextUntil != "2026-07-14" || len(page.Records) != 2 {
 		t.Fatalf("page = %+v", page)
 	}
-	if ml := page.Records[0].MarginLoan; ml != nil && ml.BalanceQuantity.IsZero() && ml.NewQuantity.IsZero() {
-		t.Errorf("MarginLoan present but all zero: %+v", ml)
+	r := page.Records[0]
+	if r.Date != "2026-07-16" || r.UpdatedAt.IsZero() || r.MarginLoan == nil || r.StockLoan == nil {
+		t.Fatalf("r = %+v", r)
+	}
+	if r.MarginLoan.NewQuantity.String() != "125300" || r.MarginLoan.BalanceQuantity.String() != "2513400" || r.MarginLoan.BalanceRate.String() != "0.0042" || r.MarginLoan.TradingRate.String() != "0.09" {
+		t.Errorf("MarginLoan = %+v", r.MarginLoan)
+	}
+	if r.StockLoan.BalanceQuantity.String() != "45200" || r.StockLoan.TradingRate.String() != "0.0004" {
+		t.Errorf("StockLoan = %+v", r.StockLoan)
 	}
 }
 
+// fixture = openapi 예시(daily)
 func TestSecuritiesLending(t *testing.T) {
 	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/stocks/005930/securities-lending", Query: url.Values{"count": {"1"}}}, 200, testutil.Fixture(t, "securities_lending.json"))
 	defer done()
@@ -2296,12 +2309,17 @@ func TestSecuritiesLending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Records) == 0 || page.Records[0].BalanceQuantity.IsZero() {
-		t.Errorf("page = %+v", page)
+	if page.NextUntil == nil || len(page.Records) != 2 {
+		t.Fatalf("page = %+v", page)
+	}
+	r := page.Records[0]
+	if r.Date != "2026-07-17" || r.ExecutionQuantity.String() != "210500" || r.RepaymentQuantity.String() != "185300" || r.BalanceQuantity.String() != "15234000" || r.BalanceAmount.String() != "1218720000000" {
+		t.Errorf("r = %+v", r)
 	}
 }
 
-func TestTrend_SymbolEscaped(t *testing.T) {
+// params.Symbol 이 [A-Za-z0-9.-] 만 허용하므로 PathEscape 는 방어용 — '.' 이 경로에 그대로 남는지만 확인
+func TestTrend_DottedSymbolPath(t *testing.T) {
 	hc, done := testutil.NewServer(t, testutil.Expect{Path: "/api/v1/stocks/BRK.B/short-selling"}, 200, []byte(`{"result":{"nextUntil":null,"records":[]}}`))
 	defer done()
 	page, err := New(hc).ShortSelling(context.Background(), "BRK.B", TrendParams{})
@@ -2336,6 +2354,7 @@ Expected: 컴파일 에러.
 cat > stockinfo/client.go << 'EOF'
 // Package stockinfo 는 토스 Open API 종목 정보(Stock Info) 그룹 — 종목 메타·전체 목록·매수 유의사항·
 // 투자자별/프로그램/공매도/신용/대차 매매동향. toss.Client.StockInfo 로 접근한다.
+// 매매동향 5종은 국내(KR) 종목만 지원한다 — 해외 심볼을 넘기면 400 unsupported-market *APIError 가 반환된다.
 package stockinfo
 
 import "github.com/kenshin579/toss-go/internal/httpclient"
@@ -2478,8 +2497,8 @@ type TrendParams struct {
 
 // TrendPage 는 매매동향 한 페이지. NextUntil 을 다음 요청의 Until 로 넘기면 이어서 조회한다.
 type TrendPage[T any] struct {
-	NextUntil *tosstypes.Date `json:"nextUntil"` // 더 없으면 nil
 	Records   []T             `json:"records"`
+	NextUntil *tosstypes.Date `json:"nextUntil"` // 더 없으면 nil
 }
 
 // TradingVolume 은 매수/매도/순매수 거래량.
@@ -2578,36 +2597,42 @@ type SecuritiesLendingRecord struct {
 	BalanceAmount     decimal.Decimal `json:"balanceAmount"`
 }
 
-// 페이지 타입 별칭.
-type (
-	InvestorTradingPage   = TrendPage[InvestorTradingRecord]
-	ProgramTradesPage     = TrendPage[ProgramTradesRecord]
-	ShortSellingPage      = TrendPage[ShortSellingRecord]
-	CreditTradesPage      = TrendPage[CreditTradesRecord]
-	SecuritiesLendingPage = TrendPage[SecuritiesLendingRecord]
-)
+// InvestorTradingPage 는 InvestorTrading 의 응답 페이지.
+type InvestorTradingPage = TrendPage[InvestorTradingRecord]
 
-// InvestorTrading 은 투자자별 매매동향(GET /api/v1/stocks/{symbol}/investor-trading).
+// ProgramTradesPage 는 ProgramTrades 의 응답 페이지.
+type ProgramTradesPage = TrendPage[ProgramTradesRecord]
+
+// ShortSellingPage 는 ShortSelling 의 응답 페이지.
+type ShortSellingPage = TrendPage[ShortSellingRecord]
+
+// CreditTradesPage 는 CreditTrades 의 응답 페이지.
+type CreditTradesPage = TrendPage[CreditTradesRecord]
+
+// SecuritiesLendingPage 는 SecuritiesLending 의 응답 페이지.
+type SecuritiesLendingPage = TrendPage[SecuritiesLendingRecord]
+
+// InvestorTrading 은 투자자별 매매동향(GET /api/v1/stocks/{symbol}/investor-trading). 국내 종목만 지원(해외 심볼 → 400 unsupported-market).
 func (c *Client) InvestorTrading(ctx context.Context, symbol string, p TrendParams) (*InvestorTradingPage, error) {
 	return fetchTrend[InvestorTradingRecord](ctx, c.http, symbol, "investor-trading", p)
 }
 
-// ProgramTrades 는 프로그램매매 동향(GET /api/v1/stocks/{symbol}/program-trades).
+// ProgramTrades 는 프로그램매매 동향(GET /api/v1/stocks/{symbol}/program-trades). 국내 종목만 지원(해외 심볼 → 400 unsupported-market).
 func (c *Client) ProgramTrades(ctx context.Context, symbol string, p TrendParams) (*ProgramTradesPage, error) {
 	return fetchTrend[ProgramTradesRecord](ctx, c.http, symbol, "program-trades", p)
 }
 
-// ShortSelling 은 공매도 동향(GET /api/v1/stocks/{symbol}/short-selling).
+// ShortSelling 은 공매도 동향(GET /api/v1/stocks/{symbol}/short-selling). 국내 종목만 지원(해외 심볼 → 400 unsupported-market).
 func (c *Client) ShortSelling(ctx context.Context, symbol string, p TrendParams) (*ShortSellingPage, error) {
 	return fetchTrend[ShortSellingRecord](ctx, c.http, symbol, "short-selling", p)
 }
 
-// CreditTrades 는 신용거래 동향(GET /api/v1/stocks/{symbol}/credit-trades).
+// CreditTrades 는 신용거래 동향(GET /api/v1/stocks/{symbol}/credit-trades). 국내 종목만 지원(해외 심볼 → 400 unsupported-market).
 func (c *Client) CreditTrades(ctx context.Context, symbol string, p TrendParams) (*CreditTradesPage, error) {
 	return fetchTrend[CreditTradesRecord](ctx, c.http, symbol, "credit-trades", p)
 }
 
-// SecuritiesLending 은 대차거래 동향(GET /api/v1/stocks/{symbol}/securities-lending).
+// SecuritiesLending 은 대차거래 동향(GET /api/v1/stocks/{symbol}/securities-lending). 국내 종목만 지원(해외 심볼 → 400 unsupported-market).
 func (c *Client) SecuritiesLending(ctx context.Context, symbol string, p TrendParams) (*SecuritiesLendingPage, error) {
 	return fetchTrend[SecuritiesLendingRecord](ctx, c.http, symbol, "securities-lending", p)
 }
@@ -2817,7 +2842,7 @@ type ExchangeRate struct {
 	ValidUntil     time.Time                `json:"validUntil"`
 }
 
-// ExchangeRate 는 환율을 조회한다(GET /api/v1/exchange-rate). at 이 nil 이면 현재 고시.
+// ExchangeRate 는 환율을 조회한다(GET /api/v1/exchange-rate). at 이 nil 이면 현재 고시. 해당 통화쌍/시각의 고시가 없으면 404 exchange-rate-not-found.
 func (c *Client) ExchangeRate(ctx context.Context, base, quote tosstypes.Currency, at *time.Time) (*ExchangeRate, error) {
 	if err := params.Require("baseCurrency", string(base)); err != nil {
 		return nil, err
@@ -3211,6 +3236,7 @@ type Price struct {
 }
 
 // Prices 는 시장 지표 현재가를 조회한다(GET /api/v1/market-indicators/prices). 최대 200개. 예: KOSPI, KOSDAQ.
+// 지원하지 않는 심볼은 400 unsupported-symbol, 잘못된 요청은 400 invalid-request.
 func (c *Client) Prices(ctx context.Context, symbols ...string) ([]Price, error) {
 	joined, err := params.Symbols(symbols)
 	if err != nil {
@@ -3258,6 +3284,7 @@ type CandlesParams struct {
 }
 
 // Candles 는 시장 지표 캔들을 조회한다(GET /api/v1/market-indicators/{symbol}/candles).
+// 지원하지 않는 심볼은 400 unsupported-symbol, 잘못된 요청은 400 invalid-request.
 func (c *Client) Candles(ctx context.Context, symbol string, p CandlesParams) (*CandlePage, error) {
 	if err := params.Symbol(symbol); err != nil {
 		return nil, err
@@ -3321,8 +3348,8 @@ type InvestorTradingRecord struct {
 
 // InvestorTradingPage 는 매매대금 한 페이지. NextUntil 을 다음 요청의 Until 로 넘기면 이어서 조회한다.
 type InvestorTradingPage struct {
-	NextUntil *tosstypes.Date         `json:"nextUntil"`
 	Records   []InvestorTradingRecord `json:"records"`
+	NextUntil *tosstypes.Date         `json:"nextUntil"`
 }
 
 // InvestorTradingParams 는 InvestorTrading 인자.
@@ -3333,7 +3360,7 @@ type InvestorTradingParams struct {
 }
 
 // InvestorTrading 은 투자자별 매매대금을 조회한다(GET /api/v1/market-indicators/{symbol}/investor-trading).
-// KOSPI, KOSDAQ 만 지원한다.
+// KOSPI, KOSDAQ 만 지원한다. 지원하지 않는 심볼은 400 unsupported-symbol, 잘못된 요청은 400 invalid-request.
 func (c *Client) InvestorTrading(ctx context.Context, symbol string, p InvestorTradingParams) (*InvestorTradingPage, error) {
 	if err := params.Symbol(symbol); err != nil {
 		return nil, err
