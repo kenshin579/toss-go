@@ -9,7 +9,10 @@ import (
 	"time"
 
 	toss "github.com/kenshin579/toss-go"
+	"github.com/kenshin579/toss-go/asset"
+	"github.com/kenshin579/toss-go/conditionalorder"
 	"github.com/kenshin579/toss-go/marketdata"
+	"github.com/kenshin579/toss-go/order"
 	"github.com/kenshin579/toss-go/stockinfo"
 	"github.com/kenshin579/toss-go/tosstypes"
 )
@@ -100,5 +103,63 @@ func TestIntegration_AccessToken(t *testing.T) {
 	tok, err := c.AccessToken(context.Background())
 	if err != nil || len(tok) < 100 {
 		t.Fatalf("AccessToken: len=%d %v", len(tok), err)
+	}
+}
+
+// TestIntegration_AccountReadOnly 는 계좌·주문 조회만 호출한다.
+// 주문 생성·정정·취소·조건주문 쓰기는 실제 체결로 이어지므로 integration 테스트에서 절대 호출하지 않는다.
+func TestIntegration_AccountReadOnly(t *testing.T) {
+	c := newIntegrationClient(t)
+	ctx := context.Background()
+
+	accts, err := c.Accounts(ctx)
+	if err != nil {
+		t.Fatalf("Accounts: %v", err)
+	}
+	if len(accts) == 0 {
+		t.Skip("no accounts on this credential")
+	}
+	if accts[0].AccountNo == "" || accts[0].AccountSeq == 0 {
+		t.Errorf("account = %+v", accts[0])
+	}
+	a := c.Account(accts[0].AccountSeq)
+	time.Sleep(1100 * time.Millisecond) // ACCOUNT 그룹 1/s
+
+	if _, err := a.Asset.Holdings(ctx, asset.HoldingsParams{}); err != nil {
+		t.Errorf("Holdings: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	if _, err := a.Order.BuyingPower(ctx, tosstypes.CurrencyKRW); err != nil {
+		t.Errorf("BuyingPower: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	if _, err := a.Order.Commissions(ctx); err != nil {
+		t.Errorf("Commissions: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	page, err := a.Order.List(ctx, order.ListParams{Status: order.StatusFilterClosed, Limit: 5})
+	if err != nil {
+		t.Fatalf("Order.List: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if len(page.Orders) > 0 {
+		if _, err := a.Order.Get(ctx, page.Orders[0].OrderID); err != nil {
+			t.Errorf("Order.Get: %v", err)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+
+	cpage, err := a.ConditionalOrder.List(ctx, conditionalorder.ListParams{Status: conditionalorder.StatusFilterOpen, Limit: 5})
+	if err != nil {
+		t.Fatalf("ConditionalOrder.List: %v", err)
+	}
+	if len(cpage.ConditionalOrders) > 0 {
+		time.Sleep(300 * time.Millisecond)
+		if _, err := a.ConditionalOrder.Get(ctx, cpage.ConditionalOrders[0].ConditionalOrderID); err != nil {
+			t.Errorf("ConditionalOrder.Get: %v", err)
+		}
 	}
 }
