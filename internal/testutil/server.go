@@ -25,17 +25,10 @@ type Expect struct {
 }
 
 // NewServer 는 요청을 검증하고 status/body 를 돌려주는 서버와 그에 연결된 httpclient 를 만든다.
-// Bearer 헤더가 "test-token" 인지도 검증한다.
+// Bearer 헤더가 "test-token" 인지, 그리고 계좌 헤더가 실리지 않았는지 검증한다(계좌가 필요 없는 API 용).
 func NewServer(t *testing.T, want Expect, status int, body []byte) (*httpclient.Client, func()) {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		checkRequest(t, r, want)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		_, _ = w.Write(body)
-	}))
-	c := httpclient.New(httpclient.Config{BaseURL: srv.URL, HTTPClient: srv.Client(), Tokens: staticTokens{}})
-	return c, srv.Close
+	return NewServerWithHeader(t, want, "", status, body)
 }
 
 // NewServerWithHeader 는 NewServer 와 같지만 X-Tossinvest-Account 헤더까지 검증한다.
