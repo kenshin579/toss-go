@@ -114,16 +114,25 @@ func TestAPIErrorAlias(t *testing.T) {
 	}
 }
 
+type recordingRT struct{ url string }
+
+func (r *recordingRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	r.url = req.URL.String()
+	return nil, errors.New("recorded")
+}
+
 func TestWithBaseURL_Empty(t *testing.T) {
 	// WithBaseURL("") 은 무시되고 기본 URL 이 쓰인다(토큰만 상대경로가 되는 반쪽 동작 방지)
-	c, err := NewClient("i", "s", WithBaseURL(""))
+	rt := &recordingRT{}
+	c, err := NewClient("i", "s", WithBaseURL(""), WithHTTPClient(&http.Client{Transport: rt}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.AccessToken(context.Background()); err == nil {
-		t.Skip("network reachable; skip")
-	} else if strings.Contains(err.Error(), "unsupported protocol scheme") {
-		t.Errorf("token URL is relative: %v", err)
+		t.Fatal("want transport error")
+	}
+	if !strings.HasPrefix(rt.url, "https://openapi.tossinvest.com/oauth2/token") {
+		t.Errorf("token URL = %q", rt.url)
 	}
 }
 
@@ -156,7 +165,7 @@ func TestWithHTTPClient_OverridesTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 주입한 클라이언트가 그대로 쓰이는지 — 타임아웃이 1s 로 덮이지 않았는지 확인
-	if got := c.httpClientForTest(); got != custom || got.Timeout != 123*time.Second {
+	if got := c.hc; got != custom || got.Timeout != 123*time.Second {
 		t.Errorf("custom client not used: %+v", got)
 	}
 }

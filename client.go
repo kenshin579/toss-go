@@ -70,6 +70,3 @@ func NewClient(clientID, clientSecret string, opts ...Option) (*Client, error) {
 func (c *Client) AccessToken(ctx context.Context) (string, error) {
 	return c.tokens.Token(ctx)
 }
-
-// httpClientForTest 는 테스트에서 주입된 *http.Client 를 확인하기 위한 접근자다.
-func (c *Client) httpClientForTest() *http.Client { return c.hc }
