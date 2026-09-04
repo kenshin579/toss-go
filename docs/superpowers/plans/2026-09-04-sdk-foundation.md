@@ -1,5 +1,7 @@
 # toss-go SDK 기반 + 조회 API (v0.1.0) Implementation Plan
 
+> 내부 개발 문서(설계/실행 계획). 라이브러리 사용법은 [README](../../../README.md) 를 보세요.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 토스증권 Open API 의 Go 클라이언트 — OAuth2 토큰 자동 관리 + `{result}` 봉투 해제 + 에러 매핑을 갖춘 기반 위에 조회 21 ops(시세 5·종목 8·시장정보 3·랭킹 1·지표 3)를 구현하고 v0.1.0 으로 릴리스한다.
@@ -3665,14 +3667,20 @@ func TestAuthErrorAlias(t *testing.T) {
 }
 
 func TestWithHTTPClient_OverridesTimeout(t *testing.T) {
-	custom := &http.Client{Timeout: 123 * time.Second}
-	c, err := NewClient("i", "s", WithTimeout(time.Second), WithHTTPClient(custom))
+	// WithHTTPClient 를 주면 WithTimeout 은 무시되고 주입한 클라이언트가 그대로 쓰인다
+	rt := &recordingRT{}
+	custom := &http.Client{Timeout: 123 * time.Second, Transport: rt}
+	c, err := NewClient("i", "s", WithTimeout(time.Millisecond), WithHTTPClient(custom))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 주입한 클라이언트가 그대로 쓰이는지 — 타임아웃이 1s 로 덮이지 않았는지 확인
-	if got := c.hc; got != custom || got.Timeout != 123*time.Second {
-		t.Errorf("custom client not used: %+v", got)
+	start := time.Now()
+	if _, err := c.AccessToken(context.Background()); err == nil {
+		t.Fatal("want transport error")
+	}
+	// 1ms 타임아웃이 적용됐다면 transport 에 도달하지 못했을 것이다
+	if rt.url == "" {
+		t.Errorf("custom transport not used (elapsed %v)", time.Since(start))
 	}
 }
 EOF
@@ -3793,7 +3801,6 @@ import (
 // Client 는 toss-go 의 단일 진입점. 그룹별 sub-client 를 필드로 노출한다.
 // Client 와 sub-client 는 여러 goroutine 에서 동시에 사용해도 안전하다.
 type Client struct {
-	hc     *http.Client
 	tokens *auth.TokenSource
 
 	MarketData       *marketdata.Client // 시세: 현재가·호가·체결·상하한가·캔들
@@ -3823,7 +3830,6 @@ func NewClient(clientID, clientSecret string, opts ...Option) (*Client, error) {
 	h := httpclient.New(httpclient.Config{BaseURL: cfg.baseURL, HTTPClient: hc, Tokens: tokens})
 
 	return &Client{
-		hc:               hc,
 		tokens:           tokens,
 		MarketData:       marketdata.New(h),
 		StockInfo:        stockinfo.New(h),

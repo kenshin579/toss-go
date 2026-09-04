@@ -1,5 +1,7 @@
 # toss-go SDK 기반 + 조회 API 설계 (v0.1.0)
 
+> 내부 개발 문서(설계/실행 계획). 라이브러리 사용법은 [README](../../../README.md) 를 보세요.
+
 - 작성일: 2026-09-04
 - 상태: 확정 (브레인스토밍 완료)
 - 레포: `github.com/kenshin579/toss-go` (워크스페이스 `toss-go/`, branch `feature/sdk-foundation`)

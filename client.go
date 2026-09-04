@@ -26,7 +26,6 @@ import (
 // Client 는 toss-go 의 단일 진입점. 그룹별 sub-client 를 필드로 노출한다.
 // Client 와 sub-client 는 여러 goroutine 에서 동시에 사용해도 안전하다.
 type Client struct {
-	hc     *http.Client
 	tokens *auth.TokenSource
 
 	MarketData       *marketdata.Client // 시세: 현재가·호가·체결·상하한가·캔들
@@ -56,7 +55,6 @@ func NewClient(clientID, clientSecret string, opts ...Option) (*Client, error) {
 	h := httpclient.New(httpclient.Config{BaseURL: cfg.baseURL, HTTPClient: hc, Tokens: tokens})
 
 	return &Client{
-		hc:               hc,
 		tokens:           tokens,
 		MarketData:       marketdata.New(h),
 		StockInfo:        stockinfo.New(h),
