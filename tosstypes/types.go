@@ -13,8 +13,10 @@ var KST = time.FixedZone("KST", 9*3600)
 // Date 는 `YYYY-MM-DD` 형식의 날짜 문자열이다. JSON 에서 그대로 문자열로 오간다.
 type Date string
 
-// NewDate 는 t 의 날짜 부분(t 의 타임존 기준)으로 Date 를 만든다.
-func NewDate(t time.Time) Date { return Date(t.Format("2006-01-02")) }
+// NewDate 는 t 를 KST 로 변환한 뒤 그 날짜로 Date 를 만든다. 토스 API 의 날짜 파라미터(until, date 등)는
+// 모두 KST 기준이므로 UTC 서버에서 time.Now() 를 넘겨도 어긋나지 않는다.
+// 미국 현지 기준 날짜가 필요하면 Date(t.In(loc).Format("2006-01-02")) 로 직접 만든다.
+func NewDate(t time.Time) Date { return Date(t.In(KST).Format("2006-01-02")) }
 
 // String 은 원문 문자열을 돌려준다.
 func (d Date) String() string { return string(d) }
@@ -23,6 +25,8 @@ func (d Date) String() string { return string(d) }
 func (d Date) IsZero() bool { return d == "" }
 
 // Time 은 KST 자정 시각으로 변환한다. 형식이 맞지 않으면 에러.
+// 날짜만 의미 있는 값이므로 Year/Month/Day 용도로 쓰고, 미국 현지 기준 날짜(UsMarketDay.date 등)는
+// 시각(instant) 비교에 쓰지 않는다.
 func (d Date) Time() (time.Time, error) {
 	t, err := time.ParseInLocation("2006-01-02", string(d), KST)
 	if err != nil {
@@ -106,12 +110,12 @@ const (
 type RankingType string
 
 const (
-	RankingMarketTradingAmount         RankingType = "MARKET_TRADING_AMOUNT"
-	RankingMarketTradingVolume         RankingType = "MARKET_TRADING_VOLUME"
-	RankingTopGainers                  RankingType = "TOP_GAINERS"
-	RankingTopLosers                   RankingType = "TOP_LOSERS"
-	RankingTossSecuritiesTradingAmount RankingType = "TOSS_SECURITIES_TRADING_AMOUNT"
-	RankingTossSecuritiesTradingVolume RankingType = "TOSS_SECURITIES_TRADING_VOLUME"
+	RankingTypeMarketTradingAmount         RankingType = "MARKET_TRADING_AMOUNT"
+	RankingTypeMarketTradingVolume         RankingType = "MARKET_TRADING_VOLUME"
+	RankingTypeTopGainers                  RankingType = "TOP_GAINERS"
+	RankingTypeTopLosers                   RankingType = "TOP_LOSERS"
+	RankingTypeTossSecuritiesTradingAmount RankingType = "TOSS_SECURITIES_TRADING_AMOUNT"
+	RankingTypeTossSecuritiesTradingVolume RankingType = "TOSS_SECURITIES_TRADING_VOLUME"
 )
 
 // RankingDuration 은 랭킹 집계 기간.
@@ -131,21 +135,21 @@ const (
 type RateChangeType string
 
 const (
-	RateChangeUp    RateChangeType = "UP"
-	RateChangeEqual RateChangeType = "EQUAL"
-	RateChangeDown  RateChangeType = "DOWN"
+	RateChangeTypeUp    RateChangeType = "UP"
+	RateChangeTypeEqual RateChangeType = "EQUAL"
+	RateChangeTypeDown  RateChangeType = "DOWN"
 )
 
 // WarningType 은 매수 유의사항 종류.
 type WarningType string
 
 const (
-	WarningLiquidationTrading WarningType = "LIQUIDATION_TRADING"
-	WarningOverheated         WarningType = "OVERHEATED"
-	WarningInvestmentWarning  WarningType = "INVESTMENT_WARNING"
-	WarningInvestmentRisk     WarningType = "INVESTMENT_RISK"
-	WarningVIStaticAndDynamic WarningType = "VI_STATIC_AND_DYNAMIC"
-	WarningVIStatic           WarningType = "VI_STATIC"
-	WarningVIDynamic          WarningType = "VI_DYNAMIC"
-	WarningStockWarrants      WarningType = "STOCK_WARRANTS"
+	WarningTypeLiquidationTrading WarningType = "LIQUIDATION_TRADING"
+	WarningTypeOverheated         WarningType = "OVERHEATED"
+	WarningTypeInvestmentWarning  WarningType = "INVESTMENT_WARNING"
+	WarningTypeInvestmentRisk     WarningType = "INVESTMENT_RISK"
+	WarningTypeVIStaticAndDynamic WarningType = "VI_STATIC_AND_DYNAMIC"
+	WarningTypeVIStatic           WarningType = "VI_STATIC"
+	WarningTypeVIDynamic          WarningType = "VI_DYNAMIC"
+	WarningTypeStockWarrants      WarningType = "STOCK_WARRANTS"
 )

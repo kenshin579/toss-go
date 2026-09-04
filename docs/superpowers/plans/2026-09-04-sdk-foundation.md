@@ -106,7 +106,12 @@ func TestDate_IsZero(t *testing.T) {
 func TestNewDate(t *testing.T) {
 	ts := time.Date(2026, 9, 3, 23, 59, 0, 0, KST)
 	if got := NewDate(ts); got != "2026-09-03" {
-		t.Errorf("NewDate = %q", got)
+		t.Errorf("NewDate(KST) = %q", got)
+	}
+	// UTC 15:30 = KST 다음날 00:30 → KST 기준 날짜
+	utc := time.Date(2026, 9, 3, 15, 30, 0, 0, time.UTC)
+	if got := NewDate(utc); got != "2026-09-04" {
+		t.Errorf("NewDate(UTC) = %q, want KST date", got)
 	}
 }
 
@@ -125,6 +130,17 @@ func TestDate_JSON(t *testing.T) {
 	out, _ := json.Marshal(v.D)
 	if string(out) != `"2026-09-03"` {
 		t.Errorf("marshal = %s", out)
+	}
+
+	var nul struct {
+		D Date `json:"d"`
+	}
+	if err := json.Unmarshal([]byte(`{"d":null}`), &nul); err != nil || nul.D != "" {
+		t.Errorf("null into value Date: %q %v", nul.D, err)
+	}
+	var np *Date
+	if out, _ := json.Marshal(np); string(out) != "null" {
+		t.Errorf("marshal nil *Date = %s", out)
 	}
 }
 EOF
@@ -151,8 +167,10 @@ var KST = time.FixedZone("KST", 9*3600)
 // Date 는 `YYYY-MM-DD` 형식의 날짜 문자열이다. JSON 에서 그대로 문자열로 오간다.
 type Date string
 
-// NewDate 는 t 의 날짜 부분(t 의 타임존 기준)으로 Date 를 만든다.
-func NewDate(t time.Time) Date { return Date(t.Format("2006-01-02")) }
+// NewDate 는 t 를 KST 로 변환한 뒤 그 날짜로 Date 를 만든다. 토스 API 의 날짜 파라미터(until, date 등)는
+// 모두 KST 기준이므로 UTC 서버에서 time.Now() 를 넘겨도 어긋나지 않는다.
+// 미국 현지 기준 날짜가 필요하면 Date(t.In(loc).Format("2006-01-02")) 로 직접 만든다.
+func NewDate(t time.Time) Date { return Date(t.In(KST).Format("2006-01-02")) }
 
 // String 은 원문 문자열을 돌려준다.
 func (d Date) String() string { return string(d) }
@@ -161,6 +179,8 @@ func (d Date) String() string { return string(d) }
 func (d Date) IsZero() bool { return d == "" }
 
 // Time 은 KST 자정 시각으로 변환한다. 형식이 맞지 않으면 에러.
+// 날짜만 의미 있는 값이므로 Year/Month/Day 용도로 쓰고, 미국 현지 기준 날짜(UsMarketDay.date 등)는
+// 시각(instant) 비교에 쓰지 않는다.
 func (d Date) Time() (time.Time, error) {
 	t, err := time.ParseInLocation("2006-01-02", string(d), KST)
 	if err != nil {
@@ -244,12 +264,12 @@ const (
 type RankingType string
 
 const (
-	RankingMarketTradingAmount          RankingType = "MARKET_TRADING_AMOUNT"
-	RankingMarketTradingVolume          RankingType = "MARKET_TRADING_VOLUME"
-	RankingTopGainers                   RankingType = "TOP_GAINERS"
-	RankingTopLosers                    RankingType = "TOP_LOSERS"
-	RankingTossSecuritiesTradingAmount  RankingType = "TOSS_SECURITIES_TRADING_AMOUNT"
-	RankingTossSecuritiesTradingVolume  RankingType = "TOSS_SECURITIES_TRADING_VOLUME"
+	RankingTypeMarketTradingAmount          RankingType = "MARKET_TRADING_AMOUNT"
+	RankingTypeMarketTradingVolume          RankingType = "MARKET_TRADING_VOLUME"
+	RankingTypeTopGainers                   RankingType = "TOP_GAINERS"
+	RankingTypeTopLosers                    RankingType = "TOP_LOSERS"
+	RankingTypeTossSecuritiesTradingAmount  RankingType = "TOSS_SECURITIES_TRADING_AMOUNT"
+	RankingTypeTossSecuritiesTradingVolume  RankingType = "TOSS_SECURITIES_TRADING_VOLUME"
 )
 
 // RankingDuration 은 랭킹 집계 기간.
@@ -269,23 +289,23 @@ const (
 type RateChangeType string
 
 const (
-	RateChangeUp    RateChangeType = "UP"
-	RateChangeEqual RateChangeType = "EQUAL"
-	RateChangeDown  RateChangeType = "DOWN"
+	RateChangeTypeUp    RateChangeType = "UP"
+	RateChangeTypeEqual RateChangeType = "EQUAL"
+	RateChangeTypeDown  RateChangeType = "DOWN"
 )
 
 // WarningType 은 매수 유의사항 종류.
 type WarningType string
 
 const (
-	WarningLiquidationTrading WarningType = "LIQUIDATION_TRADING"
-	WarningOverheated         WarningType = "OVERHEATED"
-	WarningInvestmentWarning  WarningType = "INVESTMENT_WARNING"
-	WarningInvestmentRisk     WarningType = "INVESTMENT_RISK"
-	WarningVIStaticAndDynamic WarningType = "VI_STATIC_AND_DYNAMIC"
-	WarningVIStatic           WarningType = "VI_STATIC"
-	WarningVIDynamic          WarningType = "VI_DYNAMIC"
-	WarningStockWarrants      WarningType = "STOCK_WARRANTS"
+	WarningTypeLiquidationTrading WarningType = "LIQUIDATION_TRADING"
+	WarningTypeOverheated         WarningType = "OVERHEATED"
+	WarningTypeInvestmentWarning  WarningType = "INVESTMENT_WARNING"
+	WarningTypeInvestmentRisk     WarningType = "INVESTMENT_RISK"
+	WarningTypeVIStaticAndDynamic WarningType = "VI_STATIC_AND_DYNAMIC"
+	WarningTypeVIStatic           WarningType = "VI_STATIC"
+	WarningTypeVIDynamic          WarningType = "VI_DYNAMIC"
+	WarningTypeStockWarrants      WarningType = "STOCK_WARRANTS"
 )
 EOF
 gofmt -l tosstypes; go vet ./tosstypes/ && go test ./tosstypes/ -v 2>&1 | tail -8
@@ -1785,7 +1805,7 @@ func TestWarnings_Decode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].WarningType != tosstypes.WarningOverheated || got[0].Exchange == nil || *got[0].Exchange != "KRX" || got[0].StartDate == nil || got[0].EndDate != nil {
+	if len(got) != 1 || got[0].WarningType != tosstypes.WarningTypeOverheated || got[0].Exchange == nil || *got[0].Exchange != "KRX" || got[0].StartDate == nil || got[0].EndDate != nil {
 		t.Errorf("got = %+v", got)
 	}
 }
@@ -2248,7 +2268,7 @@ func TestExchangeRate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fx.BaseCurrency != tosstypes.CurrencyUSD || fx.QuoteCurrency != tosstypes.CurrencyKRW || fx.Rate.String() != "1359.63" || fx.MidRate.String() != "1359.13" || fx.BasisPoint.String() != "4" || fx.RateChangeType != tosstypes.RateChangeDown {
+	if fx.BaseCurrency != tosstypes.CurrencyUSD || fx.QuoteCurrency != tosstypes.CurrencyKRW || fx.Rate.String() != "1359.63" || fx.MidRate.String() != "1359.13" || fx.BasisPoint.String() != "4" || fx.RateChangeType != tosstypes.RateChangeTypeDown {
 		t.Errorf("fx = %+v", fx)
 	}
 	if fx.ValidFrom.IsZero() || !fx.ValidUntil.After(fx.ValidFrom) {
@@ -2546,7 +2566,7 @@ func TestRankings(t *testing.T) {
 		"type": {"TOP_GAINERS"}, "marketCountry": {"KR"}, "duration": {"1d"}, "count": {"2"}, "excludeInvestmentCaution": {"true"},
 	}}, 200, testutil.Fixture(t, "rankings.json"))
 	defer done()
-	r, err := New(hc).Rankings(context.Background(), RankingsParams{Type: tosstypes.RankingTopGainers, MarketCountry: tosstypes.MarketCountryKR, Duration: tosstypes.RankingDuration1d, Count: 2, ExcludeInvestmentCaution: &ex})
+	r, err := New(hc).Rankings(context.Background(), RankingsParams{Type: tosstypes.RankingTypeTopGainers, MarketCountry: tosstypes.MarketCountryKR, Duration: tosstypes.RankingDuration1d, Count: 2, ExcludeInvestmentCaution: &ex})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2566,8 +2586,8 @@ func TestRankings_Validation(t *testing.T) {
 	c := New(nil)
 	cases := []RankingsParams{
 		{MarketCountry: tosstypes.MarketCountryKR, Duration: tosstypes.RankingDuration1d},
-		{Type: tosstypes.RankingTopGainers, Duration: tosstypes.RankingDuration1d},
-		{Type: tosstypes.RankingTopGainers, MarketCountry: tosstypes.MarketCountryKR},
+		{Type: tosstypes.RankingTypeTopGainers, Duration: tosstypes.RankingDuration1d},
+		{Type: tosstypes.RankingTypeTopGainers, MarketCountry: tosstypes.MarketCountryKR},
 	}
 	for i, p := range cases {
 		if _, err := c.Rankings(context.Background(), p); err == nil {

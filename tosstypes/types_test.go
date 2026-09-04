@@ -38,7 +38,12 @@ func TestDate_IsZero(t *testing.T) {
 func TestNewDate(t *testing.T) {
 	ts := time.Date(2026, 9, 3, 23, 59, 0, 0, KST)
 	if got := NewDate(ts); got != "2026-09-03" {
-		t.Errorf("NewDate = %q", got)
+		t.Errorf("NewDate(KST) = %q", got)
+	}
+	// UTC 15:30 = KST 다음날 00:30 → KST 기준 날짜
+	utc := time.Date(2026, 9, 3, 15, 30, 0, 0, time.UTC)
+	if got := NewDate(utc); got != "2026-09-04" {
+		t.Errorf("NewDate(UTC) = %q, want KST date", got)
 	}
 }
 
@@ -57,5 +62,16 @@ func TestDate_JSON(t *testing.T) {
 	out, _ := json.Marshal(v.D)
 	if string(out) != `"2026-09-03"` {
 		t.Errorf("marshal = %s", out)
+	}
+
+	var nul struct {
+		D Date `json:"d"`
+	}
+	if err := json.Unmarshal([]byte(`{"d":null}`), &nul); err != nil || nul.D != "" {
+		t.Errorf("null into value Date: %q %v", nul.D, err)
+	}
+	var np *Date
+	if out, _ := json.Marshal(np); string(out) != "null" {
+		t.Errorf("marshal nil *Date = %s", out)
 	}
 }
