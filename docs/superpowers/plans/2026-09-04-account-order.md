@@ -2973,7 +2973,7 @@ func main() {
 
 	// 실제 주문 예시 — 실행하면 진짜 주문이 나간다. 필요할 때만 주석을 풀 것.
 	//
-	//	res, err := a.Order.Place(ctx, order.Request{
+	//	res, err := a.Order.Place(ctx, order.PlaceRequest{
 	//	    Symbol: "005930", Side: order.SideBuy, OrderType: order.TypeLimit,
 	//	    Quantity: decimal.NewFromInt(1), Price: decimal.NewFromInt(50000),
 	//	    ClientOrderID: toss.NewClientOrderID(), // 멱등성 키 권장
@@ -3087,7 +3087,7 @@ a := c.Account(accts[0].AccountSeq)  // 이후 모든 호출에 계좌 헤더 �
 h, _ := a.Asset.Holdings(ctx, nil)
 bp, _ := a.Order.BuyingPower(ctx, tosstypes.CurrencyKRW)
 
-res, err := a.Order.Place(ctx, order.Request{
+res, err := a.Order.Place(ctx, order.PlaceRequest{
     Symbol: "005930", Side: order.SideBuy, OrderType: order.TypeLimit,
     Quantity: decimal.NewFromInt(1), Price: decimal.NewFromInt(70000),
     ClientOrderID: toss.NewClientOrderID(), // 멱등성 키(권장)
