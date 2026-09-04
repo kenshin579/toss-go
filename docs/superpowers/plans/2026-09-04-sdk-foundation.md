@@ -3422,7 +3422,7 @@ Expected: gofmt 출력 없음, `8` (PASS 8건: ranking 2 + indicators 6).
 - [ ] **Step 4: 커밋**
 
 ```bash
-git add ranking indicators testdata && git commit -m "feat(ranking,indicators): 주식 랭킹 1 op + 시장 지표 3 ops
+git add -A ranking indicators testdata/captured && git commit -m "feat(ranking,indicators): 주식 랭킹 1 op + 시장 지표 3 ops
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
