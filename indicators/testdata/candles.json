@@ -1,0 +1,23 @@
+{
+  "result": {
+    "candles": [
+      {
+        "timestamp": "2026-06-11T09:00:00+09:00",
+        "openPrice": "2798.32",
+        "highPrice": "2820.15",
+        "lowPrice": "2790.1",
+        "closePrice": "2812.45",
+        "volume": "542000000"
+      },
+      {
+        "timestamp": "2026-06-10T09:00:00+09:00",
+        "openPrice": "2785.6",
+        "highPrice": "2801.22",
+        "lowPrice": "2779.85",
+        "closePrice": "2798.1",
+        "volume": "498000000"
+      }
+    ],
+    "nextBefore": "2026-06-10T09:00:00+09:00"
+  }
+}
