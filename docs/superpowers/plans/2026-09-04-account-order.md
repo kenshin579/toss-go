@@ -1230,9 +1230,9 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `order/client.go`, `order/types.go`, `order/place.go`, `order/modify.go`, `order/history.go`, `order/info.go`, `order/order_test.go`, `order/testdata/*.json`
-- Modify: `account.go` (`AccountScope.Order` 추가)
+- Modify: `account.go` (`AccountScope.Order` 추가), `internal/testutil/server.go` (`NewServerFunc` 추가)
 
-- [ ] **Step 1: fixture 추출**
+- [x] **Step 1: fixture 추출**
 
 ```bash
 mkdir -p order/testdata && J=docs/api/openapi.json
@@ -1250,7 +1250,7 @@ for f in order/testdata/*.json; do printf "%-40s " "$f"; jq -c 'if .result|type=
 ```
 Expected: 9개 파일. `orders.json` 은 `orders,nextCursor,hasNext`, `order_filled.json` 은 `orderId,symbol,...`, `commissions.json` 은 `{"n":2}`.
 
-- [ ] **Step 2: 실패 테스트 작성**
+- [x] **Step 2: 실패 테스트 작성**
 
 ```bash
 cat > order/order_test.go << 'EOF'
@@ -1411,6 +1411,46 @@ func TestCommissions(t *testing.T) {
 	}
 }
 
+// --- 계좌 검증 (accountSeq <= 0 은 요청 전에 실패해야 한다) ---
+
+func TestZeroAccountSeq(t *testing.T) {
+	// http 는 nil — 검증을 통과해 실제로 요청을 보내려 하면 nil pointer dereference 로 즉시 드러난다.
+	c := New(nil, 0)
+	ctx := context.Background()
+	if _, err := c.List(ctx, ListParams{Status: StatusFilterOpen}); err == nil {
+		t.Error("List: want error for accountSeq=0")
+	}
+	if _, err := c.Get(ctx, "o-1"); err == nil {
+		t.Error("Get: want error for accountSeq=0")
+	}
+	if _, err := c.BuyingPower(ctx, tosstypes.CurrencyKRW); err == nil {
+		t.Error("BuyingPower: want error for accountSeq=0")
+	}
+	if _, err := c.SellableQuantity(ctx, "005930"); err == nil {
+		t.Error("SellableQuantity: want error for accountSeq=0")
+	}
+	if _, err := c.Commissions(ctx); err == nil {
+		t.Error("Commissions: want error for accountSeq=0")
+	}
+	if _, err := c.Place(ctx, Request{Symbol: "005930", Side: SideBuy, OrderType: TypeLimit, Quantity: d("10"), Price: d("70000")}); err == nil {
+		t.Error("Place: want error for accountSeq=0")
+	}
+	if _, err := c.PlaceAmount(ctx, AmountRequest{Symbol: "AAPL", Side: SideBuy, OrderAmount: d("100")}); err == nil {
+		t.Error("PlaceAmount: want error for accountSeq=0")
+	}
+	if _, err := c.Modify(ctx, "o-1", ModifyRequest{OrderType: TypeLimit, Price: d("71000"), Quantity: d("5")}); err == nil {
+		t.Error("Modify: want error for accountSeq=0")
+	}
+	if _, err := c.Cancel(ctx, "o-1"); err == nil {
+		t.Error("Cancel: want error for accountSeq=0")
+	}
+
+	cNeg := New(nil, -1)
+	if _, err := cNeg.Cancel(ctx, "o-1"); err == nil {
+		t.Error("Cancel: want error for accountSeq=-1")
+	}
+}
+
 // --- 쓰기(요청 조립만 검증. 실주문은 절대 내지 않는다) ---
 
 // captureBody 는 요청 바디를 그대로 돌려주는 스텁이다.
@@ -1568,7 +1608,7 @@ go test ./order/ 2>&1 | head -5
 ```
 Expected: 컴파일 에러(`undefined: New` 등). `testutil.NewServerFunc` 도 아직 없다.
 
-- [ ] **Step 3: testutil 에 임의 핸들러 서버 추가**
+- [x] **Step 3: testutil 에 임의 핸들러 서버 추가**
 
 `internal/testutil/server.go` 에 덧붙인다:
 ```go
@@ -1581,7 +1621,16 @@ func NewServerFunc(t *testing.T, h http.HandlerFunc) (*httpclient.Client, func()
 }
 ```
 
-- [ ] **Step 4: 구현**
+- [x] **Step 4: 구현**
+
+**계좌 검증**: `order` 의 모든 메서드는 다른 검증보다 먼저 `params.AccountSeq(c.accountSeq)` 를 확인한다
+(asset 패키지 컨벤션과 동일 — accountSeq <= 0 이면 계좌 헤더 없이 요청이 나가 서버가
+`account-header-required` 를 돌려주므로 요청 전에 막는다). 파라미터 구조체는 값으로 받는다(포인터 아님).
+
+**에러 코드 보정**: 계획 초안의 `대표 에러:` 주석 중 `docs/api/openapi.json` 에 실제로 존재하지 않는
+문자열을 실제 코드로 교정했다 — `invalid-tick-size`/`amount-us-market-only` → `invalid-request`
+(둘 다 스펙상 400 `invalid-request` 로 뭉뚱그려진다), `unsupported-currency` → `invalid-request`
+(스펙 예시 키는 `unsupportedCurrency` 지만 `code` 필드는 `invalid-request`).
 
 ```bash
 mkdir -p order && cat > order/client.go << 'EOF'
@@ -1690,7 +1739,7 @@ type Order struct {
 	OrderType   Type               `json:"orderType"`
 	TimeInForce TimeInForce        `json:"timeInForce"`
 	Status      Status             `json:"status"`
-	Price       *decimal.Decimal   `json:"price"`       // 시장가 주문이면 nil
+	Price       *decimal.Decimal   `json:"price"` // 시장가 주문이면 nil
 	Quantity    decimal.Decimal    `json:"quantity"`
 	OrderAmount *decimal.Decimal   `json:"orderAmount"` // 금액 주문이면 설정, 수량 주문이면 nil
 	Currency    tosstypes.Currency `json:"currency"`
@@ -1767,9 +1816,12 @@ type placeBody struct {
 
 // Place 는 수량 기준 주문을 생성한다(POST /api/v1/orders).
 //
-// 대표 에러: insufficient-buying-power, order-hours-closed, invalid-tick-size, price-out-of-range,
+// 대표 에러: insufficient-buying-power, order-hours-closed, invalid-request, price-out-of-range,
 // stock-restricted, confirm-high-value-required, request-in-progress.
 func (c *Client) Place(ctx context.Context, r Request) (*PlaceResult, error) {
+	if err := params.AccountSeq(c.accountSeq); err != nil {
+		return nil, err
+	}
 	if err := params.Symbol(r.Symbol); err != nil {
 		return nil, err
 	}
@@ -1802,9 +1854,12 @@ func (c *Client) Place(ctx context.Context, r Request) (*PlaceResult, error) {
 // PlaceAmount 는 금액 기준 주문을 생성한다(POST /api/v1/orders). 미국 주식 시장가 전용이며
 // orderType 은 SDK 가 MARKET 으로 채운다.
 //
-// 대표 에러: amount-us-market-only, amount-order-outside-regular-hours, insufficient-buying-power,
-// max-order-amount-exceeded, confirm-high-value-required.
+// 대표 에러: invalid-request(미국 시장가 외 요청 등), amount-order-outside-regular-hours,
+// insufficient-buying-power, max-order-amount-exceeded, confirm-high-value-required.
 func (c *Client) PlaceAmount(ctx context.Context, r AmountRequest) (*PlaceResult, error) {
+	if err := params.AccountSeq(c.accountSeq); err != nil {
+		return nil, err
+	}
 	if err := params.Symbol(r.Symbol); err != nil {
 		return nil, err
 	}
@@ -1819,8 +1874,9 @@ func (c *Client) PlaceAmount(ctx context.Context, r AmountRequest) (*PlaceResult
 	}
 	body := placeBody{
 		Symbol: r.Symbol, Side: r.Side, OrderType: TypeMarket,
-		OrderAmount: r.OrderAmount.String(),
-		ClientOrderID: r.ClientOrderID, ConfirmHighValueOrder: r.ConfirmHighValue,
+		OrderAmount:           r.OrderAmount.String(),
+		ClientOrderID:         r.ClientOrderID,
+		ConfirmHighValueOrder: r.ConfirmHighValue,
 	}
 	return fetch.PostOne[PlaceResult](ctx, c.http, "/api/v1/orders", body, c.accountSeq, r.ClientOrderID)
 }
@@ -1882,6 +1938,9 @@ type modifyBody struct {
 // 대표 에러: already-filled, already-canceled, already-modified, already-processing,
 // order-not-found, modify-restricted, order-hours-closed, us-modify-quantity-not-supported.
 func (c *Client) Modify(ctx context.Context, orderID string, r ModifyRequest) (*OperationResult, error) {
+	if err := params.AccountSeq(c.accountSeq); err != nil {
+		return nil, err
+	}
 	if err := params.Require("orderId", orderID); err != nil {
 		return nil, err
 	}
@@ -1904,6 +1963,9 @@ func (c *Client) Modify(ctx context.Context, orderID string, r ModifyRequest) (*
 // 대표 에러: already-filled, already-canceled, already-processing, order-not-found,
 // cancel-restricted, order-hours-closed.
 func (c *Client) Cancel(ctx context.Context, orderID string) (*OperationResult, error) {
+	if err := params.AccountSeq(c.accountSeq); err != nil {
+		return nil, err
+	}
 	if err := params.Require("orderId", orderID); err != nil {
 		return nil, err
 	}
@@ -1934,6 +1996,9 @@ type ListParams struct {
 
 // List 는 주문 목록을 조회한다(GET /api/v1/orders).
 func (c *Client) List(ctx context.Context, p ListParams) (*Page, error) {
+	if err := params.AccountSeq(c.accountSeq); err != nil {
+		return nil, err
+	}
 	if err := params.Require("status", string(p.Status)); err != nil {
 		return nil, err
 	}
@@ -1953,6 +2018,9 @@ func (c *Client) List(ctx context.Context, p ListParams) (*Page, error) {
 
 // Get 은 주문 상세를 조회한다(GET /api/v1/orders/{orderId}). 없으면 404 order-not-found.
 func (c *Client) Get(ctx context.Context, orderID string) (*Order, error) {
+	if err := params.AccountSeq(c.accountSeq); err != nil {
+		return nil, err
+	}
 	if err := params.Require("orderId", orderID); err != nil {
 		return nil, err
 	}
@@ -1993,8 +2061,11 @@ type Commission struct {
 }
 
 // BuyingPower 는 매수 가능 금액을 조회한다(GET /api/v1/buying-power).
-// 대표 에러: unsupported-currency, account-not-found.
+// 대표 에러: invalid-request(지원하지 않는 통화), account-not-found.
 func (c *Client) BuyingPower(ctx context.Context, currency tosstypes.Currency) (*BuyingPower, error) {
+	if err := params.AccountSeq(c.accountSeq); err != nil {
+		return nil, err
+	}
 	if err := params.Require("currency", string(currency)); err != nil {
 		return nil, err
 	}
@@ -2003,6 +2074,9 @@ func (c *Client) BuyingPower(ctx context.Context, currency tosstypes.Currency) (
 
 // SellableQuantity 는 판매 가능 수량을 조회한다(GET /api/v1/sellable-quantity).
 func (c *Client) SellableQuantity(ctx context.Context, symbol string) (*SellableQuantity, error) {
+	if err := params.AccountSeq(c.accountSeq); err != nil {
+		return nil, err
+	}
 	if err := params.Symbol(symbol); err != nil {
 		return nil, err
 	}
@@ -2011,6 +2085,9 @@ func (c *Client) SellableQuantity(ctx context.Context, symbol string) (*Sellable
 
 // Commissions 는 계좌의 매매 수수료율을 조회한다(GET /api/v1/commissions).
 func (c *Client) Commissions(ctx context.Context) ([]Commission, error) {
+	if err := params.AccountSeq(c.accountSeq); err != nil {
+		return nil, err
+	}
 	return fetch.List[Commission](ctx, c.http, "/api/v1/commissions", nil, c.accountSeq)
 }
 EOF
@@ -2021,9 +2098,9 @@ EOF
 ```bash
 gofmt -w . && go vet ./... && go test ./order/ . -race -v 2>&1 | grep -cE '^--- PASS'
 ```
-Expected: order 18 + 루트 11 = `29` (실행 결과로 확인하고 모두 PASS 인지만 본다).
+Expected: order 20 + 루트 13 = `33` (실행 결과로 확인하고 모두 PASS 인지만 본다).
 
-- [ ] **Step 5: 커밋**
+- [x] **Step 5: 커밋**
 
 ```bash
 git add order account.go internal/testutil && git commit -m "feat(order): 주문 생성·정정·취소·조회·주문정보 8 ops

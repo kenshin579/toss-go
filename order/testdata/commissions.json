@@ -1,0 +1,16 @@
+{
+  "result": [
+    {
+      "marketCountry": "KR",
+      "commissionRate": "0.00015",
+      "startDate": "2026-01-01",
+      "endDate": "2026-12-31"
+    },
+    {
+      "marketCountry": "US",
+      "commissionRate": "0.001",
+      "startDate": null,
+      "endDate": "2026-06-30"
+    }
+  ]
+}

@@ -71,6 +71,14 @@ func checkRequest(t *testing.T, r *http.Request, want Expect) {
 	}
 }
 
+// NewServerFunc 는 검증을 호출자가 직접 하는 스텁 서버다(POST 바디 캡처 등).
+func NewServerFunc(t *testing.T, h http.HandlerFunc) (*httpclient.Client, func()) {
+	t.Helper()
+	srv := httptest.NewServer(h)
+	c := httpclient.New(httpclient.Config{BaseURL: srv.URL, HTTPClient: srv.Client(), Tokens: staticTokens{}})
+	return c, srv.Close
+}
+
 // Fixture 는 testdata/<name> 을 읽는다.
 func Fixture(t *testing.T, name string) []byte {
 	t.Helper()

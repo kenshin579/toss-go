@@ -1,0 +1,25 @@
+{
+  "result": {
+    "orderId": "Oqqsu76YSdwKZsdKbPwy-D7buUwy-RH2xZYbYSzAyAnlPy48Al5Lb7FyMKwibw4i",
+    "symbol": "AAPL",
+    "side": "BUY",
+    "orderType": "MARKET",
+    "timeInForce": "DAY",
+    "status": "REJECTED",
+    "price": null,
+    "quantity": "0.5",
+    "orderAmount": null,
+    "currency": "USD",
+    "orderedAt": "2026-03-28T23:30:00+09:00",
+    "canceledAt": null,
+    "execution": {
+      "filledQuantity": "0",
+      "averageFilledPrice": null,
+      "filledAmount": null,
+      "commission": null,
+      "tax": null,
+      "filledAt": null,
+      "settlementDate": null
+    }
+  }
+}

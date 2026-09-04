@@ -5,6 +5,7 @@ import (
 
 	"github.com/kenshin579/toss-go/asset"
 	"github.com/kenshin579/toss-go/internal/fetch"
+	"github.com/kenshin579/toss-go/order"
 )
 
 // AccountScope 는 특정 계좌(accountSeq)에 고정된 sub-client 묶음이다.
@@ -14,6 +15,7 @@ type AccountScope struct {
 	accountSeq int64
 
 	Asset *asset.Client // 자산: 보유 주식
+	Order *order.Client // 주문: 생성·정정·취소·조회·주문 정보
 }
 
 // AccountSeq 는 이 스코프가 고정된 계좌 일련번호를 돌려준다. 생성 후 바뀌지 않는다.
@@ -30,6 +32,7 @@ func (c *Client) Account(accountSeq int64) *AccountScope {
 	return &AccountScope{
 		accountSeq: accountSeq,
 		Asset:      asset.New(c.http, accountSeq),
+		Order:      order.New(c.http, accountSeq),
 	}
 }
 
