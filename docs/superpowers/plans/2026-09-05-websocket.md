@@ -39,7 +39,7 @@
 
 커밋 메시지는 항상 아래 트레일러로 끝낸다:
 ```
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 ```
 
 ---
@@ -697,7 +697,7 @@ Expected: `8`.
 ```bash
 git add stream && git commit -m "feat(stream): 이벤트 타입 + 선언형 구독 집합
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
 
 ---
@@ -1267,7 +1267,7 @@ Expected: `22` (Task 1 의 8 + Task 2 의 14).
 ```bash
 git add stream && git commit -m "feat(stream): 수신 프레임 디코딩·topic 파싱
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
 
 ---
@@ -3138,7 +3138,7 @@ Expected: `54` (Task 1 의 8 + Task 2 의 16 + 이번 29 — `grep -cE '^--- PAS
 ```bash
 go mod tidy && git add stream client.go go.mod go.sum && git commit -m "feat(stream): 연결·PING·재연결·백프레셔 + 공개 Stream API
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
 
 ---
@@ -3257,26 +3257,33 @@ func TestIntegration_Stream(t *testing.T) {
 	if err := s.Subscribe(ctx, stream.Trade(tosstypes.MarketCountryKR, "005930")); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
+
 	// 존재하지 않는 심볼은 rejected 로 돌아온다 — ack 경로가 살아 있다는 증거로 쓴다.
-	if err := s.Subscribe(ctx, stream.Trade(tosstypes.MarketCountryKR, "999999")); err != nil {
+	// Subscribe 는 ack 를 기다렸다 반환하므로 거부는 보통 반환값(*RejectedError)으로 오지만,
+	// 선언 코얼레싱·재선언 타이밍에 따라 Errors() 로만 관측될 수도 있다 — 둘 다 성공으로 본다.
+	var re *stream.RejectedError
+	if err := s.Subscribe(ctx, stream.Trade(tosstypes.MarketCountryKR, "999999")); err != nil && !errors.As(err, &re) {
 		t.Fatalf("Subscribe(bad): %v", err)
 	}
-
-	select {
-	case err := <-s.Errors():
-		var re *stream.RejectedError
-		if !errors.As(err, &re) {
-			t.Fatalf("에러 = %v", err)
+	if re == nil {
+		select {
+		case err := <-s.Errors():
+			if !errors.As(err, &re) {
+				t.Fatalf("에러 = %v", err)
+			}
+		case ev := <-s.Trades():
+			t.Logf("체결 수신: %s %s @ %s", ev.Symbol, ev.Volume, ev.Price)
+		case <-ctx.Done():
+			t.Fatal("ack 도 데이터도 받지 못했다")
 		}
-		if re.Target != "trade:kr:999999" || re.Code == "" {
-			t.Errorf("rejected = %+v", re)
-		}
-		t.Logf("구독 거부 확인: %s (%s)", re.Target, re.Code)
-	case ev := <-s.Trades():
-		t.Logf("체결 수신: %s %s @ %s", ev.Symbol, ev.Volume, ev.Price)
-	case <-ctx.Done():
-		t.Fatal("ack 도 데이터도 받지 못했다")
 	}
+	if re == nil {
+		return // 거부 없이 체결만 받은 경우 — 연결·구독 경로는 이미 확인됐다
+	}
+	if re.Target != "trade:kr:999999" || re.Code == "" {
+		t.Errorf("rejected = %+v", re)
+	}
+	t.Logf("구독 거부 확인: %s (%s)", re.Target, re.Code)
 
 	// 거부된 항목은 집합에서 자동으로 빠진다
 	for _, sub := range s.Subscriptions() {
@@ -3290,6 +3297,10 @@ func TestIntegration_Stream(t *testing.T) {
 EOF
 ```
 import 에 `"errors"`, `"github.com/kenshin579/toss-go/stream"` 를 추가한다(`tosstypes` 는 이미 있다).
+
+> 계획 초안 수정: `Subscribe` 는 ack 를 기다렸다 반환하며 거부 시 `*RejectedError` 를 **반환값으로도** 준다.
+> 따라서 `Subscribe(bad)` 의 에러를 무조건 `t.Fatalf` 하면 정상 거부에서 테스트가 죽는다 — 반환값 거부와
+> `Errors()` 거부를 **둘 다 성공으로** 처리하도록 고쳤다(실호출에서는 반환값 경로로 온다).
 
 ```bash
 gofmt -w . && go vet -tags integration ./... && echo VET_OK
@@ -3343,6 +3354,8 @@ for {
 }
 ```
 
+실행 가능한 예시: `examples/stream`.
+
 **실시간 주의**
 
 - 구독은 **선언형 full-replace** 다. SDK 가 현재 집합을 들고 있다가 `Subscribe`/`Unsubscribe` 때마다
@@ -3362,7 +3375,7 @@ for {
 gofmt -l . ; go build ./... && go vet ./... && go vet -tags integration ./... && go test ./... -race -count=1 2>&1 | tail -18 && go mod tidy && git status --short
 git add -A && git commit -m "docs: 실시간 스트림 예시·integration·README
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
 Expected: 전 패키지 `ok`, `go mod tidy` 후 변경 없음.
 

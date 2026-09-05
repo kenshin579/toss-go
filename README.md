@@ -5,6 +5,7 @@
 - OAuth2 Client Credentials 토큰 자동 발급·캐시(만료 60초 전 갱신, 401 토큰 오류 시 1회 재발급)
 - 수치는 [`shopspring/decimal`](https://github.com/shopspring/decimal), 시각은 `time.Time`(KST 오프셋), 날짜는 `tosstypes.Date`
 - 토스 에러 봉투를 `*toss.APIError`(StatusCode / Code / RequestID / Data / RetryAfter)로 매핑. `toss.IsCode(err, toss.CodeStockNotFound)`
+- 실시간 웹소켓 스트림(체결·호가·본인 주문) — 선언형 full-replace 구독, 자동 재연결·재선언
 - 429/5xx 재시도·스로틀링 없음(401 토큰 오류만 1회 재발급) — 429 는 `APIError.RetryAfter` 로 전달되며 속도 조절은 호출자 책임
 
 ## 설치
@@ -36,6 +37,7 @@ import (
     toss "github.com/kenshin579/toss-go"
     "github.com/kenshin579/toss-go/marketdata"
     "github.com/kenshin579/toss-go/stockinfo"
+    "github.com/kenshin579/toss-go/stream"
     "github.com/kenshin579/toss-go/tosstypes"
 )
 ```
@@ -95,6 +97,46 @@ res, err := a.Order.Place(ctx, order.PlaceRequest{
 - SDK 는 요청 조립 오류(필수 누락·형식)만 검증한다. 호가단위·잔고·거래시간 같은 상태 의존 규칙은
   서버가 판단하며 `*toss.APIError` 로 돌아온다.
 
+### 실시간 스트림
+
+```go
+s, err := c.Stream(ctx)
+defer s.Close()
+
+s.Subscribe(ctx,
+    stream.Trade(tosstypes.MarketCountryKR, "005930"),
+    stream.PersonalOrder(accountSeq), // codes 는 종목이 아니라 계좌 accountSeq
+)
+
+for {
+    select {
+    case t := <-s.Trades():
+        fmt.Println(t.Symbol, t.Price)
+    case ev := <-s.Orders():
+        fmt.Println(ev.Event, ev.Order.OrderID)
+    case r := <-s.Reconnects():
+        // 끊긴 구간의 주문 이벤트는 재전송되지 않는다 — REST 로 재동기화한다
+        _ = r
+        page, _ := a.Order.List(ctx, order.ListParams{Status: order.StatusFilterOpen})
+        _ = page
+    case err := <-s.Errors():
+        fmt.Println(err)
+    }
+}
+```
+
+실행 가능한 예시: `examples/stream`.
+
+**실시간 주의**
+
+- 구독은 **선언형 full-replace** 다. SDK 가 현재 집합을 들고 있다가 `Subscribe`/`Unsubscribe` 때마다
+  전체를 다시 선언하고, 재연결 시 자동으로 재선언한다. 거부된 항목은 집합에서 자동으로 빠진다.
+- **재연결 구간의 주문 이벤트는 복구되지 않는다.** `Reconnects()` 신호를 받으면 REST 로 주문 상태를 맞춘다.
+- `Orders()` 를 계속 소비하지 않으면 버퍼가 차고 SDK 가 연결을 끊는다(`ReconnectBackpressure`).
+  시세 채널은 대신 오래된 이벤트를 버린다.
+- 한도: 계정당 동시 연결 **2개**, 연결당 구독 **100건**(채널×종목 조합), 선언 **5회/초**.
+- keepalive PING 은 SDK 가 보낸다(기본 60초). 별도로 보낼 필요가 없다.
+
 ## 커버리지
 
 | 그룹 | 필드 | 메서드 |
@@ -114,7 +156,19 @@ res, err := a.Order.Place(ctx, order.PlaceRequest{
 | Order | `Order` | `Place` `PlaceAmount` `Modify` `Cancel` `List` `Get` `BuyingPower` `SellableQuantity` `Commissions` |
 | Conditional Order | `ConditionalOrder` | `Place` `Modify` `Cancel` `List` `Get` |
 
-조회 21 + 계좌·주문 15 = 36 ops (v0.2.0). 실시간 웹소켓은 후속 버전.
+### 실시간(WebSocket)
+
+| 채널 | 접근자 | 전달 보장 |
+| --- | --- | --- |
+| 체결 | `Trades()` | LOSSY — 소비가 밀리면 오래된 이벤트가 버려진다 |
+| 호가 | `Orderbooks()` | LOSSY |
+| 본인 주문 | `Orders()` | 연결 세션 내 LOSSLESS |
+| 재연결 알림 | `Reconnects()` | — |
+| 구독 거부·에러 | `Errors()` | — |
+
+`c.Stream(ctx)` 로 연결하고 `stream.Trade` / `stream.Orderbook` / `stream.PersonalOrder` 로 구독한다.
+
+조회 21 + 계좌·주문 15 = 36 ops + 실시간 스트림(체결·호가·본인 주문).
 
 ## 문서
 
