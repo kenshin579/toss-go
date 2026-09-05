@@ -51,11 +51,6 @@ func newTestServer(t *testing.T) *testServer {
 			ts.maxLive = ts.live
 		}
 		ts.mu.Unlock()
-		defer func() {
-			ts.mu.Lock()
-			ts.live--
-			ts.mu.Unlock()
-		}()
 
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
@@ -63,6 +58,13 @@ func newTestServer(t *testing.T) *testServer {
 			for {
 				_, data, err := c.Read(ctx)
 				if err != nil {
+					// 연결이 죽었다는 것을 서버가 처음 아는 지점이다(핸들러 바깥의 defer 로
+					// 미루면 outer select 가 ctx.Done() 을 관측하고 CloseNow 를 부르는 goroutine
+					// 스케줄링 홉이 최소 1~2번 더 끼어들어, 그 사이 새 연결이 뜬 것처럼 관측될 수
+					// 있다 — live-- 는 여기 한 곳에서만 한다(핸들러 쪽에는 defer 로 두지 않는다).
+					ts.mu.Lock()
+					ts.live--
+					ts.mu.Unlock()
 					cancel()
 					return
 				}

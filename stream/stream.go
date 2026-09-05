@@ -189,10 +189,7 @@ func (s *Stream) Declare(ctx context.Context, subs ...Subscription) error {
 // *RejectedError 를, 선언 자체가 실패했으면 그 에러를 돌려준다.
 func (s *Stream) declareAndWait(ctx context.Context, keys []string) error {
 	ch := make(chan ackResult, 1)
-	s.mu.Lock()
-	s.pendingWaiters = append(s.pendingWaiters, ch)
-	s.mu.Unlock()
-	s.requestDeclare()
+	s.registerWaiter(ch)
 
 	select {
 	case res := <-ch:
@@ -256,6 +253,19 @@ func (s *Stream) requestDeclare() {
 	case s.declareCh <- struct{}{}:
 	default: // 이미 예약돼 있으면 합친다(선언 5회/초 한도 대응)
 	}
+}
+
+// registerWaiter 는 대기자를 등록하고 선언을 요청하는 것을 하나의 임계구역으로 묶는다 —
+// declareLoop 의 snapshot+drain 도 같은 s.mu 로 원자적이라(아래 참고), 이 둘이 상호 배타적이 되어
+// "등록은 이번 배치에 잡혔는데 신호는 다음 drain 에 먹혀 requestDeclare 없이 방치되는" 창이 없다.
+func (s *Stream) registerWaiter(ch chan ackResult) {
+	s.mu.Lock()
+	s.pendingWaiters = append(s.pendingWaiters, ch)
+	select {
+	case s.declareCh <- struct{}{}:
+	default:
+	}
+	s.mu.Unlock()
 }
 
 // run 은 연결 수명 주기를 관리한다: 읽기·PING·선언 루프를 돌리고, 끊기면 재연결한다.
@@ -499,18 +509,19 @@ func (s *Stream) declareLoop(ctx context.Context) {
 			}
 			id := "d-" + strconv.FormatInt(s.seq.Add(1), 10)
 
+			// snapshot 과 drain 을 하나의 임계구역으로 묶는다 — registerWaiter 의 append+signal 도
+			// 같은 s.mu 로 원자적이므로, 이 둘은 서로 완전히 앞서거나 뒤서게 된다: 요청이 이 스냅샷에
+			// 잡혔다면 그 요청이 남긴 신호도 반드시 이 안에서 함께 지워지고(잔여 토큰에 의한 대기자
+			// 없는 중복 선언 없음), 스냅샷 뒤에 등록됐다면 신호도 그대로 살아남아 다음 루프가 정확히
+			// 그 요청을 처리한다(신호가 먼저 사라져 대기자가 다음 requestDeclare 까지 방치되는 일 없음).
 			s.mu.Lock()
 			waiting := s.pendingWaiters
 			s.pendingWaiters = nil
-			s.mu.Unlock()
-			// 위 coalesce-drain 과 이 스냅샷 사이에 들어온 요청은 이미 이 배치(waiting)에 잡혔지만,
-			// 그 요청이 requestDeclare 로 declareCh 에 남긴 신호는 아직 안 지워졌을 수 있다 —
-			// 그대로 두면 대기자 없는 중복 선언이 하나 더 나가 5회/초 예산을 낭비한다. 스냅샷
-			// 직후 한 번 더(비차단) 흡수한다.
 			select {
 			case <-s.declareCh:
 			default:
 			}
+			s.mu.Unlock()
 
 			body, err := s.subs.declaration(id)
 			if err != nil {
@@ -527,18 +538,15 @@ func (s *Stream) declareLoop(ctx context.Context) {
 				s.resolveWaiters(waiting, ackResult{err: errNotConnected})
 				continue
 			}
-			if err := c.Write(ctx, websocket.MessageText, body); err != nil {
-				werr := fmt.Errorf("toss: declare: %w", err)
-				s.emitErr(werr)
-				s.resolveWaiters(waiting, ackResult{err: werr})
-				return
-			}
 			if isEmptyDeclaration(body) {
 				// 빈 배열은 프로토콜상 id 없이 `[]` 로만 전송되는 전체 해제 전용 형태라 서버도
-				// 개별 subscriptions ack 를 보내지 않는다. 거부될 항목이 있을 수 없으므로 즉시
-				// 성공으로 풀어준다(id 도 기록하지 않는다 — 실제로 echo 될 id 가 없다). full-replace
-				// 라 이 선언이 이전 선언들을 전부 대체한다 — 앞서 쌓인 채 아직 ack 를 못 받은
-				// 배치가 있다면(예: rate-limit 로 대기 중이던 것) 그 대기자도 함께 풀어준다.
+				// 개별 subscriptions ack 를 보내지 않는다 — 그래서 아래(비어 있지 않은 경우)의
+				// "쓰기 전에 등록" 규칙과 무관하다: 애초에 매칭할 id 가 없으니 ack 가 등록을
+				// 앞지를 일도 없다. 그래도 소켓에는 반드시 써야 한다(`[]` 를 실제로 보내지 않으면
+				// 서버 구독이 그대로 남는다) — 쓰기 성공을 확인한 뒤에만 성공으로 풀어준다.
+				// full-replace 라 이 선언이 이전 선언들을 전부 대체한다 — 앞서 쌓인 채 아직 ack
+				// 를 못 받은 배치가 있다면(예: rate-limit 로 대기 중이던 것) 그 대기자도 함께
+				// 풀어준다(id 를 기록하지 않는다 — 실제로 echo 될 id 가 없다).
 				s.mu.Lock()
 				carried := waiting
 				for _, b := range s.waiterBatches {
@@ -546,18 +554,26 @@ func (s *Stream) declareLoop(ctx context.Context) {
 				}
 				s.waiterBatches = nil
 				s.mu.Unlock()
+				if err := c.Write(ctx, websocket.MessageText, body); err != nil {
+					werr := fmt.Errorf("toss: declare: %w", err)
+					s.emitErr(werr)
+					s.resolveWaiters(carried, ackResult{err: werr})
+					return
+				}
 				s.resolveWaiters(carried, ackResult{})
 				continue
 			}
-			// 실제로 보낸 선언만 기록한다 — 보내지 못한 id 를 기록하면 그 다음에 도착하는
-			// 정상 ack 가 stale 로 오인돼 거부 항목이 집합에 남는다.
+			// 등록을 쓰기보다 먼저 한다 — 반대 순서면 readLoop 이 동시에 도는 goroutine이라, 서버
+			// ack 가 이 등록보다 먼저 도착해 처리될 수 있다. 그러면 takeBatch(id) 가 아직 없는
+			// 배치를 찾지 못해 ack 는 소비된 채 버려지고, 뒤이어 등록되는 배치는 그 id 로 다시는
+			// ack 를 받을 수 없어 영구 고아가 된다(호출자가 무기한 대기). full-replace 라 이 선언이
+			// 이전 선언들을 전부 대체한다 — 서버가 error 프레임에는 id 를 echo 하지 않는 경우가
+			// 있어(예: rate-limit-exceeded), 그런 선언에 매달린 배치는 결코 자기 id 로 된 ack 를
+			// 받지 못한다 — 방치하면 그 배치의 호출자가 영원히 막히고 waiterBatches 도 연결 수명
+			// 내내 계속 자란다. 이번에 새로 보낼 선언에 흡수해 이번 선언의 ack 가 대신 풀어주게 한다.
 			s.mu.Lock()
+			prevID := s.lastDeclareID
 			s.lastDeclareID = id
-			// full-replace 라 이 선언이 이전 선언들을 전부 대체한다. 서버가 error 프레임에는 id 를
-			// echo 하지 않는 경우가 있어(예: rate-limit-exceeded), 그런 선언에 매달린 배치는 결코
-			// 자기 id 로 된 ack 를 받지 못한다 — 방치하면 그 배치의 호출자가 영원히 막히고
-			// waiterBatches 도 연결 수명 내내 계속 자란다. 이번에 새로 보낸 선언에 흡수해 이번
-			// 선언의 ack 가 대신 풀어주게 한다.
 			carried := waiting
 			for _, b := range s.waiterBatches {
 				carried = append(carried, b.waiters...)
@@ -567,6 +583,22 @@ func (s *Stream) declareLoop(ctx context.Context) {
 				s.waiterBatches = append(s.waiterBatches, declareBatch{id: id, waiters: carried})
 			}
 			s.mu.Unlock()
+
+			if err := c.Write(ctx, websocket.MessageText, body); err != nil {
+				// 못 보낸 선언이니 되돌린다 — id 를 남기면 다음 ack 가 stale 로 오인되고, 방금
+				// 등록한 배치는 애초에 ack 를 받을 길이 없으니 여기서 직접 실패로 풀어준다.
+				s.mu.Lock()
+				s.lastDeclareID = prevID
+				chs := s.waiterBatches
+				s.waiterBatches = nil
+				s.mu.Unlock()
+				werr := fmt.Errorf("toss: declare: %w", err)
+				s.emitErr(werr)
+				for _, b := range chs {
+					s.resolveWaiters(b.waiters, ackResult{err: werr})
+				}
+				return
+			}
 		}
 	}
 }
@@ -630,6 +662,13 @@ func (s *Stream) failAllWaiters(err error) {
 			ch <- res
 		}
 	}
+}
+
+// pendingBatchCountForTest 는 아직 해소되지 않은 대기 배치 수다(테스트 전용).
+func (s *Stream) pendingBatchCountForTest() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.waiterBatches)
 }
 
 // retryDeclareAfter 는 d 후에 선언을 한 번 더 요청한다. 연결이 끝나면 취소된다.

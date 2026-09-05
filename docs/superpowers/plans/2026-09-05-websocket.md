@@ -1444,11 +1444,6 @@ func newTestServer(t *testing.T) *testServer {
 			ts.maxLive = ts.live
 		}
 		ts.mu.Unlock()
-		defer func() {
-			ts.mu.Lock()
-			ts.live--
-			ts.mu.Unlock()
-		}()
 
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
@@ -1456,6 +1451,13 @@ func newTestServer(t *testing.T) *testServer {
 			for {
 				_, data, err := c.Read(ctx)
 				if err != nil {
+					// 연결이 죽었다는 것을 서버가 처음 아는 지점이다(핸들러 바깥의 defer 로
+					// 미루면 outer select 가 ctx.Done() 을 관측하고 CloseNow 를 부르는 goroutine
+					// 스케줄링 홉이 최소 1~2번 더 끼어들어, 그 사이 새 연결이 뜬 것처럼 관측될 수
+					// 있다 — live-- 는 여기 한 곳에서만 한다(핸들러 쪽에는 defer 로 두지 않는다).
+					ts.mu.Lock()
+					ts.live--
+					ts.mu.Unlock()
 					cancel()
 					return
 				}
@@ -1581,6 +1583,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1992,12 +1996,16 @@ func TestStream_ClosesOldConnBeforeReconnect(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			t.Fatalf("재연결 %d 회차 미수신", reconnects+1)
 		}
-		// 스텁 서버는 옛 연결의 live-- 를 비동기로 처리한다(Read 에러 → cancel → outer select →
-		// CloseNow → defer, 최소 goroutine 스케줄링 2~3홉). 클라이언트는 첫 재시도를 즉시(0 대기)
-		// 하므로, 바로 다음 백프레셔를 몰아치면 그 비동기 처리가 아직 안 끝난 상태에서 새 연결이
-		// 뜬 것처럼 관측될 수 있다(실제로 클라이언트가 옛 연결을 안 닫아서가 아니라, 스텁의 회계가
-		// 새 다이얼을 못 따라간 것 — closeConn 은 프로그램 순서상 항상 다음 dial 보다 먼저 끝난다).
-		// 다음 라운드로 넘어가기 전에 짧게 쉬어 회계가 안정되게 한다.
+		// 클라이언트 쪽 순서(closeConn → dial)는 run() 안에서 순차적으로 보장된다.
+		// 이 테스트는 그 순서가 나중에 뒤바뀌는 것을 막는 방어선이며, maxConcurrent 는
+		// 서버 쪽에서 관측한 확률적 근사치다(디크리먼트가 클라이언트의 CloseNow 와 비동기다).
+		//
+		// 스텁의 live-- 는 이제 읽기 루프가 Read 에러를 처음 관측하는 지점에서 바로 일어난다(핸들러
+		// 바깥의 defer 로 미루지 않는다 — 그러면 outer select 가 ctx.Done() 을 보고 CloseNow 를
+		// 부르는 홉이 한 번 더 끼어든다). 그래도 클라이언트가 CloseNow 를 부른 뒤 그 FIN 을 서버 쪽
+		// OS 가 받아 Read 가 에러를 반환하기까지는 여전히 비동기다 — 첫 재시도가 즉시(0 대기)라 이
+		// 처리가 안 끝난 상태에서 새 연결이 뜬 것처럼 보일 수 있다. 다음 라운드로 넘어가기 전에
+		// 짧게 쉬어 회계가 안정되게 한다.
 		time.Sleep(20 * time.Millisecond)
 	}
 	if got := ts.maxConcurrent(); got > 1 {
@@ -2193,6 +2201,40 @@ func TestSubscribe_SurvivesIDlessErrorFrame(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("Subscribe 가 영원히 대기한다 — 고아 배치")
 	}
+}
+
+// TestDeclare_ConcurrentFloodAlwaysReturns 는 declareLoop 가 소켓에 쓴 뒤에 배치를 등록하면 생기는
+// 경합 — readLoop 이 등록보다 먼저 ack 를 처리해 배치가 영구 고아가 되는 문제 — 를 잡는다.
+// 단일 스레드로는 재현되지 않으므로 반드시 동시 부하로 두드린다.
+func TestDeclare_ConcurrentFloodAlwaysReturns(t *testing.T) {
+	// ack 가 배치 등록을 앞지르면 호출자가 영원히 막힌다. 동시에 두드려 모든 호출이 반환되는지 본다.
+	ts := newTestServer(t)
+	s := newTestStream(t, ts, WithCoalesceDelay(time.Millisecond))
+	waitFor(t, "connection", func() bool { return ts.connCount() >= 1 })
+
+	const workers, iters = 8, 60
+	var wg sync.WaitGroup
+	var stuck atomic.Int32
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				err := s.Declare(ctx, Trade(tosstypes.MarketCountryKR, fmt.Sprintf("%06d", w*iters+i)))
+				if errors.Is(err, context.DeadlineExceeded) {
+					stuck.Add(1)
+				}
+				cancel()
+			}
+		}(w)
+	}
+	wg.Wait()
+	if n := stuck.Load(); n > 0 {
+		t.Errorf("%d 건이 ack 를 받지 못하고 대기했다 — 배치 등록이 ack 보다 늦다", n)
+	}
+	// 정지 상태에서는 남은 배치가 없어야 한다
+	waitFor(t, "no orphan batches", func() bool { return s.pendingBatchCountForTest() == 0 })
 }
 
 func asRejected(err error, target **RejectedError) bool { return errors.As(err, target) }
@@ -2508,10 +2550,7 @@ func (s *Stream) Declare(ctx context.Context, subs ...Subscription) error {
 // *RejectedError 를, 선언 자체가 실패했으면 그 에러를 돌려준다.
 func (s *Stream) declareAndWait(ctx context.Context, keys []string) error {
 	ch := make(chan ackResult, 1)
-	s.mu.Lock()
-	s.pendingWaiters = append(s.pendingWaiters, ch)
-	s.mu.Unlock()
-	s.requestDeclare()
+	s.registerWaiter(ch)
 
 	select {
 	case res := <-ch:
@@ -2575,6 +2614,19 @@ func (s *Stream) requestDeclare() {
 	case s.declareCh <- struct{}{}:
 	default: // 이미 예약돼 있으면 합친다(선언 5회/초 한도 대응)
 	}
+}
+
+// registerWaiter 는 대기자를 등록하고 선언을 요청하는 것을 하나의 임계구역으로 묶는다 —
+// declareLoop 의 snapshot+drain 도 같은 s.mu 로 원자적이라(아래 참고), 이 둘이 상호 배타적이 되어
+// "등록은 이번 배치에 잡혔는데 신호는 다음 drain 에 먹혀 requestDeclare 없이 방치되는" 창이 없다.
+func (s *Stream) registerWaiter(ch chan ackResult) {
+	s.mu.Lock()
+	s.pendingWaiters = append(s.pendingWaiters, ch)
+	select {
+	case s.declareCh <- struct{}{}:
+	default:
+	}
+	s.mu.Unlock()
 }
 
 // run 은 연결 수명 주기를 관리한다: 읽기·PING·선언 루프를 돌리고, 끊기면 재연결한다.
@@ -2818,18 +2870,19 @@ func (s *Stream) declareLoop(ctx context.Context) {
 			}
 			id := "d-" + strconv.FormatInt(s.seq.Add(1), 10)
 
+			// snapshot 과 drain 을 하나의 임계구역으로 묶는다 — registerWaiter 의 append+signal 도
+			// 같은 s.mu 로 원자적이므로, 이 둘은 서로 완전히 앞서거나 뒤서게 된다: 요청이 이 스냅샷에
+			// 잡혔다면 그 요청이 남긴 신호도 반드시 이 안에서 함께 지워지고(잔여 토큰에 의한 대기자
+			// 없는 중복 선언 없음), 스냅샷 뒤에 등록됐다면 신호도 그대로 살아남아 다음 루프가 정확히
+			// 그 요청을 처리한다(신호가 먼저 사라져 대기자가 다음 requestDeclare 까지 방치되는 일 없음).
 			s.mu.Lock()
 			waiting := s.pendingWaiters
 			s.pendingWaiters = nil
-			s.mu.Unlock()
-			// 위 coalesce-drain 과 이 스냅샷 사이에 들어온 요청은 이미 이 배치(waiting)에 잡혔지만,
-			// 그 요청이 requestDeclare 로 declareCh 에 남긴 신호는 아직 안 지워졌을 수 있다 —
-			// 그대로 두면 대기자 없는 중복 선언이 하나 더 나가 5회/초 예산을 낭비한다. 스냅샷
-			// 직후 한 번 더(비차단) 흡수한다.
 			select {
 			case <-s.declareCh:
 			default:
 			}
+			s.mu.Unlock()
 
 			body, err := s.subs.declaration(id)
 			if err != nil {
@@ -2846,18 +2899,15 @@ func (s *Stream) declareLoop(ctx context.Context) {
 				s.resolveWaiters(waiting, ackResult{err: errNotConnected})
 				continue
 			}
-			if err := c.Write(ctx, websocket.MessageText, body); err != nil {
-				werr := fmt.Errorf("toss: declare: %w", err)
-				s.emitErr(werr)
-				s.resolveWaiters(waiting, ackResult{err: werr})
-				return
-			}
 			if isEmptyDeclaration(body) {
 				// 빈 배열은 프로토콜상 id 없이 `[]` 로만 전송되는 전체 해제 전용 형태라 서버도
-				// 개별 subscriptions ack 를 보내지 않는다. 거부될 항목이 있을 수 없으므로 즉시
-				// 성공으로 풀어준다(id 도 기록하지 않는다 — 실제로 echo 될 id 가 없다). full-replace
-				// 라 이 선언이 이전 선언들을 전부 대체한다 — 앞서 쌓인 채 아직 ack 를 못 받은
-				// 배치가 있다면(예: rate-limit 로 대기 중이던 것) 그 대기자도 함께 풀어준다.
+				// 개별 subscriptions ack 를 보내지 않는다 — 그래서 아래(비어 있지 않은 경우)의
+				// "쓰기 전에 등록" 규칙과 무관하다: 애초에 매칭할 id 가 없으니 ack 가 등록을
+				// 앞지를 일도 없다. 그래도 소켓에는 반드시 써야 한다(`[]` 를 실제로 보내지 않으면
+				// 서버 구독이 그대로 남는다) — 쓰기 성공을 확인한 뒤에만 성공으로 풀어준다.
+				// full-replace 라 이 선언이 이전 선언들을 전부 대체한다 — 앞서 쌓인 채 아직 ack
+				// 를 못 받은 배치가 있다면(예: rate-limit 로 대기 중이던 것) 그 대기자도 함께
+				// 풀어준다(id 를 기록하지 않는다 — 실제로 echo 될 id 가 없다).
 				s.mu.Lock()
 				carried := waiting
 				for _, b := range s.waiterBatches {
@@ -2865,18 +2915,26 @@ func (s *Stream) declareLoop(ctx context.Context) {
 				}
 				s.waiterBatches = nil
 				s.mu.Unlock()
+				if err := c.Write(ctx, websocket.MessageText, body); err != nil {
+					werr := fmt.Errorf("toss: declare: %w", err)
+					s.emitErr(werr)
+					s.resolveWaiters(carried, ackResult{err: werr})
+					return
+				}
 				s.resolveWaiters(carried, ackResult{})
 				continue
 			}
-			// 실제로 보낸 선언만 기록한다 — 보내지 못한 id 를 기록하면 그 다음에 도착하는
-			// 정상 ack 가 stale 로 오인돼 거부 항목이 집합에 남는다.
+			// 등록을 쓰기보다 먼저 한다 — 반대 순서면 readLoop 이 동시에 도는 goroutine이라, 서버
+			// ack 가 이 등록보다 먼저 도착해 처리될 수 있다. 그러면 takeBatch(id) 가 아직 없는
+			// 배치를 찾지 못해 ack 는 소비된 채 버려지고, 뒤이어 등록되는 배치는 그 id 로 다시는
+			// ack 를 받을 수 없어 영구 고아가 된다(호출자가 무기한 대기). full-replace 라 이 선언이
+			// 이전 선언들을 전부 대체한다 — 서버가 error 프레임에는 id 를 echo 하지 않는 경우가
+			// 있어(예: rate-limit-exceeded), 그런 선언에 매달린 배치는 결코 자기 id 로 된 ack 를
+			// 받지 못한다 — 방치하면 그 배치의 호출자가 영원히 막히고 waiterBatches 도 연결 수명
+			// 내내 계속 자란다. 이번에 새로 보낼 선언에 흡수해 이번 선언의 ack 가 대신 풀어주게 한다.
 			s.mu.Lock()
+			prevID := s.lastDeclareID
 			s.lastDeclareID = id
-			// full-replace 라 이 선언이 이전 선언들을 전부 대체한다. 서버가 error 프레임에는 id 를
-			// echo 하지 않는 경우가 있어(예: rate-limit-exceeded), 그런 선언에 매달린 배치는 결코
-			// 자기 id 로 된 ack 를 받지 못한다 — 방치하면 그 배치의 호출자가 영원히 막히고
-			// waiterBatches 도 연결 수명 내내 계속 자란다. 이번에 새로 보낸 선언에 흡수해 이번
-			// 선언의 ack 가 대신 풀어주게 한다.
 			carried := waiting
 			for _, b := range s.waiterBatches {
 				carried = append(carried, b.waiters...)
@@ -2886,6 +2944,22 @@ func (s *Stream) declareLoop(ctx context.Context) {
 				s.waiterBatches = append(s.waiterBatches, declareBatch{id: id, waiters: carried})
 			}
 			s.mu.Unlock()
+
+			if err := c.Write(ctx, websocket.MessageText, body); err != nil {
+				// 못 보낸 선언이니 되돌린다 — id 를 남기면 다음 ack 가 stale 로 오인되고, 방금
+				// 등록한 배치는 애초에 ack 를 받을 길이 없으니 여기서 직접 실패로 풀어준다.
+				s.mu.Lock()
+				s.lastDeclareID = prevID
+				chs := s.waiterBatches
+				s.waiterBatches = nil
+				s.mu.Unlock()
+				werr := fmt.Errorf("toss: declare: %w", err)
+				s.emitErr(werr)
+				for _, b := range chs {
+					s.resolveWaiters(b.waiters, ackResult{err: werr})
+				}
+				return
+			}
 		}
 	}
 }
@@ -2951,6 +3025,13 @@ func (s *Stream) failAllWaiters(err error) {
 	}
 }
 
+// pendingBatchCountForTest 는 아직 해소되지 않은 대기 배치 수다(테스트 전용).
+func (s *Stream) pendingBatchCountForTest() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.waiterBatches)
+}
+
 // retryDeclareAfter 는 d 후에 선언을 한 번 더 요청한다. 연결이 끝나면 취소된다.
 //
 // 이 goroutine 은 WaitGroup 에 넣지 않는다 — declareCh 는 절대 닫히지 않으므로 채널 종료 후에도
@@ -3008,7 +3089,7 @@ func (c *Client) Stream(ctx context.Context, opts ...stream.Option) (*stream.Str
 ```bash
 gofmt -w . && go vet ./... && go test ./stream/ -race -count=1 -v 2>&1 | grep -cE '^--- PASS'
 ```
-Expected: `52` (Task 1 의 8 + Task 2 의 16 + 이번 28 — `grep -cE '^--- PASS'` 는 앞에 공백이 붙는 서브테스트 줄을 세지 않는다. 15(최초 구현) + rate-limit 재선언·재연결 전 종료·낡은 ack 무시 리뷰 테스트 3개 + 옵션 값 검증·pushLossy·ack 대기형 Subscribe·자동재연결 꺼짐 진단 2차 리뷰 테스트 8개 + 백프레셔 재연결 폭주·고아 대기 배치 3차 리뷰(liveness) 회귀 테스트 2개 = 28). 실행 결과로 확인하고 모두 PASS 인지만 본다.
+Expected: `53` (Task 1 의 8 + Task 2 의 16 + 이번 29 — `grep -cE '^--- PASS'` 는 앞에 공백이 붙는 서브테스트 줄을 세지 않는다. 15(최초 구현) + rate-limit 재선언·재연결 전 종료·낡은 ack 무시 리뷰 테스트 3개 + 옵션 값 검증·pushLossy·ack 대기형 Subscribe·자동재연결 꺼짐 진단 2차 리뷰 테스트 8개 + 백프레셔 재연결 폭주·고아 대기 배치 3차 리뷰(liveness) 회귀 테스트 2개 + ack 가 배치 등록을 앞지르는 경합(4차 리뷰, 동시 부하) 회귀 테스트 1개 = 29). 실행 결과로 확인하고 모두 PASS 인지만 본다.
 
 - [x] **Step 6: 커밋**
 

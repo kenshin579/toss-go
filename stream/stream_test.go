@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -416,12 +418,16 @@ func TestStream_ClosesOldConnBeforeReconnect(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			t.Fatalf("재연결 %d 회차 미수신", reconnects+1)
 		}
-		// 스텁 서버는 옛 연결의 live-- 를 비동기로 처리한다(Read 에러 → cancel → outer select →
-		// CloseNow → defer, 최소 goroutine 스케줄링 2~3홉). 클라이언트는 첫 재시도를 즉시(0 대기)
-		// 하므로, 바로 다음 백프레셔를 몰아치면 그 비동기 처리가 아직 안 끝난 상태에서 새 연결이
-		// 뜬 것처럼 관측될 수 있다(실제로 클라이언트가 옛 연결을 안 닫아서가 아니라, 스텁의 회계가
-		// 새 다이얼을 못 따라간 것 — closeConn 은 프로그램 순서상 항상 다음 dial 보다 먼저 끝난다).
-		// 다음 라운드로 넘어가기 전에 짧게 쉬어 회계가 안정되게 한다.
+		// 클라이언트 쪽 순서(closeConn → dial)는 run() 안에서 순차적으로 보장된다.
+		// 이 테스트는 그 순서가 나중에 뒤바뀌는 것을 막는 방어선이며, maxConcurrent 는
+		// 서버 쪽에서 관측한 확률적 근사치다(디크리먼트가 클라이언트의 CloseNow 와 비동기다).
+		//
+		// 스텁의 live-- 는 이제 읽기 루프가 Read 에러를 처음 관측하는 지점에서 바로 일어난다(핸들러
+		// 바깥의 defer 로 미루지 않는다 — 그러면 outer select 가 ctx.Done() 을 보고 CloseNow 를
+		// 부르는 홉이 한 번 더 끼어든다). 그래도 클라이언트가 CloseNow 를 부른 뒤 그 FIN 을 서버 쪽
+		// OS 가 받아 Read 가 에러를 반환하기까지는 여전히 비동기다 — 첫 재시도가 즉시(0 대기)라 이
+		// 처리가 안 끝난 상태에서 새 연결이 뜬 것처럼 보일 수 있다. 다음 라운드로 넘어가기 전에
+		// 짧게 쉬어 회계가 안정되게 한다.
 		time.Sleep(20 * time.Millisecond)
 	}
 	if got := ts.maxConcurrent(); got > 1 {
@@ -617,6 +623,40 @@ func TestSubscribe_SurvivesIDlessErrorFrame(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("Subscribe 가 영원히 대기한다 — 고아 배치")
 	}
+}
+
+// TestDeclare_ConcurrentFloodAlwaysReturns 는 declareLoop 가 소켓에 쓴 뒤에 배치를 등록하면 생기는
+// 경합 — readLoop 이 등록보다 먼저 ack 를 처리해 배치가 영구 고아가 되는 문제 — 를 잡는다.
+// 단일 스레드로는 재현되지 않으므로 반드시 동시 부하로 두드린다.
+func TestDeclare_ConcurrentFloodAlwaysReturns(t *testing.T) {
+	// ack 가 배치 등록을 앞지르면 호출자가 영원히 막힌다. 동시에 두드려 모든 호출이 반환되는지 본다.
+	ts := newTestServer(t)
+	s := newTestStream(t, ts, WithCoalesceDelay(time.Millisecond))
+	waitFor(t, "connection", func() bool { return ts.connCount() >= 1 })
+
+	const workers, iters = 8, 60
+	var wg sync.WaitGroup
+	var stuck atomic.Int32
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				err := s.Declare(ctx, Trade(tosstypes.MarketCountryKR, fmt.Sprintf("%06d", w*iters+i)))
+				if errors.Is(err, context.DeadlineExceeded) {
+					stuck.Add(1)
+				}
+				cancel()
+			}
+		}(w)
+	}
+	wg.Wait()
+	if n := stuck.Load(); n > 0 {
+		t.Errorf("%d 건이 ack 를 받지 못하고 대기했다 — 배치 등록이 ack 보다 늦다", n)
+	}
+	// 정지 상태에서는 남은 배치가 없어야 한다
+	waitFor(t, "no orphan batches", func() bool { return s.pendingBatchCountForTest() == 0 })
 }
 
 func asRejected(err error, target **RejectedError) bool { return errors.As(err, target) }
