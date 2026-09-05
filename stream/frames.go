@@ -81,9 +81,12 @@ func decodeFrame(raw []byte) (frame, error) {
 		f.kind = frameMessage
 	case "error":
 		f.kind = frameError
-		if w.Error != nil {
+		if w.Error != nil && w.Error.Code != "" {
 			f.errCode, f.errMessage = w.Error.Code, w.Error.Message
 		} else {
+			if w.Error != nil {
+				f.errMessage = w.Error.Message
+			}
 			f.errCode = "unknown" // 서버가 새 에러 형태를 보내도 스트림을 죽이지 않되, 메시지는 진단 가능하게
 		}
 	case "pong":
@@ -131,6 +134,11 @@ func (f frame) tradeEvent() (TradeEvent, error) {
 	if err := json.Unmarshal(f.data, &w); err != nil {
 		return TradeEvent{}, fmt.Errorf("toss: decode trade data: %w", err)
 	}
+	// 값 검증 — 빈 객체나 일부 필드만 담긴 payload 는 언마샬이 통과해 zero value(가격 0 체결)를 만든다.
+	// 체결에 시각·가격·수량이 없는 경우는 없으므로 이벤트로 내보내지 않고 에러로 돌린다.
+	if w.Timestamp.IsZero() || !w.Price.IsPositive() || !w.Volume.IsPositive() {
+		return TradeEvent{}, fmt.Errorf("toss: incomplete trade data for %q (price=%s volume=%s)", f.topic, w.Price, w.Volume)
+	}
 	return TradeEvent{
 		Market: market, Symbol: symbol,
 		Price: w.Price, Volume: w.Volume, Timestamp: w.Timestamp, Currency: w.Currency,
@@ -145,6 +153,7 @@ type wireOrderbook struct {
 }
 
 // orderbookEvent 는 message 프레임을 호가 이벤트로 해석한다.
+// 체결·주문과 달리 값 검증을 하지 않는다 — 장 시작 전처럼 호가가 비어 있는 상태가 실제로 존재한다.
 func (f frame) orderbookEvent() (OrderbookEvent, error) {
 	market, symbol, err := f.marketSymbol("orderbook")
 	if err != nil {
@@ -182,6 +191,10 @@ func (f frame) orderEvent() (OrderEvent, error) {
 	seq, err := strconv.ParseInt(code, 10, 64)
 	if err != nil {
 		return OrderEvent{}, fmt.Errorf("toss: invalid accountSeq in topic %q: %w", f.topic, err)
+	}
+	// 값 검증 — 빈 payload 는 언마샬이 통과한다. 무손실 채널이라 빈 이벤트를 흘리면 소비자가 잘못 판단한다.
+	if w.Event == "" || w.Order.OrderID == "" {
+		return OrderEvent{}, fmt.Errorf("toss: incomplete order data for %q (event=%q orderId=%q)", f.topic, w.Event, w.Order.OrderID)
 	}
 	return OrderEvent{Event: w.Event, AccountSeq: seq, Order: w.Order}, nil
 }

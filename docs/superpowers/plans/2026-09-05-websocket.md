@@ -1000,6 +1000,54 @@ func FuzzDecodeFrame(f *testing.F) {
 		_, _ = fr.orderEvent()
 	})
 }
+
+func TestFrame_EmptyPayloadIsRejected(t *testing.T) {
+	// data:{} 는 구조상 유효하지만 값이 비어 있다 — zero value(가격 0 체결, 빈 주문)를 내보내면 안 된다.
+	for name, raw := range map[string]string{
+		"empty trade":          `{"type":"message","topic":"trade:kr:005930","data":{}}`,
+		"trade missing volume": `{"type":"message","topic":"trade:kr:005930","data":{"price":"72000","timestamp":"2026-03-25T09:30:42+09:00","currency":"KRW"}}`,
+		"zero price":           `{"type":"message","topic":"trade:kr:005930","data":{"price":"0","volume":"1","timestamp":"2026-03-25T09:30:42+09:00","currency":"KRW"}}`,
+	} {
+		f, err := decodeFrame([]byte(raw))
+		if err != nil {
+			t.Fatalf("%s: decode = %v", name, err)
+		}
+		if ev, err := f.tradeEvent(); err == nil {
+			t.Errorf("%s: 값이 빈 체결은 에러여야 한다, got %+v", name, ev)
+		}
+	}
+	for name, raw := range map[string]string{
+		"empty order": `{"type":"message","topic":"personal:order:3","data":{}}`,
+		"no orderId":  `{"type":"message","topic":"personal:order:3","data":{"event":"FILL","accountSeq":"3","order":{}}}`,
+		"no event":    `{"type":"message","topic":"personal:order:3","data":{"accountSeq":"3","order":{"orderId":"o-1"}}}`,
+	} {
+		f, err := decodeFrame([]byte(raw))
+		if err != nil {
+			t.Fatalf("%s: decode = %v", name, err)
+		}
+		if ev, err := f.orderEvent(); err == nil {
+			t.Errorf("%s: 값이 빈 주문 이벤트는 에러여야 한다, got %+v", name, ev)
+		}
+	}
+	// 호가는 장 시작 전처럼 비어 있는 상태가 실제로 존재하므로 관용적으로 통과시킨다.
+	f, err := decodeFrame([]byte(`{"type":"message","topic":"orderbook:kr:005930","data":{"currency":"KRW","asks":[],"bids":[]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.orderbookEvent(); err != nil {
+		t.Errorf("빈 호가는 정상 상태다: %v", err)
+	}
+}
+
+func TestDecodeFrame_EmptyErrorObject(t *testing.T) {
+	f, err := decodeFrame([]byte(`{"type":"error","error":{}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.kind != frameError || f.errCode != "unknown" {
+		t.Errorf("빈 error 객체도 진단 가능한 코드를 가져야 한다: %+v", f)
+	}
+}
 EOF
 go test ./stream/ 2>&1 | head -5
 ```
@@ -1092,9 +1140,12 @@ func decodeFrame(raw []byte) (frame, error) {
 		f.kind = frameMessage
 	case "error":
 		f.kind = frameError
-		if w.Error != nil {
+		if w.Error != nil && w.Error.Code != "" {
 			f.errCode, f.errMessage = w.Error.Code, w.Error.Message
 		} else {
+			if w.Error != nil {
+				f.errMessage = w.Error.Message
+			}
 			f.errCode = "unknown" // 서버가 새 에러 형태를 보내도 스트림을 죽이지 않되, 메시지는 진단 가능하게
 		}
 	case "pong":
@@ -1142,6 +1193,11 @@ func (f frame) tradeEvent() (TradeEvent, error) {
 	if err := json.Unmarshal(f.data, &w); err != nil {
 		return TradeEvent{}, fmt.Errorf("toss: decode trade data: %w", err)
 	}
+	// 값 검증 — 빈 객체나 일부 필드만 담긴 payload 는 언마샬이 통과해 zero value(가격 0 체결)를 만든다.
+	// 체결에 시각·가격·수량이 없는 경우는 없으므로 이벤트로 내보내지 않고 에러로 돌린다.
+	if w.Timestamp.IsZero() || !w.Price.IsPositive() || !w.Volume.IsPositive() {
+		return TradeEvent{}, fmt.Errorf("toss: incomplete trade data for %q (price=%s volume=%s)", f.topic, w.Price, w.Volume)
+	}
 	return TradeEvent{
 		Market: market, Symbol: symbol,
 		Price: w.Price, Volume: w.Volume, Timestamp: w.Timestamp, Currency: w.Currency,
@@ -1156,6 +1212,7 @@ type wireOrderbook struct {
 }
 
 // orderbookEvent 는 message 프레임을 호가 이벤트로 해석한다.
+// 체결·주문과 달리 값 검증을 하지 않는다 — 장 시작 전처럼 호가가 비어 있는 상태가 실제로 존재한다.
 func (f frame) orderbookEvent() (OrderbookEvent, error) {
 	market, symbol, err := f.marketSymbol("orderbook")
 	if err != nil {
@@ -1193,6 +1250,10 @@ func (f frame) orderEvent() (OrderEvent, error) {
 	seq, err := strconv.ParseInt(code, 10, 64)
 	if err != nil {
 		return OrderEvent{}, fmt.Errorf("toss: invalid accountSeq in topic %q: %w", f.topic, err)
+	}
+	// 값 검증 — 빈 payload 는 언마샬이 통과한다. 무손실 채널이라 빈 이벤트를 흘리면 소비자가 잘못 판단한다.
+	if w.Event == "" || w.Order.OrderID == "" {
+		return OrderEvent{}, fmt.Errorf("toss: incomplete order data for %q (event=%q orderId=%q)", f.topic, w.Event, w.Order.OrderID)
 	}
 	return OrderEvent{Event: w.Event, AccountSeq: seq, Order: w.Order}, nil
 }
@@ -2214,7 +2275,7 @@ func (c *Client) Stream(ctx context.Context, opts ...stream.Option) (*stream.Str
 ```bash
 gofmt -w . && go vet ./... && go test ./stream/ -race -count=1 -v 2>&1 | grep -cE '^--- PASS'
 ```
-Expected: `37` (Task 1 의 8 + Task 2 의 14 + 이번 15). 실행 결과로 확인하고 모두 PASS 인지만 본다.
+Expected: `46` (Task 1 의 8 + Task 2 의 23 + 이번 15). 실행 결과로 확인하고 모두 PASS 인지만 본다.
 
 - [ ] **Step 6: 커밋**
 

@@ -287,3 +287,51 @@ func FuzzDecodeFrame(f *testing.F) {
 		_, _ = fr.orderEvent()
 	})
 }
+
+func TestFrame_EmptyPayloadIsRejected(t *testing.T) {
+	// data:{} 는 구조상 유효하지만 값이 비어 있다 — zero value(가격 0 체결, 빈 주문)를 내보내면 안 된다.
+	for name, raw := range map[string]string{
+		"empty trade":          `{"type":"message","topic":"trade:kr:005930","data":{}}`,
+		"trade missing volume": `{"type":"message","topic":"trade:kr:005930","data":{"price":"72000","timestamp":"2026-03-25T09:30:42+09:00","currency":"KRW"}}`,
+		"zero price":           `{"type":"message","topic":"trade:kr:005930","data":{"price":"0","volume":"1","timestamp":"2026-03-25T09:30:42+09:00","currency":"KRW"}}`,
+	} {
+		f, err := decodeFrame([]byte(raw))
+		if err != nil {
+			t.Fatalf("%s: decode = %v", name, err)
+		}
+		if ev, err := f.tradeEvent(); err == nil {
+			t.Errorf("%s: 값이 빈 체결은 에러여야 한다, got %+v", name, ev)
+		}
+	}
+	for name, raw := range map[string]string{
+		"empty order": `{"type":"message","topic":"personal:order:3","data":{}}`,
+		"no orderId":  `{"type":"message","topic":"personal:order:3","data":{"event":"FILL","accountSeq":"3","order":{}}}`,
+		"no event":    `{"type":"message","topic":"personal:order:3","data":{"accountSeq":"3","order":{"orderId":"o-1"}}}`,
+	} {
+		f, err := decodeFrame([]byte(raw))
+		if err != nil {
+			t.Fatalf("%s: decode = %v", name, err)
+		}
+		if ev, err := f.orderEvent(); err == nil {
+			t.Errorf("%s: 값이 빈 주문 이벤트는 에러여야 한다, got %+v", name, ev)
+		}
+	}
+	// 호가는 장 시작 전처럼 비어 있는 상태가 실제로 존재하므로 관용적으로 통과시킨다.
+	f, err := decodeFrame([]byte(`{"type":"message","topic":"orderbook:kr:005930","data":{"currency":"KRW","asks":[],"bids":[]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.orderbookEvent(); err != nil {
+		t.Errorf("빈 호가는 정상 상태다: %v", err)
+	}
+}
+
+func TestDecodeFrame_EmptyErrorObject(t *testing.T) {
+	f, err := decodeFrame([]byte(`{"type":"error","error":{}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.kind != frameError || f.errCode != "unknown" {
+		t.Errorf("빈 error 객체도 진단 가능한 코드를 가져야 한다: %+v", f)
+	}
+}
