@@ -69,11 +69,22 @@ func decodeFrame(raw []byte) (frame, error) {
 	case "subscriptions":
 		f.kind = frameSubscriptions
 	case "message":
+		// 구조 검증은 여기서 한다 — 모든 수신 프레임이 지나는 단일 지점이고,
+		// data 가 null/부재면 payload 언마샬이 에러 없이 zero value 를 만들어(가격 0 인 체결 등)
+		// 사용자 채널로 흘러들어간다.
+		if w.Topic == "" {
+			return frame{}, fmt.Errorf("toss: message frame has no topic")
+		}
+		if len(w.Data) == 0 || string(w.Data) == "null" {
+			return frame{}, fmt.Errorf("toss: message frame %q has no data", w.Topic)
+		}
 		f.kind = frameMessage
 	case "error":
 		f.kind = frameError
 		if w.Error != nil {
 			f.errCode, f.errMessage = w.Error.Code, w.Error.Message
+		} else {
+			f.errCode = "unknown" // 서버가 새 에러 형태를 보내도 스트림을 죽이지 않되, 메시지는 진단 가능하게
 		}
 	case "pong":
 		f.kind = framePong
@@ -92,6 +103,8 @@ func (f frame) topicKind() string {
 	return typ
 }
 
+// prefix 는 subscription.go 의 typeTrade*/typeOrderbook* 와 짝을 이룬다. 시장 세그먼트는
+// 검증하지 않는다 — 토스가 시장을 추가해도 디코딩이 깨지지 않도록 관용적으로 둔다.
 func (f frame) marketSymbol(prefix string) (tosstypes.MarketCountry, string, error) {
 	typ, code, ok := splitTopic(f.topic)
 	if !ok || !strings.HasPrefix(typ, prefix+":") {
@@ -148,9 +161,11 @@ func (f frame) orderbookEvent() (OrderbookEvent, error) {
 }
 
 type wireOrder struct {
-	Event      OrderEventType `json:"event"`
-	AccountSeq string         `json:"accountSeq"`
-	Order      order.Order    `json:"order"`
+	Event OrderEventType `json:"event"`
+	// AccountSeq 는 와이어 문서화용. 실제 값은 topic 에서 파싱한다(스펙상 동일).
+	// 불일치해도 에러로 만들지 않는다 — 무손실 채널의 이벤트를 버리는 대가가 더 크다.
+	AccountSeq string      `json:"accountSeq"`
+	Order      order.Order `json:"order"`
 }
 
 // orderEvent 는 message 프레임을 주문 이벤트로 해석한다.
