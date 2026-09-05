@@ -14,8 +14,14 @@ const (
 	defaultDiagBuffer     = 16
 	defaultBackoffMin     = time.Second
 	defaultBackoffMax     = 30 * time.Second
-	defaultCoalesceDelay  = 100 * time.Millisecond // 선언 5회/초 한도 대응
+	defaultCoalesceDelay  = 100 * time.Millisecond // 짧은 창 안의 연속 호출을 한 선언으로 묶는다
 	defaultRateLimitRetry = time.Second            // rate-limit-exceeded 수신 뒤 재선언까지 대기
+	// minDeclareInterval 은 연속된(코얼레싱되지 않은) 선언 사이에 강제하는 최소 간격이다. 문서상
+	// 한도는 5회/초(=200ms 간격)이므로 210ms 로 여유를 둔다. coalesceDelay 는 짧은 창 안의 호출을
+	// 하나로 묶을 뿐이라, 그 창보다 넓게 떨어진(하지만 여전히 잦은) 연속 Subscribe 호출까지는
+	// 막지 못한다 — 이 상수가 그 간격을 추가로 강제한다. 유휴 상태 뒤의 첫 선언은 대기 없이 바로
+	// 나간다(연속 선언만 조절된다).
+	minDeclareInterval = 210 * time.Millisecond
 )
 
 type config struct {

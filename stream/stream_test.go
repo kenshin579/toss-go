@@ -243,6 +243,60 @@ func TestStream_RateLimitTriggersRedeclare(t *testing.T) {
 	})
 }
 
+// TestStream_CoalescesConsecutiveSubscribes 는 기본 coalesceDelay(100ms) 로 짧은 창 안에 몰린
+// 동시 Subscribe 호출이 선언 하나(또는 최소한 호출 수보다 적은 수)로 묶이는지 본다. newTestStream
+// 은 다른 테스트의 타이밍 편의를 위해 coalesceDelay 를 1ms 로 낮춰 두므로, 이 테스트는 명시적으로
+// 기본값(defaultCoalesceDelay)을 되돌려 실제 코얼레싱 동작을 검증한다.
+func TestStream_CoalescesConsecutiveSubscribes(t *testing.T) {
+	ts := newTestServer(t)
+	s := newTestStream(t, ts, WithCoalesceDelay(defaultCoalesceDelay))
+	waitFor(t, "connection", func() bool { return ts.connCount() >= 1 })
+
+	const n = 10
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_ = s.Subscribe(context.Background(), Trade(tosstypes.MarketCountryKR, fmt.Sprintf("%06d", i)))
+		}(i)
+	}
+	wg.Wait()
+	if got := len(declares(ts)); got >= n {
+		t.Errorf("동시 Subscribe %d회에 선언 %d개가 나갔다 — 코얼레싱되지 않았다", n, got)
+	}
+}
+
+// TestStream_DeclareRateNeverExceedsDocumentedLimit 은 계속되는 수요 아래서도 선언 빈도가 문서
+// 한도(5회/초)를 넘지 않는지 본다. minDeclareInterval(210ms) 이 이를 강제한다 — 스트림 생성 직후
+// idle 상태의 첫 선언은 무료(즉시)이고, 그 뒤로는 매 선언이 210ms 이상 떨어져 나가야 한다. 그러면
+// 어떤 1초 구간을 잘라 봐도 많아야 5~6회(경계 정렬에 따라 +1)여야 한다.
+func TestStream_DeclareRateNeverExceedsDocumentedLimit(t *testing.T) {
+	ts := newTestServer(t)
+	s := newTestStream(t, ts, WithCoalesceDelay(defaultCoalesceDelay))
+	waitFor(t, "connection", func() bool { return ts.connCount() >= 1 })
+
+	const workers = 4
+	deadline := time.Now().Add(1050 * time.Millisecond)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; time.Now().Before(deadline); i++ {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				_ = s.Subscribe(ctx, Trade(tosstypes.MarketCountryKR, fmt.Sprintf("%d%05d", w, i)))
+				cancel()
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	if got := len(declares(ts)); got > 6 {
+		t.Errorf("계속된 수요 아래 1.05초 동안 선언 %d회 나갔다 — 문서 한도(5회/초)를 넘었다", got)
+	}
+}
+
 func TestStream_ReconnectsAndRedeclares(t *testing.T) {
 	ts := newTestServer(t)
 	s := newTestStream(t, ts)
@@ -507,6 +561,12 @@ func TestPushLossy_CapZeroReturnsWithoutBlocking(t *testing.T) {
 
 // TestSubscribe_ReturnsRejection 은 Subscribe 가 자신이 넣은 항목의 거부를 *RejectedError 로
 // 돌려주는지 본다(C: ack 를 기다리는 Subscribe/Unsubscribe/Declare).
+//
+// 실서버는 비어 있지 않은 선언에는 항상 id 를 echo 한다 — id 없는 ack 는 절대 오지 않는다. 그래서
+// 여기서 push 하는 ack 에도 실제로 보낸 선언의 id 를 넣는다: id 를 빼면 takeBatch 의 id=="" 폴백에
+// 기대는 셈이 되는데, 그 폴백은 실서버가 절대 보내지 않는 모양의 ack 로 이 테스트가 통과하게 만들
+// 뿐 아니라(I-1), `[]` 의 지연 ack 가 뒤이은 Subscribe 배치를 가로채 거부를 nil 로 되돌리는 실제
+// 버그를 오히려 검증하고 있었다.
 func TestSubscribe_ReturnsRejection(t *testing.T) {
 	ts := newTestServer(t)
 	ts.setAutoAck(false) // 이 테스트가 직접 ack 를 통제한다
@@ -515,7 +575,12 @@ func TestSubscribe_ReturnsRejection(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- s.Subscribe(ctx, Trade(tosstypes.MarketCountryUS, "AAPL", "NOPE")) }()
 	waitFor(t, "declare", func() bool { return len(declares(ts)) >= 1 })
-	ts.push(`{"type":"subscriptions","subscribed":["trade:us:AAPL"],"rejected":[{"target":"trade:us:NOPE","code":"stock-not-found","message":"없음"}]}`)
+	d := declares(ts)
+	id := declareID(d[len(d)-1])
+	if id == "" {
+		t.Fatal("보낸 선언에서 id 를 못 찾았다")
+	}
+	ts.push(`{"type":"subscriptions","id":"` + id + `","subscribed":["trade:us:AAPL"],"rejected":[{"target":"trade:us:NOPE","code":"stock-not-found","message":"없음"}]}`)
 	select {
 	case err := <-errCh:
 		var re *RejectedError

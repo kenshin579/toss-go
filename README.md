@@ -100,7 +100,7 @@ res, err := a.Order.Place(ctx, order.PlaceRequest{
 ### 실시간 스트림
 
 ```go
-s, err := c.Stream(ctx)
+s, _ := c.Stream(ctx)
 defer s.Close()
 
 s.Subscribe(ctx,

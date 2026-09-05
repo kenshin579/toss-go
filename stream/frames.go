@@ -106,8 +106,11 @@ func (f frame) topicKind() string {
 	return typ
 }
 
-// prefix 는 subscription.go 의 typeTrade*/typeOrderbook* 와 짝을 이룬다. 시장 세그먼트는
-// 검증하지 않는다 — 토스가 시장을 추가해도 디코딩이 깨지지 않도록 관용적으로 둔다.
+// prefix 는 subscription.go 의 typeTrade*/typeOrderbook* 와 짝을 이룬다. 여기서는 시장 세그먼트를
+// 검증하지 않는다 — 토스가 시장을 추가해도 이 디코딩 단계 자체는 깨지지 않는다. 다만 그 관용성은
+// 이 함수에 한정된다: 상위의 dispatch 는 알려진 채널(typeTradeKR/US, typeOrderbookKR/US,
+// typePersonalOrder)만 정확 일치로 처리하고, 그 밖의 topic 은 emitErr 로 알린 뒤 버린다 — 새 시장
+// 세그먼트가 조용히 사라지는 채널이 되지는 않는다는 뜻이다.
 func (f frame) marketSymbol(prefix string) (tosstypes.MarketCountry, string, error) {
 	typ, code, ok := splitTopic(f.topic)
 	if !ok || !strings.HasPrefix(typ, prefix+":") {

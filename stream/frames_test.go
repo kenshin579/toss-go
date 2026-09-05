@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kenshin579/toss-go/order"
 	"github.com/kenshin579/toss-go/tosstypes"
 )
 
@@ -237,15 +238,48 @@ func TestFrame_ConverterErrors(t *testing.T) {
 }
 
 // TestDecodeFrame_AsyncAPIExamples 는 docs/api/asyncapi.json 의 실제 예시 payload(stream/testdata/frames/*.json)로
-// decodeFrame + 해당 변환기가 성공하는지 확인한다. 손으로 적은 테스트 리터럴이 스펙과 어긋나는 것을 막는 회귀 테스트다.
+// decodeFrame + 해당 변환기가 성공하는지, 그리고 결과 값이 fixture 와 실제로 일치하는지 확인한다.
+// 에러 유무만 보면 손으로 적은 테스트 리터럴이 스펙과 어긋나는 것을 절반만 막는다 — 변환기가 필드를
+// 잘못된 곳에 매핑해도(예: bids/asks 를 바꿔 읽어도) 에러 없이 통과해 버리기 때문에, 각 fixture 의
+// 실제 값(가격·수량·통화·주문 상태 등)을 최소 하나씩 단언한다.
 func TestDecodeFrame_AsyncAPIExamples(t *testing.T) {
 	cases := []struct {
-		file string
-		conv func(frame) error
+		file  string
+		check func(t *testing.T, f frame)
 	}{
-		{"trade.json", func(f frame) error { _, err := f.tradeEvent(); return err }},
-		{"orderbook.json", func(f frame) error { _, err := f.orderbookEvent(); return err }},
-		{"order.json", func(f frame) error { _, err := f.orderEvent(); return err }},
+		{"trade.json", func(t *testing.T, f frame) {
+			ev, err := f.tradeEvent()
+			if err != nil {
+				t.Fatalf("tradeEvent: %v", err)
+			}
+			if ev.Market != tosstypes.MarketCountryUS || ev.Symbol != "AAPL" ||
+				ev.Price.String() != "243.26" || ev.Volume.String() != "8" || ev.Currency != tosstypes.CurrencyUSD {
+				t.Errorf("trade = %+v", ev)
+			}
+		}},
+		{"orderbook.json", func(t *testing.T, f frame) {
+			ev, err := f.orderbookEvent()
+			if err != nil {
+				t.Fatalf("orderbookEvent: %v", err)
+			}
+			if ev.Market != tosstypes.MarketCountryKR || ev.Symbol != "005930" || ev.Currency != tosstypes.CurrencyKRW ||
+				len(ev.Asks) != 1 || ev.Asks[0].Price.String() != "71500" || ev.Asks[0].Volume.String() != "5" ||
+				len(ev.Bids) != 1 || ev.Bids[0].Price.String() != "71400" || ev.Bids[0].Volume.String() != "10" {
+				t.Errorf("orderbook = %+v", ev)
+			}
+		}},
+		{"order.json", func(t *testing.T, f frame) {
+			ev, err := f.orderEvent()
+			if err != nil {
+				t.Fatalf("orderEvent: %v", err)
+			}
+			if ev.Event != OrderEventFill || ev.AccountSeq != 3 ||
+				ev.Order.OrderID != "bAGzNvMOOTa5Uy0xVzYNbxDJ3Qpobwau4jDF3hyZZGWbpHm7wha8CFZc7aXVOWAl" ||
+				ev.Order.Symbol != "AAPL" || ev.Order.Status != order.StatusFilled ||
+				ev.Order.Execution.FilledQuantity.String() != "10" {
+				t.Errorf("order = %+v", ev)
+			}
+		}},
 	}
 	for _, c := range cases {
 		t.Run(c.file, func(t *testing.T) {
@@ -260,9 +294,7 @@ func TestDecodeFrame_AsyncAPIExamples(t *testing.T) {
 			if f.kind != frameMessage {
 				t.Fatalf("kind = %v", f.kind)
 			}
-			if err := c.conv(f); err != nil {
-				t.Errorf("converter: %v", err)
-			}
+			c.check(t, f)
 		})
 	}
 }

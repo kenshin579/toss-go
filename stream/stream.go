@@ -18,8 +18,8 @@ type ackResult struct {
 	err      error // 비어 있지 않으면 대기자에게 그대로 돌려준다(*DeclareError, 전송 실패, 연결 종료 등)
 }
 
-// declareBatch 는 전송된 특정 선언 id 에 매달린 대기자들이다. 도착 순서를 보존한다 — id 를 echo
-// 하지 않는 ack 는 가장 오래 기다린(가장 먼저 보낸) 배치에 배정한다.
+// declareBatch 는 전송된 특정 선언 id 에 매달린 대기자들이다(takeBatch 참고 — id 없는 ack 는
+// 어떤 배치에도 매달지 않는다).
 type declareBatch struct {
 	id      string
 	waiters []chan ackResult
@@ -49,6 +49,7 @@ type Stream struct {
 	mu             sync.Mutex
 	conn           *websocket.Conn // 현재 연결. 쓰기 전에 잠근다
 	lastDeclareID  string          // 마지막으로 전송에 성공한 선언의 id. 낡은 ack 를 걸러내는 데 쓴다
+	lastDeclareAt  time.Time       // 마지막으로 전송에 성공한 선언 시각. minDeclareInterval 강제에 쓴다
 	pendingWaiters []chan ackResult
 	waiterBatches  []declareBatch
 }
@@ -139,6 +140,11 @@ func (s *Stream) Subscriptions() []Subscription { return s.subs.snapshot() }
 // 이때 선언은 이미 전송됐을 수 있다. 연속 호출은 최대 coalesceDelay(기본 100ms) 동안 하나의
 // 선언으로 합쳐지므로 그만큼 지연될 수 있다.
 //
+// 이 호출이 넣은 항목 중 여럿이 거부돼도 반환값은 그중 하나뿐이다 — 나머지도 포함해 거부된 항목
+// 전체는 Errors() 로 통지된다. *DeclareError 로 실패해도(선언 자체가 실패한 것이지 항목이 거부된
+// 게 아니므로) 추가한 항목은 구독 집합에 남아 다음 선언에 다시 포함된다 — 호출자가 별도로
+// 재시도할 필요가 없다.
+//
 // rate-limit-exceeded 는 SDK 가 자동으로 재선언하므로 에러로 반환하지 않는다(Errors() 로는
 // 통지된다) — 곧 성공할 구독을 실패로 알고 호출자가 재시도하면 선언 빈도 한도를 더 악화시키기
 // 때문이다.
@@ -156,8 +162,10 @@ func (s *Stream) Subscribe(ctx context.Context, subs ...Subscription) error {
 //
 // 서버의 구독 ack 를 기다린다. 이 호출은 항목을 추가하지 않으므로 거부와는 무관하며(항상 nil 이거나
 // 선언 자체가 실패했을 때만 *DeclareError), ctx 가 먼저 끝나면 ctx.Err() 를 돌려주는데 이때 선언은
-// 이미 전송됐을 수 있다. rate-limit-exceeded 는 SDK 가 자동으로 재선언하므로 에러로 반환하지 않는다
-// (Errors() 로는 통지된다).
+// 이미 전송됐을 수 있다. 단, 이 호출로 구독 집합이 완전히 비면 Declare(ctx) 의 빈 선언과 같은
+// 경로다 — 프로토콜상 `[]` 로만 보내고 서버도 개별 ack 를 주지 않는 전체 해제라, 서버 확인을
+// 기다리지 않고 곧바로 nil 을 돌려준다. rate-limit-exceeded 는 SDK 가 자동으로 재선언하므로 에러로
+// 반환하지 않는다(Errors() 로는 통지된다).
 func (s *Stream) Unsubscribe(ctx context.Context, subs ...Subscription) error {
 	if s.closed.Load() {
 		return errStreamClosed
@@ -283,7 +291,7 @@ func (s *Stream) run(ctx context.Context, conn *websocket.Conn) {
 		wg.Add(3)
 		go func() { defer wg.Done(); s.readLoop(connCtx, conn, causeCh); connCancel() }()
 		go func() { defer wg.Done(); _ = pingLoop(connCtx, conn, s.cfg.pingInterval); connCancel() }()
-		go func() { defer wg.Done(); s.declareLoop(connCtx) }()
+		go func() { defer wg.Done(); s.declareLoop(connCtx); connCancel() }()
 		wg.Wait()
 
 		// 곧바로 다시 끊긴 연결은 성공으로 치지 않는다 — attempt 를 유지해 백오프 곡선을 이어간다.
@@ -465,6 +473,10 @@ func (s *Stream) dispatch(f frame) bool {
 		default:
 			return false
 		}
+	default:
+		// 알 수 없는 채널·시장은 버리되, 조용히 버리지는 않는다 —
+		// 무손실 채널의 프레임이 흔적 없이 사라지는 것을 막는다.
+		s.emitErr(fmt.Errorf("toss: unhandled message topic %q", f.topic))
 	}
 	return true
 }
@@ -538,6 +550,21 @@ func (s *Stream) declareLoop(ctx context.Context) {
 				s.resolveWaiters(waiting, ackResult{err: errNotConnected})
 				continue
 			}
+			// 최소 선언 간격을 강제한다 — coalesceDelay 는 짧은 창 안의 호출만 하나로 묶어, 그보다
+			// 넓게(하지만 여전히 잦게) 떨어진 연속 Subscribe 는 그대로 다 나가 문서상 5회/초 한도를
+			// 넘길 수 있었다(실측: 순차 Subscribe 10회가 1.01초에 전부 나감). 이 대기는 반드시
+			// 배치 등록보다 앞에 둔다 — 등록 뒤에 대기하면 그 사이 도착하는 ack 와의 순서 관계가
+			// 바뀌어 "쓰기 전에 등록한다" 는 불변식이 깨진다. 유휴 상태 뒤의 첫 선언은 곧바로 나간다.
+			s.mu.Lock()
+			wait := minDeclareInterval - time.Since(s.lastDeclareAt)
+			s.mu.Unlock()
+			if wait > 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(wait):
+				}
+			}
 			if isEmptyDeclaration(body) {
 				// 빈 배열은 프로토콜상 id 없이 `[]` 로만 전송되는 전체 해제 전용 형태라 서버도
 				// 개별 subscriptions ack 를 보내지 않는다 — 그래서 아래(비어 있지 않은 경우)의
@@ -560,6 +587,9 @@ func (s *Stream) declareLoop(ctx context.Context) {
 					s.resolveWaiters(carried, ackResult{err: werr})
 					return
 				}
+				s.mu.Lock()
+				s.lastDeclareAt = time.Now()
+				s.mu.Unlock()
 				s.resolveWaiters(carried, ackResult{})
 				continue
 			}
@@ -599,6 +629,9 @@ func (s *Stream) declareLoop(ctx context.Context) {
 				}
 				return
 			}
+			s.mu.Lock()
+			s.lastDeclareAt = time.Now()
+			s.mu.Unlock()
 			if s.cfg.afterDeclareWrite != nil {
 				s.cfg.afterDeclareWrite()
 			}
@@ -611,23 +644,23 @@ func isEmptyDeclaration(body []byte) bool {
 	return string(bytes.TrimSpace(body)) == "[]"
 }
 
-// takeBatch 는 id 에 매달린 대기자를 찾아 제거하고 돌려준다. id 가 비어 있으면(서버가 echo 하지
-// 않은 ack) 가장 오래 기다린(가장 먼저 보낸) 배치를 돌려준다. 없으면 nil.
+// takeBatch 는 id 에 매달린 대기자를 찾아 제거하고 돌려준다. id 가 비어 있으면 아무 배치에도
+// 매달지 않는다 — SDK 는 비어 있지 않은 선언에는 항상 id 를 붙이므로, id 없는 ack 가 올 수 있는
+// 유일한 경우는 `[]`(전체 해제) 뿐이고 그 경로는 자기 대기자를 직접 해소한다(declareLoop 참고).
+// 예전에는 "가장 오래 기다린 배치" 로 폴백했는데, id 없는 ack 의 유일한 출처가 `[]` 인 이상 그
+// 폴백은 항상 틀린 배치를 집었다 — 뒤이어 보낸 선언(예: Subscribe)의 배치를 가로채 그 결과를
+// "성공, 거부 없음" 으로 잘못 확정시키고, 진짜 ack 는 주인을 잃었다.
 func (s *Stream) takeBatch(id string) []chan ackResult {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.waiterBatches) == 0 {
+	if id == "" {
 		return nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	idx := -1
-	if id == "" {
-		idx = 0
-	} else {
-		for i, b := range s.waiterBatches {
-			if b.id == id {
-				idx = i
-				break
-			}
+	for i, b := range s.waiterBatches {
+		if b.id == id {
+			idx = i
+			break
 		}
 	}
 	if idx < 0 {
@@ -690,11 +723,11 @@ func (s *Stream) retryDeclareAfter(ctx context.Context, d time.Duration) {
 	}()
 }
 
+// emitErr 는 Errors() 채널이 가득 찼을 때 가장 오래된 에러를 버린다 — 다른 LOSSY 채널(시세,
+// 재연결 알림)과 같은 규약이다. 새 에러를 버리면 Errors() 를 소비하지 않는 호출자가 최초 16건에서
+// 멈춘 채 그 뒤의 모든 진단을 영영 놓친다 — 최신 상태가 오래된 상태보다 알 가치가 크다.
 func (s *Stream) emitErr(err error) {
-	select {
-	case s.errs <- err:
-	default: // 진단 채널이 밀리면 버린다
-	}
+	pushLossy(s.errs, err)
 }
 
 // emitReconnect 는 재연결 채널이 가득 찼을 때 가장 오래된 신호를 버린다 — 최신 재연결 신호가

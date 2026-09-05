@@ -100,7 +100,9 @@ const (
 //
 // 끊긴 구간의 주문 이벤트는 재전송되지 않으므로, 이 신호를 받으면 REST 로 주문 상태를 재동기화해야 한다.
 type Reconnect struct {
-	Attempt int            // 몇 번째 시도에서 성공했는지(1부터)
+	// Attempt 는 재연결 시도 누적 횟수(1부터)다. 곧바로 다시 끊긴 연결(flap)은 "성공"으로 치지
+	// 않으므로 리셋되지 않는다 — 짧게 끊겼다 이어지는 구간에서는 이 값이 계속 커질 수 있다.
+	Attempt int
 	Cause   ReconnectCause // 직전 연결이 끊긴 이유
 	At      time.Time
 }
@@ -119,8 +121,10 @@ func (e *ConnectError) Unwrap() error { return e.Err }
 
 // DeclareError 는 구독 선언 전체가 실패했을 때의 error 프레임.
 // 기존 구독은 유지된다. Code 는 wrong-format·no-type·invalid-type·no-codes·too-many-topics·
-// too-many·rate-limit-exceeded·internal-error·server-shutdown 중 하나이며 unknown 값도 올 수 있다.
-// 단 server-shutdown 은 SDK 가 에러로 취급하지 않고 재연결 사유(ReconnectServerShutdown)로 처리한다.
+// too-many·rate-limit-exceeded·internal-error·server-shutdown 중 하나다. 서버가 error 프레임에
+// code 를 채우지 않은 경우 SDK 가 리터럴 문자열 `"unknown"` 을 합성해 채운다 — 이 값 자체가 토스
+// 문서에 있는 실제 에러 코드는 아니며, 진단을 위한 SDK 쪽 표시다. 단 server-shutdown 은 SDK 가
+// 에러로 취급하지 않고 재연결 사유(ReconnectServerShutdown)로 처리한다.
 type DeclareError struct {
 	ID      string // 요청에 id 를 보냈을 때만 채워진다
 	Code    string
