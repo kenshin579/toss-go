@@ -58,6 +58,7 @@ package stream
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -165,7 +166,9 @@ func TestSubscriptionSet_MaxTopics(t *testing.T) {
 	s := newSubscriptionSet()
 	codes := make([]string, MaxTopics)
 	for i := range codes {
-		codes[i] = "00000" + string(rune('0'+i%10))
+		// 6자리 고유 코드(플랜 원문의 "00000"+i%10 생성식은 10종만 나와 중복되므로, 정확히
+		// MaxTopics 개의 서로 다른 코드를 만들도록 %06d 로 바꿨다).
+		codes[i] = fmt.Sprintf("%06d", i)
 	}
 	if err := s.add(Subscription{Type: "trade:kr", Codes: codes}); err != nil {
 		t.Fatalf("정확히 %d 건은 허용해야 한다: %v", MaxTopics, err)
@@ -382,10 +385,10 @@ const MaxTopics = 100
 
 // 구독 type 문자열.
 const (
-	typeTradeKR      = "trade:kr"
-	typeTradeUS      = "trade:us"
-	typeOrderbookKR  = "orderbook:kr"
-	typeOrderbookUS  = "orderbook:us"
+	typeTradeKR       = "trade:kr"
+	typeTradeUS       = "trade:us"
+	typeOrderbookKR   = "orderbook:kr"
+	typeOrderbookUS   = "orderbook:us"
 	typePersonalOrder = "personal:order"
 )
 
