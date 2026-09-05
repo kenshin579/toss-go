@@ -2345,7 +2345,6 @@ func (s *Stream) declareLoop(ctx context.Context) {
 			}
 			s.mu.Lock()
 			c := s.conn
-			s.lastDeclareID = id
 			s.mu.Unlock()
 			if c == nil {
 				continue
@@ -2354,6 +2353,11 @@ func (s *Stream) declareLoop(ctx context.Context) {
 				s.emitErr(fmt.Errorf("toss: declare: %w", err))
 				return
 			}
+			// 실제로 보낸 선언만 기록한다 — 보내지 못한 id 를 기록하면 그 다음에 도착하는
+			// 정상 ack 가 stale 로 오인돼 거부 항목이 집합에 남는다.
+			s.mu.Lock()
+			s.lastDeclareID = id
+			s.mu.Unlock()
 		}
 	}
 }
