@@ -58,5 +58,5 @@ func (c *Client) Rankings(ctx context.Context, p RankingsParams) (*Rankings, err
 	q := url.Values{"type": {string(p.Type)}, "marketCountry": {string(p.MarketCountry)}, "duration": {string(p.Duration)}}
 	params.Bool(q, "excludeInvestmentCaution", p.ExcludeInvestmentCaution)
 	params.Int(q, "count", p.Count)
-	return fetch.One[Rankings](ctx, c.http, "/api/v1/rankings", q)
+	return fetch.One[Rankings](ctx, c.http, "/api/v1/rankings", q, 0)
 }

@@ -1,9 +1,11 @@
 // Package httpclient 는 토스 Open API REST 호출의 단일 통로다.
 // Bearer 토큰 주입, `{"result": ...}` 봉투 해제, `{"error": {...}}` → APIError 매핑,
-// 401 토큰 오류 시 1회 재발급·재시도를 담당한다. 재시도(429/5xx)·스로틀링·캐싱은 하지 않는다.
+// 401 토큰 오류 시 1회 재발급·재시도(GET 과 멱등성 키가 있는 쓰기에 한정)를 담당한다.
+// 재시도(429/5xx)·스로틀링·캐싱은 하지 않는다.
 package httpclient
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -102,54 +104,98 @@ type errorEnvelope struct {
 	} `json:"error"`
 }
 
-// Get 은 GET {baseURL}{path}?{query} 를 호출해 `result` 를 out 으로 디코딩한다.
-// out 이 nil 이면 바디를 버린다. 2xx 인데 result 가 없거나 null 이면 에러(토스는 2xx 에 항상 result 를 채운다). 4xx/5xx 는 *APIError.
-// 401 이고 code 가 expired-token / invalid-token 이면 토큰을 무효화하고 정확히 1회 재시도한다.
-func (c *Client) Get(ctx context.Context, path string, query url.Values, out any) error {
-	body, err := c.do(ctx, path, query, false)
+// Request 는 한 번의 HTTP 호출을 기술한다.
+type Request struct {
+	Method     string     // GET/POST/DELETE. 빈 값이면 GET
+	Path       string     // 예: /api/v1/orders
+	Query      url.Values // nil 가능
+	Body       any        // nil 이 아니면 JSON 으로 직렬화해 전송. struct/map 만 — []byte 는 base64 문자열, string 은 따옴표 문자열이 된다
+	AccountSeq int64      // 0 이 아니면 X-Tossinvest-Account 헤더
+	// IdempotencyKey 는 이 요청이 서버 측 멱등성 키(토스 clientOrderId)를 바디에 담고 있음을 뜻한다.
+	// 비어 있지 않을 때만 쓰기 요청을 401 토큰 오류에 1회 재시도한다 — 키 없는 쓰기를 재시도하면
+	// 서버가 이미 접수한 주문이 중복될 수 있다. GET 은 이 값과 무관하게 항상 재시도한다.
+	IdempotencyKey string
+	Out            any // nil 이면 응답 본문을 읽지 않는다(204 포함)
+}
+
+// Do 는 Request 를 실행하고 `result` 를 Out 으로 디코딩한다.
+// Out 이 nil 이면 본문을 버린다(204 정상). Out 이 nil 이 아닌데 본문이 없거나 result 가 null 이면 에러.
+// 4xx/5xx 는 *APIError. 401 이고 code 가 expired-token / invalid-token 이면 토큰을 무효화하고,
+// canRetry(GET 또는 IdempotencyKey 있는 쓰기)인 요청만 정확히 1회 재시도한다(멱등성 키 없는 쓰기의 중복 실행 방지).
+func (c *Client) Do(ctx context.Context, r Request) error {
+	if r.Method == "" {
+		r.Method = http.MethodGet
+	}
+	var payload []byte
+	if r.Body != nil {
+		b, err := json.Marshal(r.Body)
+		if err != nil {
+			return fmt.Errorf("toss: encode body %s: %w", r.Path, err)
+		}
+		payload = b
+	}
+	body, err := c.do(ctx, r, payload, false)
 	if err != nil {
 		return err
 	}
-	if out == nil {
+	if r.Out == nil {
 		return nil
+	}
+	if len(body) == 0 {
+		return fmt.Errorf("toss: %s: empty response body", r.Path)
 	}
 	var env resultEnvelope
 	if err := json.Unmarshal(body, &env); err != nil {
-		return fmt.Errorf("toss: decode envelope %s: %w", path, err)
+		return fmt.Errorf("toss: decode envelope %s: %w", r.Path, err)
 	}
 	if len(env.Result) == 0 || string(env.Result) == "null" {
-		return fmt.Errorf("toss: %s: response has no result", path)
+		return fmt.Errorf("toss: %s: response has no result", r.Path)
 	}
-	if err := json.Unmarshal(env.Result, out); err != nil {
-		return fmt.Errorf("toss: decode result %s: %w", path, err)
+	if err := json.Unmarshal(env.Result, r.Out); err != nil {
+		return fmt.Errorf("toss: decode result %s: %w", r.Path, err)
 	}
 	return nil
 }
 
-func (c *Client) do(ctx context.Context, path string, query url.Values, retried bool) ([]byte, error) {
+// Get 은 GET 조회 단축형이다. GET 은 항상 멱등이라 401 토큰 오류에 1회 재시도한다(자세한 규칙은 Do 참고).
+func (c *Client) Get(ctx context.Context, path string, query url.Values, out any) error {
+	return c.Do(ctx, Request{Method: http.MethodGet, Path: path, Query: query, Out: out})
+}
+
+func (c *Client) do(ctx context.Context, r Request, payload []byte, retried bool) ([]byte, error) {
 	tok, err := c.tokens.Token(ctx)
 	if err != nil {
 		return nil, err
 	}
-	u := c.baseURL + path
-	if len(query) > 0 {
-		u += "?" + query.Encode()
+	u := c.baseURL + r.Path
+	if len(r.Query) > 0 {
+		u += "?" + r.Query.Encode()
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	var reader io.Reader
+	if payload != nil {
+		reader = bytes.NewReader(payload) // 재시도 때 다시 읽을 수 있도록 매번 새 Reader
+	}
+	req, err := http.NewRequestWithContext(ctx, r.Method, u, reader)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Accept", "application/json")
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if r.AccountSeq != 0 {
+		req.Header.Set("X-Tossinvest-Account", strconv.FormatInt(r.AccountSeq, 10))
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("toss: GET %s: %w", path, err)
+		return nil, fmt.Errorf("toss: %s %s: %w", r.Method, r.Path, err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("toss: read %s: %w", path, err)
+		return nil, fmt.Errorf("toss: read %s: %w", r.Path, err)
 	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return body, nil
@@ -159,8 +205,8 @@ func (c *Client) do(ctx context.Context, path string, query url.Values, retried 
 	if resp.StatusCode == http.StatusUnauthorized && isTokenError(apiErr.Code) {
 		// 서버가 거부한 토큰은 재시도 여부와 무관하게 캐시에서 제거한다(재시도 후 401 이어도 하루 동안 남지 않도록).
 		c.tokens.Invalidate(tok)
-		if !retried {
-			return c.do(ctx, path, query, true)
+		if !retried && canRetry(r) {
+			return c.do(ctx, r, payload, true)
 		}
 	}
 	return nil, apiErr
@@ -168,6 +214,12 @@ func (c *Client) do(ctx context.Context, path string, query url.Values, retried 
 
 func isTokenError(code string) bool {
 	return code == "expired-token" || code == "invalid-token"
+}
+
+// canRetry 는 401 토큰 오류에 요청을 다시 보내도 안전한지 판단한다.
+// GET 은 HTTP 정의상 멱등이고, 쓰기는 서버 멱등성 키가 있을 때만 안전하다.
+func canRetry(r Request) bool {
+	return r.Method == http.MethodGet || r.IdempotencyKey != ""
 }
 
 func parseError(resp *http.Response, body []byte) *APIError {

@@ -64,6 +64,34 @@ func Symbols(symbols []string) (string, error) { return joinSymbols(symbols, Sym
 // IndicatorSymbols 는 시장 지표 symbols= 쿼리 값을 만든다(규칙은 IndicatorSymbol).
 func IndicatorSymbols(symbols []string) (string, error) { return joinSymbols(symbols, IndicatorSymbol) }
 
+// AccountSeq 는 계좌 일련번호가 유효한지 검증한다. 0 이하면 계좌 헤더가 실리지 않아
+// 서버가 account-header-required 를 돌려주므로 요청 전에 실패시킨다.
+func AccountSeq(seq int64) error {
+	if seq <= 0 {
+		return fmt.Errorf("toss: accountSeq must be positive (got %d); use a value from Accounts", seq)
+	}
+	return nil
+}
+
+// clientOrderIDPattern 은 clientOrderId 형식 규칙(영숫자와 -, _).
+var clientOrderIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// MaxClientOrderIDLen 은 clientOrderId 최대 길이(토스 규칙).
+const MaxClientOrderIDLen = 36
+
+// ClientOrderIDFormat 은 clientOrderId 형식을 검증한다(1~36자, 영숫자와 -, _). 빈 값은 호출 측이 처리한다 —
+// order/conditionalorder 는 빈 값을 "멱등성 미적용"으로 허용하고, 루트 toss.ValidateClientOrderID 는
+// 필수로 거부한다. 세 곳(루트·order·conditionalorder)이 이 함수로 검증 규칙과 메시지를 공유한다.
+func ClientOrderIDFormat(id string) error {
+	if !clientOrderIDPattern.MatchString(id) {
+		return fmt.Errorf("toss: invalid clientOrderId %q (allowed: A-Z a-z 0-9 - _)", id)
+	}
+	if len(id) > MaxClientOrderIDLen {
+		return fmt.Errorf("toss: clientOrderId too long: %d chars (max %d)", len(id), MaxClientOrderIDLen)
+	}
+	return nil
+}
+
 // Str 은 s 가 비어 있지 않으면 설정한다.
 func Str(v url.Values, key, s string) {
 	if s != "" {

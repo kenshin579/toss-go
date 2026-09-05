@@ -1,0 +1,67 @@
+{
+  "result": {
+    "totalPurchaseAmount": {
+      "krw": "0",
+      "usd": "1500.00"
+    },
+    "marketValue": {
+      "amount": {
+        "krw": "0",
+        "usd": "1700.00"
+      },
+      "amountAfterCost": {
+        "krw": "0",
+        "usd": "1650.00"
+      }
+    },
+    "profitLoss": {
+      "amount": {
+        "krw": "0",
+        "usd": "200.00"
+      },
+      "amountAfterCost": {
+        "krw": "0",
+        "usd": "150.00"
+      },
+      "rate": "0.1333",
+      "rateAfterCost": "0.1000"
+    },
+    "dailyProfitLoss": {
+      "amount": {
+        "krw": "0",
+        "usd": "20.00"
+      },
+      "rate": "0.0119"
+    },
+    "items": [
+      {
+        "symbol": "AAPL",
+        "name": "Apple Inc.",
+        "marketCountry": "US",
+        "currency": "USD",
+        "quantity": "10",
+        "lastPrice": "170.00",
+        "averagePurchasePrice": "150.00",
+        "marketValue": {
+          "purchaseAmount": "1500.00",
+          "amount": "1700.00",
+          "amountAfterCost": "1650.00"
+        },
+        "profitLoss": {
+          "amount": "200.00",
+          "amountAfterCost": "150.00",
+          "rate": "0.1333",
+          "rateAfterCost": "0.10"
+        },
+        "dailyProfitLoss": {
+          "amount": "20.00",
+          "rate": "0.012"
+        },
+        "cost": {
+          "commission": "2.15",
+          "tax": null
+        }
+      }
+    ]
+  }
+}

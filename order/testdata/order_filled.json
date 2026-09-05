@@ -1,0 +1,25 @@
+{
+  "result": {
+    "orderId": "0d5QIHjmtksbsmM-hBRAgP-ExI8iodGm9fAR5txelPfnMM8XQ_swoJdwL5RpGWMo",
+    "symbol": "005930",
+    "side": "BUY",
+    "orderType": "LIMIT",
+    "timeInForce": "DAY",
+    "status": "FILLED",
+    "price": "70000",
+    "quantity": "10",
+    "orderAmount": null,
+    "currency": "KRW",
+    "orderedAt": "2026-03-28T09:30:00+09:00",
+    "canceledAt": null,
+    "execution": {
+      "filledQuantity": "10",
+      "averageFilledPrice": "70000",
+      "filledAmount": "700000",
+      "commission": "1400",
+      "tax": "0",
+      "filledAt": "2026-03-28T09:31:15+09:00",
+      "settlementDate": "2026-03-30"
+    }
+  }
+}

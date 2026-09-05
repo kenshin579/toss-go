@@ -43,7 +43,7 @@ func (c *Client) Stocks(ctx context.Context, symbols ...string) ([]Stock, error)
 	if err != nil {
 		return nil, err
 	}
-	return fetch.List[Stock](ctx, c.http, "/api/v1/stocks", url.Values{"symbols": {joined}})
+	return fetch.List[Stock](ctx, c.http, "/api/v1/stocks", url.Values{"symbols": {joined}}, 0)
 }
 
 // ListedStock 은 마켓별 전체 종목 목록의 항목.
@@ -72,5 +72,5 @@ func (c *Client) ListStocks(ctx context.Context, p ListStocksParams) ([]ListedSt
 	params.Str(q, "status", string(p.Status))
 	params.Str(q, "securityType", string(p.SecurityType))
 	params.Bool(q, "commonShare", p.CommonShare)
-	return fetch.List[ListedStock](ctx, c.http, "/api/v1/stocks/all", q)
+	return fetch.List[ListedStock](ctx, c.http, "/api/v1/stocks/all", q, 0)
 }

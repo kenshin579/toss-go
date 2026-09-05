@@ -50,5 +50,5 @@ func (c *Client) Candles(ctx context.Context, p CandlesParams) (*CandlePage, err
 	params.Int(q, "count", p.Count)
 	params.Time(q, "before", p.Before)
 	params.Bool(q, "adjusted", p.Adjusted)
-	return fetch.One[CandlePage](ctx, c.http, "/api/v1/candles", q)
+	return fetch.One[CandlePage](ctx, c.http, "/api/v1/candles", q, 0)
 }

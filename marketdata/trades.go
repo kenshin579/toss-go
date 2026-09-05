@@ -27,5 +27,5 @@ func (c *Client) Trades(ctx context.Context, symbol string, count int) ([]Trade,
 	}
 	q := url.Values{"symbol": {symbol}}
 	params.Int(q, "count", count)
-	return fetch.List[Trade](ctx, c.http, "/api/v1/trades", q)
+	return fetch.List[Trade](ctx, c.http, "/api/v1/trades", q, 0)
 }

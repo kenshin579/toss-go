@@ -25,31 +25,56 @@ type Expect struct {
 }
 
 // NewServer 는 요청을 검증하고 status/body 를 돌려주는 서버와 그에 연결된 httpclient 를 만든다.
-// Bearer 헤더가 "test-token" 인지도 검증한다.
+// Bearer 헤더가 "test-token" 인지, 그리고 계좌 헤더가 실리지 않았는지 검증한다(계좌가 필요 없는 API 용).
 func NewServer(t *testing.T, want Expect, status int, body []byte) (*httpclient.Client, func()) {
 	t.Helper()
+	return NewServerWithHeader(t, want, "", status, body)
+}
+
+// NewServerWithHeader 는 NewServer 와 같지만 X-Tossinvest-Account 헤더까지 검증한다.
+// wantAccount 가 빈 문자열이면 헤더가 없어야 한다.
+func NewServerWithHeader(t *testing.T, want Expect, wantAccount string, status int, body []byte) (*httpclient.Client, func()) {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != want.Path {
-			t.Errorf("path = %q, want %q", r.URL.Path, want.Path)
-		}
-		got := r.URL.Query()
-		for k := range want.Query {
-			if got.Get(k) != want.Query.Get(k) {
-				t.Errorf("query %s = %q, want %q", k, got.Get(k), want.Query.Get(k))
-			}
-		}
-		for k := range got {
-			if _, ok := want.Query[k]; !ok {
-				t.Errorf("unexpected query %s=%q", k, got.Get(k))
-			}
-		}
-		if r.Header.Get("Authorization") != "Bearer test-token" {
-			t.Errorf("Authorization = %q", r.Header.Get("Authorization"))
+		checkRequest(t, r, want)
+		if got := r.Header.Get("X-Tossinvest-Account"); got != wantAccount {
+			t.Errorf("X-Tossinvest-Account = %q, want %q", got, wantAccount)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
-		_, _ = w.Write(body)
+		if body != nil {
+			_, _ = w.Write(body)
+		}
 	}))
+	c := httpclient.New(httpclient.Config{BaseURL: srv.URL, HTTPClient: srv.Client(), Tokens: staticTokens{}})
+	return c, srv.Close
+}
+
+func checkRequest(t *testing.T, r *http.Request, want Expect) {
+	t.Helper()
+	if r.URL.Path != want.Path {
+		t.Errorf("path = %q, want %q", r.URL.Path, want.Path)
+	}
+	got := r.URL.Query()
+	for k := range want.Query {
+		if got.Get(k) != want.Query.Get(k) {
+			t.Errorf("query %s = %q, want %q", k, got.Get(k), want.Query.Get(k))
+		}
+	}
+	for k := range got {
+		if _, ok := want.Query[k]; !ok {
+			t.Errorf("unexpected query %s=%q", k, got.Get(k))
+		}
+	}
+	if r.Header.Get("Authorization") != "Bearer test-token" {
+		t.Errorf("Authorization = %q", r.Header.Get("Authorization"))
+	}
+}
+
+// NewServerFunc 는 검증을 호출자가 직접 하는 스텁 서버다(POST 바디 캡처 등).
+func NewServerFunc(t *testing.T, h http.HandlerFunc) (*httpclient.Client, func()) {
+	t.Helper()
+	srv := httptest.NewServer(h)
 	c := httpclient.New(httpclient.Config{BaseURL: srv.URL, HTTPClient: srv.Client(), Tokens: staticTokens{}})
 	return c, srv.Close
 }

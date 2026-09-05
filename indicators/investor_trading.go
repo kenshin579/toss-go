@@ -70,5 +70,5 @@ func (c *Client) InvestorTrading(ctx context.Context, symbol string, p InvestorT
 	q := url.Values{"interval": {string(p.Interval)}}
 	params.Int(q, "count", p.Count)
 	params.Date(q, "until", p.Until)
-	return fetch.One[InvestorTradingPage](ctx, c.http, "/api/v1/market-indicators/"+url.PathEscape(symbol)+"/investor-trading", q)
+	return fetch.One[InvestorTradingPage](ctx, c.http, "/api/v1/market-indicators/"+url.PathEscape(symbol)+"/investor-trading", q, 0)
 }

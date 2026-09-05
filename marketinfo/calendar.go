@@ -70,12 +70,12 @@ type USMarketCalendar struct {
 func (c *Client) KRMarketCalendar(ctx context.Context, date tosstypes.Date) (*KRMarketCalendar, error) {
 	q := url.Values{}
 	params.Date(q, "date", date)
-	return fetch.One[KRMarketCalendar](ctx, c.http, "/api/v1/market-calendar/KR", q)
+	return fetch.One[KRMarketCalendar](ctx, c.http, "/api/v1/market-calendar/KR", q, 0)
 }
 
 // USMarketCalendar 는 해외 장 운영 정보를 조회한다(GET /api/v1/market-calendar/US). date 는 미국 현지 날짜(비면 오늘). tosstypes.NewDate 는 KST 변환이므로 미국 날짜는 Date(t.In(loc).Format("2006-01-02")) 로 직접 만든다.
 func (c *Client) USMarketCalendar(ctx context.Context, date tosstypes.Date) (*USMarketCalendar, error) {
 	q := url.Values{}
 	params.Date(q, "date", date)
-	return fetch.One[USMarketCalendar](ctx, c.http, "/api/v1/market-calendar/US", q)
+	return fetch.One[USMarketCalendar](ctx, c.http, "/api/v1/market-calendar/US", q, 0)
 }

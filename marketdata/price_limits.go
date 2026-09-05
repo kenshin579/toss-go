@@ -25,5 +25,5 @@ func (c *Client) PriceLimits(ctx context.Context, symbol string) (*PriceLimits, 
 	if err := params.Symbol(symbol); err != nil {
 		return nil, err
 	}
-	return fetch.One[PriceLimits](ctx, c.http, "/api/v1/price-limits", url.Values{"symbol": {symbol}})
+	return fetch.One[PriceLimits](ctx, c.http, "/api/v1/price-limits", url.Values{"symbol": {symbol}}, 0)
 }
