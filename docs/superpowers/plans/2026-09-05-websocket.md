@@ -1055,7 +1055,7 @@ func (f frame) orderEvent() (OrderEvent, error) {
 EOF
 gofmt -w stream && go vet ./stream/ && go test ./stream/ -race -v 2>&1 | grep -cE '^--- PASS'
 ```
-Expected: `16` (Task 1 의 7 + 이번 9).
+Expected: `17` (Task 1 의 8 + 이번 9).
 
 - [ ] **Step 3: 커밋**
 
@@ -2070,7 +2070,7 @@ func (c *Client) Stream(ctx context.Context, opts ...stream.Option) (*stream.Str
 ```bash
 gofmt -w . && go vet ./... && go test ./stream/ -race -count=1 -v 2>&1 | grep -cE '^--- PASS'
 ```
-Expected: `31` (Task 1 의 7 + Task 2 의 9 + 이번 15). 실행 결과로 확인하고 모두 PASS 인지만 본다.
+Expected: `32` (Task 1 의 8 + Task 2 의 9 + 이번 15). 실행 결과로 확인하고 모두 PASS 인지만 본다.
 
 - [ ] **Step 6: 커밋**
 
