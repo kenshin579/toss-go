@@ -138,6 +138,10 @@ func (s *Stream) Subscriptions() []Subscription { return s.subs.snapshot() }
 // 선언 자체가 실패했으면 *DeclareError 를 돌려준다. ctx 가 먼저 끝나면 ctx.Err() 를 돌려주는데,
 // 이때 선언은 이미 전송됐을 수 있다. 연속 호출은 최대 coalesceDelay(기본 100ms) 동안 하나의
 // 선언으로 합쳐지므로 그만큼 지연될 수 있다.
+//
+// rate-limit-exceeded 는 SDK 가 자동으로 재선언하므로 에러로 반환하지 않는다(Errors() 로는
+// 통지된다) — 곧 성공할 구독을 실패로 알고 호출자가 재시도하면 선언 빈도 한도를 더 악화시키기
+// 때문이다.
 func (s *Stream) Subscribe(ctx context.Context, subs ...Subscription) error {
 	if s.closed.Load() {
 		return errStreamClosed
@@ -152,7 +156,8 @@ func (s *Stream) Subscribe(ctx context.Context, subs ...Subscription) error {
 //
 // 서버의 구독 ack 를 기다린다. 이 호출은 항목을 추가하지 않으므로 거부와는 무관하며(항상 nil 이거나
 // 선언 자체가 실패했을 때만 *DeclareError), ctx 가 먼저 끝나면 ctx.Err() 를 돌려주는데 이때 선언은
-// 이미 전송됐을 수 있다.
+// 이미 전송됐을 수 있다. rate-limit-exceeded 는 SDK 가 자동으로 재선언하므로 에러로 반환하지 않는다
+// (Errors() 로는 통지된다).
 func (s *Stream) Unsubscribe(ctx context.Context, subs ...Subscription) error {
 	if s.closed.Load() {
 		return errStreamClosed
@@ -168,7 +173,8 @@ func (s *Stream) Unsubscribe(ctx context.Context, subs ...Subscription) error {
 // 서버의 구독 ack 를 기다렸다가, 이 호출이 넣은 항목이 거부됐으면 *RejectedError 를, 선언 자체가
 // 실패했으면 *DeclareError 를 돌려준다(단, 빈 Declare 는 프로토콜상 id 없이 `[]` 로만 보내고 서버도
 // 개별 ack 를 주지 않는 전체 해제라 즉시 nil 을 돌려준다 — 거부될 항목이 있을 수 없다). ctx 가 먼저
-// 끝나면 ctx.Err() 를 돌려주는데, 이때 선언은 이미 전송됐을 수 있다.
+// 끝나면 ctx.Err() 를 돌려주는데, 이때 선언은 이미 전송됐을 수 있다. rate-limit-exceeded 는 SDK 가
+// 자동으로 재선언하므로 에러로 반환하지 않는다(Errors() 로는 통지된다).
 func (s *Stream) Declare(ctx context.Context, subs ...Subscription) error {
 	if s.closed.Load() {
 		return errStreamClosed
@@ -203,6 +209,9 @@ func (s *Stream) declareAndWait(ctx context.Context, keys []string) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-s.done:
+		// Close() 가 s.closed 를 세우기 직전에 이 호출이 위의 검사를 통과한 경우를 위한
+		// 안전망 — 이게 없으면 영원히 대기한다(그 경우 pendingWaiters 에 등록은 됐지만
+		// run() 이 이미 완전히 끝나 다시는 failAllWaiters 가 불리지 않는다).
 		return errStreamClosed
 	}
 }
@@ -257,6 +266,7 @@ func (s *Stream) run(ctx context.Context, conn *websocket.Conn) {
 	attempt := 0
 	cause := ReconnectReadError
 	for {
+		connStart := time.Now() // 최초 연결·재연결 모두 여기서 이 연결의 "시작"으로 친다
 		connCtx, connCancel := context.WithCancel(ctx)
 		causeCh := make(chan ReconnectCause, 1)
 		var wg sync.WaitGroup
@@ -265,6 +275,13 @@ func (s *Stream) run(ctx context.Context, conn *websocket.Conn) {
 		go func() { defer wg.Done(); _ = pingLoop(connCtx, conn, s.cfg.pingInterval); connCancel() }()
 		go func() { defer wg.Done(); s.declareLoop(connCtx) }()
 		wg.Wait()
+
+		// 곧바로 다시 끊긴 연결은 성공으로 치지 않는다 — attempt 를 유지해 백오프 곡선을 이어간다.
+		// 이게 없으면 백프레셔처럼 클라이언트가 스스로 끊는 경우 즉시 재시도가 폭주한다: 첫 시도가
+		// 즉시(0 대기)인 데다 재연결 성공마다 attempt 를 0 으로 되돌리면, 짧게 살다 죽는 연결이
+		// 반복될 때마다 매번 "새로 시작"으로 착각해 초당 수천 회 재다이얼하게 된다(실측: 기본
+		// backoff 로 2초에 8949회).
+		healthy := time.Since(connStart) >= s.cfg.backoffMin
 
 		// 이 연결에 걸려 있던 ack 대기자는 다시는 응답을 받지 못한다 — 여기서 풀어준다
 		// (영원히 막히지 않게). 재연결에 성공하면 저장된 집합이 다시 선언되지만, 그 새 선언에
@@ -323,7 +340,9 @@ func (s *Stream) run(ctx context.Context, conn *websocket.Conn) {
 		conn = next
 		s.emitReconnect(Reconnect{Attempt: attempt, Cause: cause, At: time.Now()})
 		s.requestDeclare() // 저장된 집합을 다시 선언한다
-		attempt = 0
+		if healthy {
+			attempt = 0
+		}
 		cause = ReconnectReadError
 	}
 }
@@ -377,9 +396,13 @@ func (s *Stream) readLoop(ctx context.Context, conn *websocket.Conn, causeCh cha
 			s.emitErr(declErr)
 			if f.errCode == "rate-limit-exceeded" {
 				// 선언 빈도(5회/초)에 걸린 선언은 반영되지 않았다. 대기 후 한 번 다시 선언한다
-				// (토스는 Retry-After 를 주지 않는다). 재시도 자체가 또 걸리면 다음 Subscribe 나
-				// 재연결 때 어차피 전체 집합이 다시 선언된다.
+				// (토스는 Retry-After 를 주지 않는다). 대기자는 여기서 풀지 않는다 — 곧 보낼
+				// 재선언이 프로토콜상 full-replace 라 이 선언을 대체하므로, declareLoop 가 그
+				// 재선언을 보낼 때 지금 남아 있는 배치를 새 배치에 흡수한다(아래 참고). 여기서
+				// 풀어 버리면 실제로는 잠시 후 성공할 구독을 호출자가 실패로 알고 재시도해
+				// 선언 빈도 한도를 더 악화시킬 수 있다.
 				s.retryDeclareAfter(ctx, s.cfg.rateLimitRetry)
+				continue
 			}
 			// id 가 없는 에러 프레임은 특정 선언과 무관한 전역 에러일 수 있어(예: 일반
 			// internal-error), 임의로 가장 오래된 대기자에게 떠넘기지 않는다 — 그 대기자의
@@ -480,6 +503,14 @@ func (s *Stream) declareLoop(ctx context.Context) {
 			waiting := s.pendingWaiters
 			s.pendingWaiters = nil
 			s.mu.Unlock()
+			// 위 coalesce-drain 과 이 스냅샷 사이에 들어온 요청은 이미 이 배치(waiting)에 잡혔지만,
+			// 그 요청이 requestDeclare 로 declareCh 에 남긴 신호는 아직 안 지워졌을 수 있다 —
+			// 그대로 두면 대기자 없는 중복 선언이 하나 더 나가 5회/초 예산을 낭비한다. 스냅샷
+			// 직후 한 번 더(비차단) 흡수한다.
+			select {
+			case <-s.declareCh:
+			default:
+			}
 
 			body, err := s.subs.declaration(id)
 			if err != nil {
@@ -505,16 +536,35 @@ func (s *Stream) declareLoop(ctx context.Context) {
 			if isEmptyDeclaration(body) {
 				// 빈 배열은 프로토콜상 id 없이 `[]` 로만 전송되는 전체 해제 전용 형태라 서버도
 				// 개별 subscriptions ack 를 보내지 않는다. 거부될 항목이 있을 수 없으므로 즉시
-				// 성공으로 풀어준다(id 도 기록하지 않는다 — 실제로 echo 될 id 가 없다).
-				s.resolveWaiters(waiting, ackResult{})
+				// 성공으로 풀어준다(id 도 기록하지 않는다 — 실제로 echo 될 id 가 없다). full-replace
+				// 라 이 선언이 이전 선언들을 전부 대체한다 — 앞서 쌓인 채 아직 ack 를 못 받은
+				// 배치가 있다면(예: rate-limit 로 대기 중이던 것) 그 대기자도 함께 풀어준다.
+				s.mu.Lock()
+				carried := waiting
+				for _, b := range s.waiterBatches {
+					carried = append(carried, b.waiters...)
+				}
+				s.waiterBatches = nil
+				s.mu.Unlock()
+				s.resolveWaiters(carried, ackResult{})
 				continue
 			}
 			// 실제로 보낸 선언만 기록한다 — 보내지 못한 id 를 기록하면 그 다음에 도착하는
 			// 정상 ack 가 stale 로 오인돼 거부 항목이 집합에 남는다.
 			s.mu.Lock()
 			s.lastDeclareID = id
-			if len(waiting) > 0 {
-				s.waiterBatches = append(s.waiterBatches, declareBatch{id: id, waiters: waiting})
+			// full-replace 라 이 선언이 이전 선언들을 전부 대체한다. 서버가 error 프레임에는 id 를
+			// echo 하지 않는 경우가 있어(예: rate-limit-exceeded), 그런 선언에 매달린 배치는 결코
+			// 자기 id 로 된 ack 를 받지 못한다 — 방치하면 그 배치의 호출자가 영원히 막히고
+			// waiterBatches 도 연결 수명 내내 계속 자란다. 이번에 새로 보낸 선언에 흡수해 이번
+			// 선언의 ack 가 대신 풀어주게 한다.
+			carried := waiting
+			for _, b := range s.waiterBatches {
+				carried = append(carried, b.waiters...)
+			}
+			s.waiterBatches = nil
+			if len(carried) > 0 {
+				s.waiterBatches = append(s.waiterBatches, declareBatch{id: id, waiters: carried})
 			}
 			s.mu.Unlock()
 		}

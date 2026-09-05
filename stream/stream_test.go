@@ -368,6 +368,36 @@ func TestStream_OrderBackpressureReconnects(t *testing.T) {
 	}
 }
 
+func TestStream_BackpressureDoesNotStormReconnects(t *testing.T) {
+	// Orders() 를 소비하지 않으면 백프레셔로 계속 끊긴다. 이때 재연결이 백오프로 제한되지 않으면
+	// 계정당 2연결·선언 5회/초 제한이 있는 서버를 향해 초당 수천 번 다이얼하게 된다.
+	ts := newTestServer(t)
+	newTestStream(t, ts, WithOrderBuffer(1), WithBackoff(50*time.Millisecond, 200*time.Millisecond))
+	waitFor(t, "connection", func() bool { return ts.connCount() >= 1 })
+	ev := `{"type":"message","topic":"personal:order:3","data":{"event":"PENDING","accountSeq":"3","order":{"orderId":"o-1","symbol":"005930","side":"BUY","orderType":"LIMIT","timeInForce":"DAY","status":"PENDING","quantity":"1","currency":"KRW","orderedAt":"2026-03-28T09:30:00+09:00","execution":{"filledQuantity":"0","averageFilledPrice":null,"filledAmount":null,"commission":null,"tax":null,"settlementDate":null}}}}`
+	stop := make(chan struct{})
+	go func() { // 연결이 살아날 때마다 계속 밀어 넣어 백프레셔를 유지한다
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				ts.push(ev)
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+	}()
+	time.Sleep(600 * time.Millisecond)
+	close(stop)
+	// 50ms 백오프면 600ms 동안 많아야 십여 회다. 폭주하면 수백~수천 회가 된다.
+	if n := ts.connCount(); n > 30 {
+		t.Errorf("600ms 동안 연결 %d회 — 백프레셔 재연결이 백오프로 제한되지 않는다", n)
+	}
+	if n := ts.connCount(); n < 2 {
+		t.Errorf("재연결이 아예 일어나지 않았다(%d) — 테스트가 무의미하다", n)
+	}
+}
+
 func TestStream_ClosesOldConnBeforeReconnect(t *testing.T) {
 	// 계정당 동시 연결은 2개다. 재연결 전에 기존 연결을 닫지 않으면 새 연결이 자기 자신을 밀어내
 	// 끊김이 반복된다. 클라이언트가 먼저 끊는 경로(백프레셔)로 여러 번 재연결시켜 확인한다.
@@ -386,6 +416,13 @@ func TestStream_ClosesOldConnBeforeReconnect(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			t.Fatalf("재연결 %d 회차 미수신", reconnects+1)
 		}
+		// 스텁 서버는 옛 연결의 live-- 를 비동기로 처리한다(Read 에러 → cancel → outer select →
+		// CloseNow → defer, 최소 goroutine 스케줄링 2~3홉). 클라이언트는 첫 재시도를 즉시(0 대기)
+		// 하므로, 바로 다음 백프레셔를 몰아치면 그 비동기 처리가 아직 안 끝난 상태에서 새 연결이
+		// 뜬 것처럼 관측될 수 있다(실제로 클라이언트가 옛 연결을 안 닫아서가 아니라, 스텁의 회계가
+		// 새 다이얼을 못 따라간 것 — closeConn 은 프로그램 순서상 항상 다음 dial 보다 먼저 끝난다).
+		// 다음 라운드로 넘어가기 전에 짧게 쉬어 회계가 안정되게 한다.
+		time.Sleep(20 * time.Millisecond)
 	}
 	if got := ts.maxConcurrent(); got > 1 {
 		t.Errorf("동시 연결 %d — 재연결 전에 기존 연결을 닫지 않았다", got)
@@ -550,6 +587,35 @@ func TestSubscribe_DisconnectUnblocksWaiter(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("연결이 끊겼는데도 Subscribe 가 풀리지 않았다")
+	}
+}
+
+// TestSubscribe_SurvivesIDlessErrorFrame 은 서버가 error 프레임에 id 를 echo 하지 않아도(코드가
+// 이미 그 비대칭을 가정한다) 호출자가 영원히 막히지 않는지 본다. 뒤이은 재선언의 ack 가
+// full-replace 흡수 로직 덕분에 옛 배치의 대기자를 대신 풀어줘야 한다.
+func TestSubscribe_SurvivesIDlessErrorFrame(t *testing.T) {
+	ts := newTestServer(t)
+	ts.setAutoAck(false)
+	s := newTestStream(t, ts, WithRateLimitRetryDelay(10*time.Millisecond))
+	waitFor(t, "connection", func() bool { return ts.connCount() >= 1 })
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.Subscribe(context.Background(), Trade(tosstypes.MarketCountryKR, "005930"))
+	}()
+	waitFor(t, "first declare", func() bool { return len(declares(ts)) >= 1 })
+	ts.push(`{"type":"error","error":{"code":"rate-limit-exceeded","message":"too fast"}}`) // id 없음
+	// 재선언이 나가면 그 ack 로 대기자가 풀려야 한다
+	waitFor(t, "redeclare", func() bool { return len(declares(ts)) >= 2 })
+	d := declares(ts)
+	ts.push(`{"type":"subscriptions","id":"` + declareID(d[len(d)-1]) + `","subscribed":["trade:kr:005930"],"rejected":[]}`)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("Subscribe = %v, want nil", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Subscribe 가 영원히 대기한다 — 고아 배치")
 	}
 }
 
