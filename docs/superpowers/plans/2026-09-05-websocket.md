@@ -1352,6 +1352,10 @@ func WithoutAutoReconnect() Option { return func(c *config) { c.autoReconnect = 
 
 // WithBaseURL 은 웹소켓 URL 을 바꾼다(테스트용). 기본 wss://openapi-ws.tossinvest.com/ws/v1.
 func WithBaseURL(u string) Option { return func(c *config) { c.baseURL = u } }
+
+// WithCoalesceDelay 는 연속된 구독 변경을 하나의 선언으로 묶는 대기 시간을 바꾼다(기본 100ms).
+// 토스는 선언을 초당 5회로 제한한다.
+func WithCoalesceDelay(d time.Duration) Option { return func(c *config) { c.coalesceDelay = d } }
 EOF
 ```
 
@@ -1793,21 +1797,13 @@ func declares(ts *testServer) []string {
 }
 EOF
 ```
-> `WithCoalesceDelay` 는 Step 5 에서 `options.go` 에 추가한다.
 
 ```bash
 go test ./stream/ 2>&1 | head -5
 ```
-Expected: 컴파일 에러(`undefined: New`, `WithCoalesceDelay` 등).
+Expected: 컴파일 에러(`undefined: New`, `undefined: Stream` 등) — `WithCoalesceDelay` 는 이미 Step 2 의 `options.go` 에 포함돼 있다.
 
 - [ ] **Step 5: 구현**
-
-`options.go` 에 테스트용 옵션을 추가한다:
-```go
-// WithCoalesceDelay 는 연속된 구독 변경을 하나의 선언으로 묶는 대기 시간을 바꾼다(기본 100ms).
-// 토스는 선언을 초당 5회로 제한한다.
-func WithCoalesceDelay(d time.Duration) Option { return func(c *config) { c.coalesceDelay = d } }
-```
 
 ```bash
 cat > stream/conn.go << 'EOF'
@@ -2275,7 +2271,7 @@ func (c *Client) Stream(ctx context.Context, opts ...stream.Option) (*stream.Str
 ```bash
 gofmt -w . && go vet ./... && go test ./stream/ -race -count=1 -v 2>&1 | grep -cE '^--- PASS'
 ```
-Expected: `46` (Task 1 의 8 + Task 2 의 23 + 이번 15). 실행 결과로 확인하고 모두 PASS 인지만 본다.
+Expected: `39` (Task 1 의 8 + Task 2 의 16 + 이번 15 — `grep -cE '^--- PASS'` 는 앞에 공백이 붙는 서브테스트 줄을 세지 않는다). 실행 결과로 확인하고 모두 PASS 인지만 본다.
 
 - [ ] **Step 6: 커밋**
 
