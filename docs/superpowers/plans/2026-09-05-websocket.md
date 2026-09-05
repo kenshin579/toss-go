@@ -1233,6 +1233,8 @@ package stream
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -1497,7 +1499,7 @@ func TestStream_MaxTopicsRejectedBeforeSend(t *testing.T) {
 	s := newTestStream(t, ts)
 	codes := make([]string, MaxTopics+1)
 	for i := range codes {
-		codes[i] = "00000" + string(rune('0'+i%10))
+		codes[i] = fmt.Sprintf("%06d", i) // 고유해야 상한에 걸린다(중복 code 는 집합에서 합쳐진다)
 	}
 	err := s.Subscribe(context.Background(), Subscription{Type: "trade:kr", Codes: codes})
 	if err == nil || !strings.Contains(err.Error(), "too many") {
@@ -1520,6 +1522,10 @@ func TestStream_CloseIsIdempotent(t *testing.T) {
 	}
 }
 
+func asRejected(err error, target **RejectedError) bool { return errors.As(err, target) }
+
+func asDeclare(err error, target **DeclareError) bool { return errors.As(err, target) }
+
 // declares 는 스텁이 받은 프레임 중 선언(JSON 배열)만 고른다.
 func declares(ts *testServer) []string {
 	var out []string
@@ -1532,12 +1538,7 @@ func declares(ts *testServer) []string {
 }
 EOF
 ```
-> `asRejected`/`asDeclare` 는 `errors.As` 래퍼다. 구현 시 `stream_test.go` 하단에 아래를 추가한다:
-> ```go
-> func asRejected(err error, target **RejectedError) bool { return errors.As(err, target) }
-> func asDeclare(err error, target **DeclareError) bool   { return errors.As(err, target) }
-> ```
-> `errors` import 도 함께 추가한다. `WithCoalesceDelay` 는 Step 5 에서 `options.go` 에 추가한다.
+> `WithCoalesceDelay` 는 Step 5 에서 `options.go` 에 추가한다.
 
 ```bash
 go test ./stream/ 2>&1 | head -5
