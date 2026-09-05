@@ -177,6 +177,25 @@ func TestStream_StaleAckIsIgnored(t *testing.T) {
 	if !found {
 		t.Error("낡은 ack 로 구독이 제거됐다")
 	}
+
+	// 양성 대조: 실제로 보낸 선언(lastDeclareID)과 같은 id 로 같은 거부가 오면 이번엔 제거돼야
+	// 한다 — 프레임 경로 자체는 살아 있고, 위의 무시는 stale 판정 때문임을 증명한다.
+	d := declares(ts)
+	lastID := declareID(d[len(d)-1])
+	if lastID == "" {
+		t.Fatal("보낸 선언에서 id 를 못 찾았다")
+	}
+	ts.push(`{"type":"subscriptions","id":"` + lastID + `","subscribed":[],"rejected":[{"target":"trade:us:AAPL","code":"stock-not-found","message":"real"}]}`)
+	waitFor(t, "set without AAPL after matching ack", func() bool {
+		for _, sub := range s.Subscriptions() {
+			for _, c := range sub.Codes {
+				if c == "AAPL" {
+					return false
+				}
+			}
+		}
+		return true
+	})
 }
 
 func TestStream_ErrorFrame(t *testing.T) {
@@ -277,6 +296,43 @@ func TestStream_WithoutAutoReconnectClosesChannels(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("채널이 닫히지 않았다")
 	}
+	// 예상 못한 연결 종료(dropConn)인데 자동 재연결이 꺼져 있으면 그 사실을 알려야 한다.
+	found := false
+drain:
+	for {
+		select {
+		case err, ok := <-s.Errors():
+			if !ok {
+				break drain
+			}
+			if strings.Contains(err.Error(), "auto-reconnect is disabled") {
+				found = true
+			}
+		case <-time.After(500 * time.Millisecond):
+			break drain
+		}
+	}
+	if !found {
+		t.Error("자동 재연결이 꺼진 채 끊겼는데 그 사실을 알리는 에러가 없었다")
+	}
+}
+
+// TestStream_DeliberateCloseWithoutAutoReconnectIsQuiet 는 사용자가 직접 Close 를 호출한
+// 경우엔(예상 못한 끊김이 아니므로) auto-reconnect-disabled 진단 에러가 나오지 않아야 함을 본다.
+func TestStream_DeliberateCloseWithoutAutoReconnectIsQuiet(t *testing.T) {
+	ts := newTestServer(t)
+	s := newTestStream(t, ts, WithoutAutoReconnect())
+	waitFor(t, "connection", func() bool { return ts.connCount() >= 1 })
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err, ok := <-s.Errors():
+		if ok {
+			t.Errorf("직접 Close 했는데 진단 에러가 나왔다: %v", err)
+		}
+	default:
+	}
 }
 
 func TestStream_TradeBufferDropsOldest(t *testing.T) {
@@ -316,7 +372,9 @@ func TestStream_ClosesOldConnBeforeReconnect(t *testing.T) {
 	// 계정당 동시 연결은 2개다. 재연결 전에 기존 연결을 닫지 않으면 새 연결이 자기 자신을 밀어내
 	// 끊김이 반복된다. 클라이언트가 먼저 끊는 경로(백프레셔)로 여러 번 재연결시켜 확인한다.
 	ts := newTestServer(t)
-	s := newTestStream(t, ts, WithOrderBuffer(1))
+	// 백오프를 기본 테스트값(5~20ms)보다 넉넉히 잡는다 — CI 부하가 큰 환경에서 3번의 재연결이
+	// 촘촘한 타이밍에 몰리면서 생기는 오탐을 줄인다(이 테스트는 타이밍이 아니라 동시 연결 수만 본다).
+	s := newTestStream(t, ts, WithOrderBuffer(1), WithBackoff(30*time.Millisecond, 90*time.Millisecond))
 	waitFor(t, "connection", func() bool { return ts.connCount() >= 1 })
 	ev := `{"type":"message","topic":"personal:order:3","data":{"event":"PENDING","accountSeq":"3","order":{"orderId":"o-1","symbol":"005930","side":"BUY","orderType":"LIMIT","timeInForce":"DAY","status":"PENDING","quantity":"1","currency":"KRW","orderedAt":"2026-03-28T09:30:00+09:00","execution":{"filledQuantity":"0","averageFilledPrice":null,"filledAmount":null,"commission":null,"tax":null,"settlementDate":null}}}}`
 	for reconnects := 0; reconnects < 3; reconnects++ {
@@ -362,6 +420,136 @@ func TestStream_CloseIsIdempotent(t *testing.T) {
 	}
 	if err := s.Subscribe(context.Background(), Trade(tosstypes.MarketCountryKR, "005930")); err == nil {
 		t.Error("닫힌 스트림에 Subscribe 하면 에러여야 한다")
+	}
+}
+
+func TestStream_InvalidOptionsFallBackToDefaults(t *testing.T) {
+	ts := newTestServer(t)
+	s := newTestStream(t, ts, WithTradeBuffer(0), WithOrderBuffer(-1), WithPingInterval(0), WithBackoff(0, 0))
+	waitFor(t, "connection", func() bool { return ts.connCount() >= 1 })
+	// 0 버퍼면 pushLossy 가 무한 스핀해 읽기 루프가 멈춘다 — 이벤트가 도착하면 정상이다
+	ts.push(`{"type":"message","topic":"trade:kr:005930","data":{"price":"72000","volume":"5","timestamp":"2026-03-25T09:30:42.000+09:00","currency":"KRW"}}`)
+	select {
+	case ev := <-s.Trades():
+		if ev.Price.String() != "72000" {
+			t.Errorf("ev = %+v", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("잘못된 버퍼 옵션이 스트림을 멈췄다")
+	}
+}
+
+func TestPushLossy_CapOneKeepsNewest(t *testing.T) {
+	ch := make(chan int, 1)
+	pushLossy(ch, 1)
+	pushLossy(ch, 2)
+	if got := <-ch; got != 2 {
+		t.Errorf("got %d, want 2 (가득 차면 최신을 유지해야 한다)", got)
+	}
+}
+
+func TestPushLossy_CapZeroReturnsWithoutBlocking(t *testing.T) {
+	ch := make(chan int) // cap 0 — 예전 구현은 여기서 무한 스핀했다
+	done := make(chan struct{})
+	go func() {
+		pushLossy(ch, 1)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cap 0 채널에서 pushLossy 가 반환되지 않았다(무한 스핀)")
+	}
+}
+
+// TestSubscribe_ReturnsRejection 은 Subscribe 가 자신이 넣은 항목의 거부를 *RejectedError 로
+// 돌려주는지 본다(C: ack 를 기다리는 Subscribe/Unsubscribe/Declare).
+func TestSubscribe_ReturnsRejection(t *testing.T) {
+	ts := newTestServer(t)
+	ts.setAutoAck(false) // 이 테스트가 직접 ack 를 통제한다
+	s := newTestStream(t, ts)
+	ctx := context.Background()
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Subscribe(ctx, Trade(tosstypes.MarketCountryUS, "AAPL", "NOPE")) }()
+	waitFor(t, "declare", func() bool { return len(declares(ts)) >= 1 })
+	ts.push(`{"type":"subscriptions","subscribed":["trade:us:AAPL"],"rejected":[{"target":"trade:us:NOPE","code":"stock-not-found","message":"없음"}]}`)
+	select {
+	case err := <-errCh:
+		var re *RejectedError
+		if !asRejected(err, &re) || re.Target != "trade:us:NOPE" {
+			t.Errorf("Subscribe err = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Subscribe 가 반환되지 않았다")
+	}
+}
+
+// TestSubscribe_ReturnsDeclareError 는 선언 자체가 실패(error 프레임)하면 Subscribe 가
+// *DeclareError 를 돌려주는지 본다.
+func TestSubscribe_ReturnsDeclareError(t *testing.T) {
+	ts := newTestServer(t)
+	ts.setAutoAck(false)
+	s := newTestStream(t, ts)
+	ctx := context.Background()
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Subscribe(ctx, Trade(tosstypes.MarketCountryKR, "005930")) }()
+	waitFor(t, "declare", func() bool { return len(declares(ts)) >= 1 })
+	d := declares(ts)
+	id := declareID(d[len(d)-1])
+	if id == "" {
+		t.Fatal("보낸 선언에서 id 를 못 찾았다")
+	}
+	ts.push(`{"type":"error","id":"` + id + `","error":{"code":"too-many-topics","message":"초과"}}`)
+	select {
+	case err := <-errCh:
+		var de *DeclareError
+		if !asDeclare(err, &de) || de.Code != "too-many-topics" {
+			t.Errorf("Subscribe err = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Subscribe 가 반환되지 않았다")
+	}
+}
+
+// TestSubscribe_ContextCanceled 는 ack 가 오지 않는 상태에서 ctx 가 먼저 끝나면 Subscribe 가
+// ctx.Err() 를 돌려주는지 본다.
+func TestSubscribe_ContextCanceled(t *testing.T) {
+	ts := newTestServer(t)
+	ts.setAutoAck(false) // ack 를 주지 않아 Subscribe 가 계속 기다리게 한다
+	s := newTestStream(t, ts)
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Subscribe(ctx, Trade(tosstypes.MarketCountryKR, "005930")) }()
+	waitFor(t, "declare", func() bool { return len(declares(ts)) >= 1 })
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Subscribe 가 반환되지 않았다")
+	}
+}
+
+// TestSubscribe_DisconnectUnblocksWaiter 는 ack 를 기다리는 도중 연결이 끊기면 Subscribe 가
+// 영원히 막히지 않고 에러로 풀리는지 본다.
+func TestSubscribe_DisconnectUnblocksWaiter(t *testing.T) {
+	ts := newTestServer(t)
+	ts.setAutoAck(false)
+	s := newTestStream(t, ts)
+	ctx := context.Background()
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Subscribe(ctx, Trade(tosstypes.MarketCountryKR, "005930")) }()
+	waitFor(t, "declare", func() bool { return len(declares(ts)) >= 1 })
+	ts.dropConn() // ack 없이 연결을 끊는다
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Error("연결이 끊겼는데 Subscribe 가 nil 을 반환했다")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("연결이 끊겼는데도 Subscribe 가 풀리지 않았다")
 	}
 }
 

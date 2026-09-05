@@ -128,6 +128,14 @@ func PersonalOrder(accountSeqs ...int64) Subscription
 - 모든 채널은 `Close()` 또는 자동 재연결을 포기했을 때 닫힌다. 소비자는 `for ... range` 또는 `select` 로 읽는다.
 - `Subscription` 은 `{Type string; Codes []string}` 를 감싼 불투명 값 타입. 같은 `Type` 끼리는 집합 갱신 시
   합쳐서 하나의 배열 원소로 직렬화한다.
+- **`Subscribe`/`Unsubscribe`/`Declare` 는 서버의 구독 ack 를 기다렸다가 반환한다**(v0.3.0 이후 바꿀 수 없는
+  결정으로 고정). 이 호출이 추가한 항목이 거부됐으면 `*RejectedError` 를, 선언 자체가 실패했으면
+  `*DeclareError` 를 돌려준다. `ctx` 가 먼저 끝나면 `ctx.Err()` 를 돌려주는데, 이때 선언은 이미 전송됐을 수
+  있다. `Unsubscribe`/빈 `Declare` 는 항목을 추가하지 않으므로 거부와 무관하며(항상 nil 이거나 선언 실패
+  시에만 `*DeclareError`), 빈 `Declare`(전체 해제)는 프로토콜상 서버가 개별 ack 를 주지 않아 즉시 nil 을
+  돌려준다. `Errors()` 로의 전달은 반환값과 별개로 항상 이뤄진다 — 반환값은 이 호출의 결과, 채널은 전체
+  스트림에 대한 관찰용이다. 연결이 끊기면(재연결이든 최종 종료든) 아직 ack 를 기다리던 호출은 모두 에러로
+  풀려난다 — 다시는 오지 않을 ack 를 기다리며 영원히 막히지 않는다.
 
 ### 구독 집합과 선언
 
@@ -147,9 +155,15 @@ func PersonalOrder(accountSeqs ...int64) Subscription
 
 - 연결마다 `Client.AccessToken(ctx)` 로 토큰을 얻어 핸드셰이크 헤더에 싣는다(만료 토큰으로 재연결하지 않도록).
 - 60초(옵션)마다 텍스트 프레임 `PING` 송신. 응답 `pong` 은 소비하고 사용자에게 노출하지 않는다.
-- 읽기 루프가 종료되면(에러·EOF·`server-shutdown`) **기존 연결을 먼저 닫고** 백오프 후 재연결한다.
-  성공 시 저장된 집합을 재선언하고 `Reconnects()` 에 `Reconnect{Attempt, Cause, At}` 를 보낸다.
-- 백오프 기본값: 1s 시작, 2배씩, 상한 30s, ±20% jitter. `WithoutAutoReconnect()` 면 채널을 닫고 종료한다.
+- 읽기 루프가 종료되면(에러·EOF·`server-shutdown`) **기존 연결을 먼저 닫고**(뮤텍스를 잡은 채로 하지 않는다 —
+  `CloseNow()` 도 상대가 응답하지 않으면 지연될 수 있어, 그 지연이 다른 goroutine 의 연결 접근을 막아서는
+  안 된다) 백오프 후 재연결한다. 성공 시 저장된 집합을 재선언하고 `Reconnects()` 에
+  `Reconnect{Attempt, Cause, At}` 를 보낸다(가득 찼으면 가장 오래된 신호를 버린다 — 최신이 더 중요하다).
+- 백오프 기본값: 첫 시도는 즉시, 이후 1s→2s→4s..., 상한 30s, ±20% jitter. 재연결 다이얼 한 번에는
+  `WithDialTimeout`(기본 10초) 제한을 건다 — 블랙홀 주소로 OS TCP 타임아웃(~75초)까지 스트림이 깜깜해지는
+  것을 막는다. 최초 연결(`New` 호출)은 이 타임아웃과 무관하게 호출자가 넘긴 `ctx` 를 그대로 따른다.
+  `WithoutAutoReconnect()` 면 채널을 닫고 종료하며, 예상 못한 끊김이었다면(사용자가 직접 `Close` 하지 않은
+  경우) `Errors()` 로 그 사실을 알린다.
 - `Close()` 는 재연결을 멈추고 연결을 닫으며 모든 채널을 닫는다. 두 번 호출해도 안전하다.
 
 ### 백프레셔
@@ -162,6 +176,13 @@ func PersonalOrder(accountSeqs ...int64) Subscription
 
 버퍼 크기는 `WithTradeBuffer`/`WithOrderBuffer` 로 조절한다. 주문 채널을 막는 소비자는 결국 서버의 2초 룰로
 끊기므로, SDK 가 먼저 명시적으로 끊고 재연결 사유를 알리는 편이 진단 가능하다.
+
+**옵션 값 보정**: 버퍼(`WithTradeBuffer`/`WithOrderBuffer`)가 1 미만이면 기본값으로 되돌린다 — 0 이면
+가득 찬 시세 채널을 비우는 로직이 무한 반복되거나(과거 버그, 지금은 구조적으로 유한하지만 여전히 의미가
+없다) 모든 주문 이벤트가 즉시 백프레셔로 판정돼 무한 재연결에 빠지기 때문이다. `WithPingInterval`·
+`WithRateLimitRetryDelay`·`WithDialTimeout` 은 0 이하면, `WithBackoff` 는 `min` 이 0 이하거나 `max` 가
+`min` 보다 작으면 각각 기본값으로 되돌린다. 스트림이 조용히 멈추는 것보다 기본값으로 동작하는 편이 낫다는
+판단이다.
 
 ## 이벤트 타입
 

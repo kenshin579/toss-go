@@ -1291,13 +1291,17 @@ Expected: `github.com/coder/websocket v1.8.14`.
 cat > stream/options.go << 'EOF'
 package stream
 
-import "time"
+import (
+	"net/http"
+	"time"
+)
 
 // 기본값.
 const (
 	DefaultPingInterval   = 60 * time.Second // 서버는 클라이언트 송신이 180초 없으면 끊는다
 	DefaultTradeBuffer    = 1024
 	DefaultOrderBuffer    = 256
+	DefaultDialTimeout    = 10 * time.Second // 재연결 시 한 번의 연결 시도에 허용하는 시간
 	defaultDiagBuffer     = 16
 	defaultBackoffMin     = time.Second
 	defaultBackoffMax     = 30 * time.Second
@@ -1313,8 +1317,10 @@ type config struct {
 	backoffMax     time.Duration
 	coalesceDelay  time.Duration
 	rateLimitRetry time.Duration
+	dialTimeout    time.Duration
 	autoReconnect  bool
-	baseURL        string // 테스트용 ws:// 오버라이드
+	baseURL        string       // 테스트용 ws:// 오버라이드
+	httpClient     *http.Client // 핸드셰이크에 쓸 클라이언트(nil 이면 라이브러리 기본값)
 }
 
 func defaultConfig() config {
@@ -1326,6 +1332,7 @@ func defaultConfig() config {
 		backoffMax:     defaultBackoffMax,
 		coalesceDelay:  defaultCoalesceDelay,
 		rateLimitRetry: defaultRateLimitRetry,
+		dialTimeout:    DefaultDialTimeout,
 		autoReconnect:  true,
 	}
 }
@@ -1335,17 +1342,22 @@ type Option func(*config)
 
 // WithPingInterval 은 keepalive PING 주기를 바꾼다(기본 60초).
 // 서버는 클라이언트로부터의 수신이 180초 없으면 연결을 끊으므로 그보다 짧아야 한다.
+// 1 미만이면(0 이하) 기본값으로 되돌린다.
 func WithPingInterval(d time.Duration) Option { return func(c *config) { c.pingInterval = d } }
 
 // WithTradeBuffer 는 시세 채널(Trades·Orderbooks) 버퍼 크기를 바꾼다(기본 1024).
-// 가득 차면 가장 오래된 이벤트를 버린다 — 시세는 LOSSY 규약이다.
+// 가득 차면 가장 오래된 이벤트를 버린다 — 시세는 LOSSY 규약이다. 1 미만이면 기본값으로 되돌린다 —
+// 버퍼가 0(또는 음수)이면 읽기 루프가 멈추거나 패닉할 수 있기 때문이다.
 func WithTradeBuffer(n int) Option { return func(c *config) { c.tradeBuffer = n } }
 
 // WithOrderBuffer 는 주문 채널 버퍼 크기를 바꾼다(기본 256).
 // 주문 이벤트는 버리지 않는다 — 가득 차면 연결을 끊고 재연결하며 Reconnects() 로 알린다.
+// 1 미만이면 기본값으로 되돌린다 — 버퍼가 0(또는 음수)이면 모든 주문 이벤트가 즉시 백프레셔로
+// 판정돼 무한 재연결에 빠지기 때문이다.
 func WithOrderBuffer(n int) Option { return func(c *config) { c.orderBuffer = n } }
 
 // WithBackoff 는 재연결 지수 백오프의 시작·상한을 바꾼다(기본 1초·30초).
+// min 이 0 이하면 기본값으로, max 가 min 보다 작으면 min 으로 되돌린다.
 func WithBackoff(min, max time.Duration) Option {
 	return func(c *config) { c.backoffMin, c.backoffMax = min, max }
 }
@@ -1361,9 +1373,17 @@ func WithBaseURL(u string) Option { return func(c *config) { c.baseURL = u } }
 func WithCoalesceDelay(d time.Duration) Option { return func(c *config) { c.coalesceDelay = d } }
 
 // WithRateLimitRetryDelay 는 rate-limit-exceeded 를 받은 뒤 재선언까지의 대기 시간을 바꾼다(기본 1초).
+// 1 미만이면(0 이하) 기본값으로 되돌린다.
 func WithRateLimitRetryDelay(d time.Duration) Option {
 	return func(c *config) { c.rateLimitRetry = d }
 }
+
+// WithDialTimeout 은 재연결 다이얼 타임아웃을 바꾼다(기본 10초). 최초 연결은 New 에 넘긴 ctx 를
+// 따른다. 1 미만이면(0 이하) 기본값으로 되돌린다.
+func WithDialTimeout(d time.Duration) Option { return func(c *config) { c.dialTimeout = d } }
+
+// WithHTTPClient 는 핸드셰이크에 쓸 *http.Client 를 지정한다(프록시·TLS·타임아웃 제어용).
+func WithHTTPClient(hc *http.Client) Option { return func(c *config) { c.httpClient = hc } }
 EOF
 ```
 
@@ -1375,6 +1395,7 @@ package stream
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1387,6 +1408,11 @@ import (
 
 // testServer 는 실제 웹소켓 업그레이드를 하는 스텁이다.
 // 수신한 텍스트 프레임을 기록하고, 테스트가 원하는 프레임을 밀어 넣을 수 있다.
+//
+// 기본적으로 클라이언트가 보낸 선언(빈 배열이 아닌 JSON 배열)에는 자동으로 성공 ack 를 돌려준다 —
+// 실제 서버 동작과 같고, Subscribe/Unsubscribe/Declare 가 ack 를 기다리는 지금 구조에서 그렇게
+// 하지 않으면 대부분의 테스트가 멈춰 버린다. 특정 ack(거부·에러·낡은 id 등)를 직접 통제해야 하는
+// 테스트는 setAutoAck(false) 로 끄고 push 로 원하는 프레임을 보낸다.
 type testServer struct {
 	srv *httptest.Server
 	url string
@@ -1399,11 +1425,12 @@ type testServer struct {
 	closeCh  chan struct{} // 현재 연결을 강제 종료하라는 신호
 	live     int           // 현재 살아 있는 연결 수
 	maxLive  int           // 관측된 최대 동시 연결 수
+	autoAck  bool          // 선언을 받으면 자동으로 성공 ack 를 돌려줄지
 }
 
 func newTestServer(t *testing.T) *testServer {
 	t.Helper()
-	ts := &testServer{pushCh: make(chan string, 64), closeCh: make(chan struct{}, 8)}
+	ts := &testServer{pushCh: make(chan string, 64), closeCh: make(chan struct{}, 8), autoAck: true}
 	ts.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := websocket.Accept(w, r, nil)
 		if err != nil {
@@ -1425,7 +1452,7 @@ func newTestServer(t *testing.T) *testServer {
 
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
-		go func() { // 읽기 루프: 수신 프레임 기록 + PING 에 pong 응답
+		go func() { // 읽기 루프: 수신 프레임 기록 + PING 에 pong 응답 + 선언에 자동 ack
 			for {
 				_, data, err := c.Read(ctx)
 				if err != nil {
@@ -1435,9 +1462,18 @@ func newTestServer(t *testing.T) *testServer {
 				s := string(data)
 				ts.mu.Lock()
 				ts.received = append(ts.received, s)
+				autoAck := ts.autoAck
 				ts.mu.Unlock()
 				if s == "PING" {
 					_ = c.Write(ctx, websocket.MessageText, []byte(`{"type":"pong"}`))
+					continue
+				}
+				trimmed := strings.TrimSpace(s)
+				if autoAck && strings.HasPrefix(trimmed, "[") && trimmed != "[]" {
+					if id := declareID(s); id != "" {
+						ack := `{"type":"subscriptions","id":"` + id + `"}`
+						_ = c.Write(ctx, websocket.MessageText, []byte(ack))
+					}
 				}
 			}
 		}()
@@ -1488,6 +1524,30 @@ func (ts *testServer) maxConcurrent() int {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	return ts.maxLive
+}
+
+// setAutoAck 는 선언에 대한 자동 ack 를 켜고 끈다. 거부·에러·낡은 id 등 ack 내용을 테스트가
+// 직접 통제해야 할 때 false 로 끈다.
+func (ts *testServer) setAutoAck(v bool) {
+	ts.mu.Lock()
+	ts.autoAck = v
+	ts.mu.Unlock()
+}
+
+// declareID 는 선언 프레임(JSON 배열)의 첫 원소가 {"id":"..."} 형태면 그 id 를 돌려준다.
+// 없으면 빈 문자열.
+func declareID(raw string) string {
+	var arr []json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &arr); err != nil || len(arr) == 0 {
+		return ""
+	}
+	var first struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(arr[0], &first); err != nil {
+		return ""
+	}
+	return first.ID
 }
 
 // waitFor 는 조건이 참이 될 때까지 최대 2초 기다린다.
@@ -1693,6 +1753,25 @@ func TestStream_StaleAckIsIgnored(t *testing.T) {
 	if !found {
 		t.Error("낡은 ack 로 구독이 제거됐다")
 	}
+
+	// 양성 대조: 실제로 보낸 선언(lastDeclareID)과 같은 id 로 같은 거부가 오면 이번엔 제거돼야
+	// 한다 — 프레임 경로 자체는 살아 있고, 위의 무시는 stale 판정 때문임을 증명한다.
+	d := declares(ts)
+	lastID := declareID(d[len(d)-1])
+	if lastID == "" {
+		t.Fatal("보낸 선언에서 id 를 못 찾았다")
+	}
+	ts.push(`{"type":"subscriptions","id":"` + lastID + `","subscribed":[],"rejected":[{"target":"trade:us:AAPL","code":"stock-not-found","message":"real"}]}`)
+	waitFor(t, "set without AAPL after matching ack", func() bool {
+		for _, sub := range s.Subscriptions() {
+			for _, c := range sub.Codes {
+				if c == "AAPL" {
+					return false
+				}
+			}
+		}
+		return true
+	})
 }
 
 func TestStream_ErrorFrame(t *testing.T) {
@@ -1793,6 +1872,43 @@ func TestStream_WithoutAutoReconnectClosesChannels(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("채널이 닫히지 않았다")
 	}
+	// 예상 못한 연결 종료(dropConn)인데 자동 재연결이 꺼져 있으면 그 사실을 알려야 한다.
+	found := false
+drain:
+	for {
+		select {
+		case err, ok := <-s.Errors():
+			if !ok {
+				break drain
+			}
+			if strings.Contains(err.Error(), "auto-reconnect is disabled") {
+				found = true
+			}
+		case <-time.After(500 * time.Millisecond):
+			break drain
+		}
+	}
+	if !found {
+		t.Error("자동 재연결이 꺼진 채 끊겼는데 그 사실을 알리는 에러가 없었다")
+	}
+}
+
+// TestStream_DeliberateCloseWithoutAutoReconnectIsQuiet 는 사용자가 직접 Close 를 호출한
+// 경우엔(예상 못한 끊김이 아니므로) auto-reconnect-disabled 진단 에러가 나오지 않아야 함을 본다.
+func TestStream_DeliberateCloseWithoutAutoReconnectIsQuiet(t *testing.T) {
+	ts := newTestServer(t)
+	s := newTestStream(t, ts, WithoutAutoReconnect())
+	waitFor(t, "connection", func() bool { return ts.connCount() >= 1 })
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err, ok := <-s.Errors():
+		if ok {
+			t.Errorf("직접 Close 했는데 진단 에러가 나왔다: %v", err)
+		}
+	default:
+	}
 }
 
 func TestStream_TradeBufferDropsOldest(t *testing.T) {
@@ -1832,7 +1948,9 @@ func TestStream_ClosesOldConnBeforeReconnect(t *testing.T) {
 	// 계정당 동시 연결은 2개다. 재연결 전에 기존 연결을 닫지 않으면 새 연결이 자기 자신을 밀어내
 	// 끊김이 반복된다. 클라이언트가 먼저 끊는 경로(백프레셔)로 여러 번 재연결시켜 확인한다.
 	ts := newTestServer(t)
-	s := newTestStream(t, ts, WithOrderBuffer(1))
+	// 백오프를 기본 테스트값(5~20ms)보다 넉넉히 잡는다 — CI 부하가 큰 환경에서 3번의 재연결이
+	// 촘촘한 타이밍에 몰리면서 생기는 오탐을 줄인다(이 테스트는 타이밍이 아니라 동시 연결 수만 본다).
+	s := newTestStream(t, ts, WithOrderBuffer(1), WithBackoff(30*time.Millisecond, 90*time.Millisecond))
 	waitFor(t, "connection", func() bool { return ts.connCount() >= 1 })
 	ev := `{"type":"message","topic":"personal:order:3","data":{"event":"PENDING","accountSeq":"3","order":{"orderId":"o-1","symbol":"005930","side":"BUY","orderType":"LIMIT","timeInForce":"DAY","status":"PENDING","quantity":"1","currency":"KRW","orderedAt":"2026-03-28T09:30:00+09:00","execution":{"filledQuantity":"0","averageFilledPrice":null,"filledAmount":null,"commission":null,"tax":null,"settlementDate":null}}}}`
 	for reconnects := 0; reconnects < 3; reconnects++ {
@@ -1878,6 +1996,136 @@ func TestStream_CloseIsIdempotent(t *testing.T) {
 	}
 	if err := s.Subscribe(context.Background(), Trade(tosstypes.MarketCountryKR, "005930")); err == nil {
 		t.Error("닫힌 스트림에 Subscribe 하면 에러여야 한다")
+	}
+}
+
+func TestStream_InvalidOptionsFallBackToDefaults(t *testing.T) {
+	ts := newTestServer(t)
+	s := newTestStream(t, ts, WithTradeBuffer(0), WithOrderBuffer(-1), WithPingInterval(0), WithBackoff(0, 0))
+	waitFor(t, "connection", func() bool { return ts.connCount() >= 1 })
+	// 0 버퍼면 pushLossy 가 무한 스핀해 읽기 루프가 멈춘다 — 이벤트가 도착하면 정상이다
+	ts.push(`{"type":"message","topic":"trade:kr:005930","data":{"price":"72000","volume":"5","timestamp":"2026-03-25T09:30:42.000+09:00","currency":"KRW"}}`)
+	select {
+	case ev := <-s.Trades():
+		if ev.Price.String() != "72000" {
+			t.Errorf("ev = %+v", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("잘못된 버퍼 옵션이 스트림을 멈췄다")
+	}
+}
+
+func TestPushLossy_CapOneKeepsNewest(t *testing.T) {
+	ch := make(chan int, 1)
+	pushLossy(ch, 1)
+	pushLossy(ch, 2)
+	if got := <-ch; got != 2 {
+		t.Errorf("got %d, want 2 (가득 차면 최신을 유지해야 한다)", got)
+	}
+}
+
+func TestPushLossy_CapZeroReturnsWithoutBlocking(t *testing.T) {
+	ch := make(chan int) // cap 0 — 예전 구현은 여기서 무한 스핀했다
+	done := make(chan struct{})
+	go func() {
+		pushLossy(ch, 1)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cap 0 채널에서 pushLossy 가 반환되지 않았다(무한 스핀)")
+	}
+}
+
+// TestSubscribe_ReturnsRejection 은 Subscribe 가 자신이 넣은 항목의 거부를 *RejectedError 로
+// 돌려주는지 본다(C: ack 를 기다리는 Subscribe/Unsubscribe/Declare).
+func TestSubscribe_ReturnsRejection(t *testing.T) {
+	ts := newTestServer(t)
+	ts.setAutoAck(false) // 이 테스트가 직접 ack 를 통제한다
+	s := newTestStream(t, ts)
+	ctx := context.Background()
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Subscribe(ctx, Trade(tosstypes.MarketCountryUS, "AAPL", "NOPE")) }()
+	waitFor(t, "declare", func() bool { return len(declares(ts)) >= 1 })
+	ts.push(`{"type":"subscriptions","subscribed":["trade:us:AAPL"],"rejected":[{"target":"trade:us:NOPE","code":"stock-not-found","message":"없음"}]}`)
+	select {
+	case err := <-errCh:
+		var re *RejectedError
+		if !asRejected(err, &re) || re.Target != "trade:us:NOPE" {
+			t.Errorf("Subscribe err = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Subscribe 가 반환되지 않았다")
+	}
+}
+
+// TestSubscribe_ReturnsDeclareError 는 선언 자체가 실패(error 프레임)하면 Subscribe 가
+// *DeclareError 를 돌려주는지 본다.
+func TestSubscribe_ReturnsDeclareError(t *testing.T) {
+	ts := newTestServer(t)
+	ts.setAutoAck(false)
+	s := newTestStream(t, ts)
+	ctx := context.Background()
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Subscribe(ctx, Trade(tosstypes.MarketCountryKR, "005930")) }()
+	waitFor(t, "declare", func() bool { return len(declares(ts)) >= 1 })
+	d := declares(ts)
+	id := declareID(d[len(d)-1])
+	if id == "" {
+		t.Fatal("보낸 선언에서 id 를 못 찾았다")
+	}
+	ts.push(`{"type":"error","id":"` + id + `","error":{"code":"too-many-topics","message":"초과"}}`)
+	select {
+	case err := <-errCh:
+		var de *DeclareError
+		if !asDeclare(err, &de) || de.Code != "too-many-topics" {
+			t.Errorf("Subscribe err = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Subscribe 가 반환되지 않았다")
+	}
+}
+
+// TestSubscribe_ContextCanceled 는 ack 가 오지 않는 상태에서 ctx 가 먼저 끝나면 Subscribe 가
+// ctx.Err() 를 돌려주는지 본다.
+func TestSubscribe_ContextCanceled(t *testing.T) {
+	ts := newTestServer(t)
+	ts.setAutoAck(false) // ack 를 주지 않아 Subscribe 가 계속 기다리게 한다
+	s := newTestStream(t, ts)
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Subscribe(ctx, Trade(tosstypes.MarketCountryKR, "005930")) }()
+	waitFor(t, "declare", func() bool { return len(declares(ts)) >= 1 })
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Subscribe 가 반환되지 않았다")
+	}
+}
+
+// TestSubscribe_DisconnectUnblocksWaiter 는 ack 를 기다리는 도중 연결이 끊기면 Subscribe 가
+// 영원히 막히지 않고 에러로 풀리는지 본다.
+func TestSubscribe_DisconnectUnblocksWaiter(t *testing.T) {
+	ts := newTestServer(t)
+	ts.setAutoAck(false)
+	s := newTestStream(t, ts)
+	ctx := context.Background()
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Subscribe(ctx, Trade(tosstypes.MarketCountryKR, "005930")) }()
+	waitFor(t, "declare", func() bool { return len(declares(ts)) >= 1 })
+	ts.dropConn() // ack 없이 연결을 끊는다
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Error("연결이 끊겼는데 Subscribe 가 nil 을 반환했다")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("연결이 끊겼는데도 Subscribe 가 풀리지 않았다")
 	}
 }
 
@@ -1927,12 +2175,14 @@ const DefaultBaseURL = "wss://openapi-ws.tossinvest.com/ws/v1"
 type TokenFunc func(ctx context.Context) (string, error)
 
 // dial 은 핸드셰이크를 수행한다. 인증은 이 시점 1회뿐이며, 이후 토큰이 만료돼도 연결은 끊기지 않는다.
-func dial(ctx context.Context, url string, token TokenFunc) (*websocket.Conn, error) {
+// hc 가 nil 이면 라이브러리 기본값(http.DefaultClient)을 쓴다.
+func dial(ctx context.Context, url string, token TokenFunc, hc *http.Client) (*websocket.Conn, error) {
 	tok, err := token(ctx)
 	if err != nil {
 		return nil, err
 	}
 	c, resp, err := websocket.Dial(ctx, url, &websocket.DialOptions{
+		HTTPClient: hc,
 		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + tok}},
 	})
 	if err != nil {
@@ -1947,10 +2197,16 @@ func dial(ctx context.Context, url string, token TokenFunc) (*websocket.Conn, er
 	return c, nil
 }
 
-// backoff 는 지수 백오프 대기 시간을 계산한다(±20% jitter).
+// backoff 는 지수 백오프 대기 시간을 계산한다(±20% jitter). 첫 시도(attempt<=1)는 곧바로 한다 —
+// 서버 배포 직후 복귀처럼 대부분의 끊김은 일시적이라, 재시도 전에 최소 backoffMin 을 무조건
+// 기다리는 것보다 즉시 한 번 시도해 보는 편이 대체로 더 빠르게 복구된다. 두 번째 시도부터는
+// 기존과 같은 지수 곡선(min, 2·min, 4·min, ...)을 그대로 따른다.
 func backoff(attempt int, min, max time.Duration) time.Duration {
+	if attempt <= 1 {
+		return 0
+	}
 	d := min
-	for i := 1; i < attempt && d < max; i++ {
+	for i := 2; i < attempt && d < max; i++ {
 		d *= 2
 	}
 	if d > max {
@@ -1977,22 +2233,28 @@ func pingLoop(ctx context.Context, c *websocket.Conn, every time.Duration) error
 	}
 }
 
-// closeConn 은 연결을 확실히 닫는다. 재연결 전에 반드시 호출한다 —
+// closeConn 은 연결을 즉시 끊는다. 재연결 전에 반드시 호출한다 —
 // 계정당 연결 2개 한도가 있어, 닫지 않으면 새 연결이 이전 연결을 밀어내 끊김이 반복된다.
+// graceful close 핸드셰이크는 상대가 응답하지 않으면 수십 초 걸릴 수 있어 쓰지 않는다.
 func closeConn(c *websocket.Conn) {
 	if c == nil {
 		return
 	}
-	_ = c.Close(websocket.StatusNormalClosure, "")
 	_ = c.CloseNow()
 }
 
 var errStreamClosed = errors.New("toss: stream is closed")
+
+// errNotConnected 는 declareLoop 가 연결이 없는 상태에서 선언을 보내려 할 때 대기자에게 돌려주는
+// 에러다(방어적 경로 — declareLoop 는 항상 유효한 연결과 함께 시작되므로 실전에서는 거의 발생하지
+// 않는다). 다음 연결에서 저장된 구독이 다시 선언된다.
+var errNotConnected = errors.New("toss: not connected")
 EOF
 cat > stream/stream.go << 'EOF'
 package stream
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strconv"
@@ -2002,6 +2264,19 @@ import (
 
 	"github.com/coder/websocket"
 )
+
+// ackResult 는 하나의 선언에 대한 서버 응답(또는 그 선언을 보내거나 기다리는 도중 실패한 사유)이다.
+type ackResult struct {
+	rejected []rejectedItem
+	err      error // 비어 있지 않으면 대기자에게 그대로 돌려준다(*DeclareError, 전송 실패, 연결 종료 등)
+}
+
+// declareBatch 는 전송된 특정 선언 id 에 매달린 대기자들이다. 도착 순서를 보존한다 — id 를 echo
+// 하지 않는 ack 는 가장 오래 기다린(가장 먼저 보낸) 배치에 배정한다.
+type declareBatch struct {
+	id      string
+	waiters []chan ackResult
+}
 
 // Stream 은 실시간 웹소켓 스트림이다. toss.Client.Stream 으로 만든다.
 // 여러 goroutine 에서 동시에 사용해도 안전하다.
@@ -2024,9 +2299,11 @@ type Stream struct {
 	done   chan struct{}
 	closed atomic.Bool
 
-	mu            sync.Mutex
-	conn          *websocket.Conn // 현재 연결. 쓰기 전에 잠근다
-	lastDeclareID string          // 마지막으로 보낸 선언의 id. 낡은 ack 를 걸러내는 데 쓴다
+	mu             sync.Mutex
+	conn           *websocket.Conn // 현재 연결. 쓰기 전에 잠근다
+	lastDeclareID  string          // 마지막으로 전송에 성공한 선언의 id. 낡은 ack 를 걸러내는 데 쓴다
+	pendingWaiters []chan ackResult
+	waiterBatches  []declareBatch
 }
 
 // New 는 스트림을 만들고 연결한다. 보통은 toss.Client.Stream 을 쓴다.
@@ -2036,6 +2313,29 @@ func New(ctx context.Context, token TokenFunc, opts ...Option) (*Stream, error) 
 	cfg := defaultConfig()
 	for _, o := range opts {
 		o(&cfg)
+	}
+	// 버퍼가 1 미만이면 pushLossy 가 무한 스핀하거나(시세) 모든 이벤트가 백프레셔로 판정된다(주문).
+	// 잘못된 값은 조용히 기본값으로 되돌린다 — 스트림이 멈추는 것보다 낫다.
+	if cfg.tradeBuffer < 1 {
+		cfg.tradeBuffer = DefaultTradeBuffer
+	}
+	if cfg.orderBuffer < 1 {
+		cfg.orderBuffer = DefaultOrderBuffer
+	}
+	if cfg.backoffMin <= 0 {
+		cfg.backoffMin = defaultBackoffMin
+	}
+	if cfg.backoffMax < cfg.backoffMin {
+		cfg.backoffMax = cfg.backoffMin
+	}
+	if cfg.pingInterval <= 0 {
+		cfg.pingInterval = DefaultPingInterval
+	}
+	if cfg.rateLimitRetry <= 0 {
+		cfg.rateLimitRetry = defaultRateLimitRetry
+	}
+	if cfg.dialTimeout <= 0 {
+		cfg.dialTimeout = DefaultDialTimeout
 	}
 	url := cfg.baseURL
 	if url == "" {
@@ -2051,7 +2351,7 @@ func New(ctx context.Context, token TokenFunc, opts ...Option) (*Stream, error) 
 		declareCh:  make(chan struct{}, 1),
 		done:       make(chan struct{}),
 	}
-	conn, err := dial(ctx, url, token)
+	conn, err := dial(ctx, url, token, cfg.httpClient)
 	if err != nil {
 		return nil, err
 	}
@@ -2086,6 +2386,11 @@ func (s *Stream) Errors() <-chan error { return s.errs }
 func (s *Stream) Subscriptions() []Subscription { return s.subs.snapshot() }
 
 // Subscribe 는 구독을 추가하고 전체 집합을 다시 선언한다(프로토콜이 full-replace 다).
+//
+// 서버의 구독 ack 를 기다렸다가, 이 호출이 추가한 항목이 거부됐으면 *RejectedError 를,
+// 선언 자체가 실패했으면 *DeclareError 를 돌려준다. ctx 가 먼저 끝나면 ctx.Err() 를 돌려주는데,
+// 이때 선언은 이미 전송됐을 수 있다. 연속 호출은 최대 coalesceDelay(기본 100ms) 동안 하나의
+// 선언으로 합쳐지므로 그만큼 지연될 수 있다.
 func (s *Stream) Subscribe(ctx context.Context, subs ...Subscription) error {
 	if s.closed.Load() {
 		return errStreamClosed
@@ -2093,11 +2398,14 @@ func (s *Stream) Subscribe(ctx context.Context, subs ...Subscription) error {
 	if err := s.subs.add(subs...); err != nil {
 		return err
 	}
-	s.requestDeclare()
-	return nil
+	return s.declareAndWait(ctx, subKeys(subs))
 }
 
 // Unsubscribe 는 구독을 빼고 전체 집합을 다시 선언한다.
+//
+// 서버의 구독 ack 를 기다린다. 이 호출은 항목을 추가하지 않으므로 거부와는 무관하며(항상 nil 이거나
+// 선언 자체가 실패했을 때만 *DeclareError), ctx 가 먼저 끝나면 ctx.Err() 를 돌려주는데 이때 선언은
+// 이미 전송됐을 수 있다.
 func (s *Stream) Unsubscribe(ctx context.Context, subs ...Subscription) error {
 	if s.closed.Load() {
 		return errStreamClosed
@@ -2105,11 +2413,15 @@ func (s *Stream) Unsubscribe(ctx context.Context, subs ...Subscription) error {
 	if err := s.subs.remove(subs...); err != nil {
 		return err
 	}
-	s.requestDeclare()
-	return nil
+	return s.declareAndWait(ctx, nil)
 }
 
 // Declare 는 구독 집합을 통째로 바꾼다. 인자가 없으면 전체 구독을 해제한다.
+//
+// 서버의 구독 ack 를 기다렸다가, 이 호출이 넣은 항목이 거부됐으면 *RejectedError 를, 선언 자체가
+// 실패했으면 *DeclareError 를 돌려준다(단, 빈 Declare 는 프로토콜상 id 없이 `[]` 로만 보내고 서버도
+// 개별 ack 를 주지 않는 전체 해제라 즉시 nil 을 돌려준다 — 거부될 항목이 있을 수 없다). ctx 가 먼저
+// 끝나면 ctx.Err() 를 돌려주는데, 이때 선언은 이미 전송됐을 수 있다.
 func (s *Stream) Declare(ctx context.Context, subs ...Subscription) error {
 	if s.closed.Load() {
 		return errStreamClosed
@@ -2117,8 +2429,55 @@ func (s *Stream) Declare(ctx context.Context, subs ...Subscription) error {
 	if err := s.subs.replace(subs...); err != nil {
 		return err
 	}
+	return s.declareAndWait(ctx, subKeys(subs))
+}
+
+// declareAndWait 는 선언 전송을 요청하고, 그 선언의 ack 를 기다려 keys 중 하나가 거부됐으면
+// *RejectedError 를, 선언 자체가 실패했으면 그 에러를 돌려준다.
+func (s *Stream) declareAndWait(ctx context.Context, keys []string) error {
+	ch := make(chan ackResult, 1)
+	s.mu.Lock()
+	s.pendingWaiters = append(s.pendingWaiters, ch)
+	s.mu.Unlock()
 	s.requestDeclare()
-	return nil
+
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			return res.err
+		}
+		for _, r := range res.rejected {
+			if containsKey(keys, r.Target) {
+				item := r
+				return &RejectedError{Target: item.Target, Code: item.Code, Message: item.Message}
+			}
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.done:
+		return errStreamClosed
+	}
+}
+
+// subKeys 는 Subscription 들이 나타내는 full key(type:code) 목록이다.
+func subKeys(subs []Subscription) []string {
+	var keys []string
+	for _, sub := range subs {
+		for _, c := range sub.Codes {
+			keys = append(keys, sub.Type+":"+c)
+		}
+	}
+	return keys
+}
+
+func containsKey(keys []string, target string) bool {
+	for _, k := range keys {
+		if k == target {
+			return true
+		}
+	}
+	return false
 }
 
 // Close 는 재연결을 멈추고 연결을 닫으며 모든 채널을 닫는다. 여러 번 호출해도 안전하다.
@@ -2128,9 +2487,10 @@ func (s *Stream) Close() error {
 	}
 	s.cancel()
 	s.mu.Lock()
-	closeConn(s.conn)
+	c := s.conn
 	s.conn = nil
 	s.mu.Unlock()
+	closeConn(c)
 	<-s.done
 	return nil
 }
@@ -2159,12 +2519,10 @@ func (s *Stream) run(ctx context.Context, conn *websocket.Conn) {
 		go func() { defer wg.Done(); s.declareLoop(connCtx) }()
 		wg.Wait()
 
-		// 재연결 전에 반드시 기존 연결을 닫는다(계정당 2개 한도).
-		s.mu.Lock()
-		closeConn(s.conn)
-		s.conn = nil
-		s.mu.Unlock()
-		connCancel()
+		// 이 연결에 걸려 있던 ack 대기자는 다시는 응답을 받지 못한다 — 여기서 풀어준다
+		// (영원히 막히지 않게). 재연결에 성공하면 저장된 집합이 다시 선언되지만, 그 새 선언에
+		// 대한 새 대기는 재연결 이후 호출에서만 만들어진다.
+		s.failAllWaiters(fmt.Errorf("toss: connection closed while waiting for declare ack"))
 
 		select {
 		case c := <-causeCh:
@@ -2172,7 +2530,21 @@ func (s *Stream) run(ctx context.Context, conn *websocket.Conn) {
 		default:
 		}
 
+		// 재연결 전에 반드시 기존 연결을 닫는다(계정당 2개 한도). 뮤텍스를 잡은 채로 네트워크
+		// 종료 핸드셰이크를 하지 않는다 — CloseNow 조차 상대가 응답하지 않는 소켓에서는 지연될
+		// 수 있어, 그 지연이 다른 goroutine 의 s.conn 접근(예: declareLoop 의 쓰기)을 막아서는
+		// 안 된다.
+		s.mu.Lock()
+		c := s.conn
+		s.conn = nil
+		s.mu.Unlock()
+		closeConn(c)
+		connCancel()
+
 		if ctx.Err() != nil || !s.cfg.autoReconnect {
+			if !s.cfg.autoReconnect && !s.closed.Load() {
+				s.emitErr(fmt.Errorf("toss: stream disconnected (%s); auto-reconnect is disabled", cause))
+			}
 			return
 		}
 
@@ -2188,7 +2560,9 @@ func (s *Stream) run(ctx context.Context, conn *websocket.Conn) {
 				return
 			case <-time.After(backoff(attempt, s.cfg.backoffMin, s.cfg.backoffMax)):
 			}
-			c, err := dial(ctx, s.url, s.token)
+			dialCtx, dialCancel := context.WithTimeout(ctx, s.cfg.dialTimeout)
+			c, err := dial(dialCtx, s.url, s.token, s.cfg.httpClient)
+			dialCancel()
 			if err != nil {
 				s.emitErr(err)
 				continue
@@ -2233,29 +2607,41 @@ func (s *Stream) readLoop(ctx context.Context, conn *websocket.Conn, causeCh cha
 		}
 		switch f.kind {
 		case frameSubscriptions:
-			// 낡은 선언의 ack 는 무시한다 — 그 사이 사용자가 다시 넣은 구독을 지울 수 있다.
-			// id 가 없는 ack(서버가 echo 하지 않은 경우)는 그대로 적용한다.
+			// 낡은 선언의 ack 는 구독 집합에는 반영하지 않는다 — 그 사이 사용자가 다시 넣은
+			// 구독을 지울 수 있다. 다만 거부 알림은 stale 여부와 무관하게 항상 보낸다.
 			s.mu.Lock()
 			stale := f.id != "" && s.lastDeclareID != "" && f.id != s.lastDeclareID
 			s.mu.Unlock()
-			if stale {
-				continue
-			}
 			for _, r := range f.rejected {
-				s.subs.reject(r.Target)
+				if !stale {
+					s.subs.reject(r.Target)
+				}
 				s.emitErr(&RejectedError{Target: r.Target, Code: r.Code, Message: r.Message})
+			}
+			if chs := s.takeBatch(f.id); len(chs) > 0 {
+				s.resolveWaiters(chs, ackResult{rejected: f.rejected})
 			}
 		case frameError:
 			if f.errCode == "server-shutdown" {
 				shutdown = true
 				continue // 곧 연결이 끊긴다 — 에러가 아니라 재연결 사유다
 			}
-			s.emitErr(&DeclareError{ID: f.id, Code: f.errCode, Message: f.errMessage})
+			declErr := &DeclareError{ID: f.id, Code: f.errCode, Message: f.errMessage}
+			s.emitErr(declErr)
 			if f.errCode == "rate-limit-exceeded" {
 				// 선언 빈도(5회/초)에 걸린 선언은 반영되지 않았다. 대기 후 한 번 다시 선언한다
 				// (토스는 Retry-After 를 주지 않는다). 재시도 자체가 또 걸리면 다음 Subscribe 나
 				// 재연결 때 어차피 전체 집합이 다시 선언된다.
 				s.retryDeclareAfter(ctx, s.cfg.rateLimitRetry)
+			}
+			// id 가 없는 에러 프레임은 특정 선언과 무관한 전역 에러일 수 있어(예: 일반
+			// internal-error), 임의로 가장 오래된 대기자에게 떠넘기지 않는다 — 그 대기자의
+			// 실제 ack 가 뒤이어 와도 이미 소비돼 사라지는 것을 막기 위함이다. id 가 있을
+			// 때만 정확히 그 배치에 실패를 전달한다.
+			if f.id != "" {
+				if chs := s.takeBatch(f.id); len(chs) > 0 {
+					s.resolveWaiters(chs, ackResult{err: declErr})
+				}
 			}
 		case frameMessage:
 			if !s.dispatch(f) {
@@ -2303,22 +2689,26 @@ func (s *Stream) dispatch(f frame) bool {
 	return true
 }
 
-// pushLossy 는 가득 차면 가장 오래된 것을 버리고 새 이벤트를 넣는다(시세 LOSSY 규약).
+// pushLossy 는 가득 차면 가장 오래된 것을 버리고 새 이벤트를 넣는다(시세 LOSSY 규약, 재연결 알림도
+// 같은 규약을 쓴다). 반복하지 않는다 — 버퍼가 0 이면 무한 스핀이 되고(cap 0 채널은 동시 수신자가
+// 없는 한 항상 default 로 빠진다), 경쟁하는 소비자가 있으면 필요 이상으로 버릴 수 있기 때문이다.
 func pushLossy[T any](ch chan T, ev T) {
-	for {
+	select {
+	case ch <- ev:
+	default:
+		select {
+		case <-ch: // 가장 오래된 것을 버린다
+		default:
+		}
 		select {
 		case ch <- ev:
-			return
-		default:
-			select {
-			case <-ch: // 가장 오래된 것을 버린다
-			default:
-			}
+		default: // 그 사이 다시 찼다면(경쟁 소비자) 이번 이벤트를 버린다 — LOSSY 규약이니 허용한다
 		}
 	}
 }
 
-// declareLoop 는 코얼레싱된 선언 요청을 처리한다.
+// declareLoop 는 코얼레싱된 선언 요청을 처리하고, 그 선언을 기다리던 호출자(Subscribe 등)를
+// 결과가 나오는 대로 풀어준다.
 func (s *Stream) declareLoop(ctx context.Context) {
 	for {
 		select {
@@ -2338,31 +2728,117 @@ func (s *Stream) declareLoop(ctx context.Context) {
 				}
 			}
 			id := "d-" + strconv.FormatInt(s.seq.Add(1), 10)
+
+			s.mu.Lock()
+			waiting := s.pendingWaiters
+			s.pendingWaiters = nil
+			s.mu.Unlock()
+
 			body, err := s.subs.declaration(id)
 			if err != nil {
 				s.emitErr(err)
+				s.resolveWaiters(waiting, ackResult{err: err})
 				continue
 			}
 			s.mu.Lock()
 			c := s.conn
 			s.mu.Unlock()
 			if c == nil {
+				// 방어적 경로: declareLoop 는 항상 유효한 연결과 함께 시작되므로 실전에서는
+				// 거의 발생하지 않는다. 다음 연결에서 저장된 집합이 다시 선언된다.
+				s.resolveWaiters(waiting, ackResult{err: errNotConnected})
 				continue
 			}
 			if err := c.Write(ctx, websocket.MessageText, body); err != nil {
-				s.emitErr(fmt.Errorf("toss: declare: %w", err))
+				werr := fmt.Errorf("toss: declare: %w", err)
+				s.emitErr(werr)
+				s.resolveWaiters(waiting, ackResult{err: werr})
 				return
+			}
+			if isEmptyDeclaration(body) {
+				// 빈 배열은 프로토콜상 id 없이 `[]` 로만 전송되는 전체 해제 전용 형태라 서버도
+				// 개별 subscriptions ack 를 보내지 않는다. 거부될 항목이 있을 수 없으므로 즉시
+				// 성공으로 풀어준다(id 도 기록하지 않는다 — 실제로 echo 될 id 가 없다).
+				s.resolveWaiters(waiting, ackResult{})
+				continue
 			}
 			// 실제로 보낸 선언만 기록한다 — 보내지 못한 id 를 기록하면 그 다음에 도착하는
 			// 정상 ack 가 stale 로 오인돼 거부 항목이 집합에 남는다.
 			s.mu.Lock()
 			s.lastDeclareID = id
+			if len(waiting) > 0 {
+				s.waiterBatches = append(s.waiterBatches, declareBatch{id: id, waiters: waiting})
+			}
 			s.mu.Unlock()
 		}
 	}
 }
 
+// isEmptyDeclaration 은 declaration() 이 만든 body 가 전체 해제(`[]`)인지 본다.
+func isEmptyDeclaration(body []byte) bool {
+	return string(bytes.TrimSpace(body)) == "[]"
+}
+
+// takeBatch 는 id 에 매달린 대기자를 찾아 제거하고 돌려준다. id 가 비어 있으면(서버가 echo 하지
+// 않은 ack) 가장 오래 기다린(가장 먼저 보낸) 배치를 돌려준다. 없으면 nil.
+func (s *Stream) takeBatch(id string) []chan ackResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.waiterBatches) == 0 {
+		return nil
+	}
+	idx := -1
+	if id == "" {
+		idx = 0
+	} else {
+		for i, b := range s.waiterBatches {
+			if b.id == id {
+				idx = i
+				break
+			}
+		}
+	}
+	if idx < 0 {
+		return nil
+	}
+	w := s.waiterBatches[idx].waiters
+	s.waiterBatches = append(s.waiterBatches[:idx], s.waiterBatches[idx+1:]...)
+	return w
+}
+
+// resolveWaiters 는 res 를 각 채널로 보낸다. 채널은 버퍼 1개짜리이고 정확히 한 번만 보내지도록
+// 호출부가 보장한다(대기자 슬라이스는 등록·전달마다 통째로 옮겨지고 다시 쓰이지 않는다).
+func (s *Stream) resolveWaiters(chs []chan ackResult, res ackResult) {
+	for _, ch := range chs {
+		ch <- res
+	}
+}
+
+// failAllWaiters 는 아직 남아 있는 모든 대기자(전송 전 pendingWaiters + 전송 후 waiterBatches)를
+// 주어진 에러로 풀어준다. 연결 하나의 수명이 끝날 때(재연결이든 최종 종료든) run 이 호출해,
+// 다시는 오지 않을 ack 를 기다리며 영원히 막히는 일이 없게 한다.
+func (s *Stream) failAllWaiters(err error) {
+	s.mu.Lock()
+	pending := s.pendingWaiters
+	s.pendingWaiters = nil
+	batches := s.waiterBatches
+	s.waiterBatches = nil
+	s.mu.Unlock()
+	res := ackResult{err: err}
+	for _, ch := range pending {
+		ch <- res
+	}
+	for _, b := range batches {
+		for _, ch := range b.waiters {
+			ch <- res
+		}
+	}
+}
+
 // retryDeclareAfter 는 d 후에 선언을 한 번 더 요청한다. 연결이 끝나면 취소된다.
+//
+// 이 goroutine 은 WaitGroup 에 넣지 않는다 — declareCh 는 절대 닫히지 않으므로 채널 종료 후에도
+// 안전하다. 여기에 emitErr 등 닫히는 채널로의 전송을 추가하면 panic 이 난다.
 func (s *Stream) retryDeclareAfter(ctx context.Context, d time.Duration) {
 	go func() {
 		t := time.NewTimer(d)
@@ -2382,11 +2858,10 @@ func (s *Stream) emitErr(err error) {
 	}
 }
 
+// emitReconnect 는 재연결 채널이 가득 찼을 때 가장 오래된 신호를 버린다 — 최신 재연결 신호가
+// 살아남아야 한다(오래된 Cause 보다 지금 상태가 더 중요하다).
 func (s *Stream) emitReconnect(r Reconnect) {
-	select {
-	case s.reconnects <- r:
-	default:
-	}
+	pushLossy(s.reconnects, r)
 }
 
 func (s *Stream) closeChannels() {
@@ -2417,7 +2892,7 @@ func (c *Client) Stream(ctx context.Context, opts ...stream.Option) (*stream.Str
 ```bash
 gofmt -w . && go vet ./... && go test ./stream/ -race -count=1 -v 2>&1 | grep -cE '^--- PASS'
 ```
-Expected: `42` (Task 1 의 8 + Task 2 의 16 + 이번 18 — `grep -cE '^--- PASS'` 는 앞에 공백이 붙는 서브테스트 줄을 세지 않는다. 15 + rate-limit 재선언·재연결 전 종료·낡은 ack 무시 리뷰 테스트 3개 = 18). 실행 결과로 확인하고 모두 PASS 인지만 본다.
+Expected: `50` (Task 1 의 8 + Task 2 의 16 + 이번 26 — `grep -cE '^--- PASS'` 는 앞에 공백이 붙는 서브테스트 줄을 세지 않는다. 15(최초 구현) + rate-limit 재선언·재연결 전 종료·낡은 ack 무시 리뷰 테스트 3개 + 옵션 값 검증·pushLossy·ack 대기형 Subscribe·자동재연결 꺼짐 진단 2차 리뷰 테스트 8개 = 26). 실행 결과로 확인하고 모두 PASS 인지만 본다.
 
 - [x] **Step 6: 커밋**
 
