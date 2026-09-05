@@ -30,6 +30,9 @@ type config struct {
 	autoReconnect  bool
 	baseURL        string       // 테스트용 ws:// 오버라이드
 	httpClient     *http.Client // 핸드셰이크에 쓸 클라이언트(nil 이면 라이브러리 기본값)
+	// afterDeclareWrite 는 선언을 소켓에 쓴 직후 호출되는 테스트 전용 훅이다(평시 nil).
+	// "대기 배치를 쓰기보다 먼저 등록한다"는 순서를 확률이 아니라 결정적으로 검증하는 데 쓴다.
+	afterDeclareWrite func()
 }
 
 func defaultConfig() config {

@@ -599,6 +599,9 @@ func (s *Stream) declareLoop(ctx context.Context) {
 				}
 				return
 			}
+			if s.cfg.afterDeclareWrite != nil {
+				s.cfg.afterDeclareWrite()
+			}
 		}
 	}
 }

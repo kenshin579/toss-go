@@ -628,22 +628,58 @@ func TestSubscribe_SurvivesIDlessErrorFrame(t *testing.T) {
 // TestDeclare_ConcurrentFloodAlwaysReturns 는 declareLoop 가 소켓에 쓴 뒤에 배치를 등록하면 생기는
 // 경합 — readLoop 이 등록보다 먼저 ack 를 처리해 배치가 영구 고아가 되는 문제 — 를 잡는다.
 // 단일 스레드로는 재현되지 않으므로 반드시 동시 부하로 두드린다.
-func TestDeclare_ConcurrentFloodAlwaysReturns(t *testing.T) {
-	// ack 가 배치 등록을 앞지르면 호출자가 영원히 막힌다. 동시에 두드려 모든 호출이 반환되는지 본다.
+// withAfterDeclareWrite 는 선언을 소켓에 쓴 직후 지점을 가로채는 테스트 전용 옵션이다.
+func withAfterDeclareWrite(f func()) Option { return func(c *config) { c.afterDeclareWrite = f } }
+
+func TestDeclare_RegistersWaiterBatchBeforeWrite(t *testing.T) {
+	// 대기 배치를 쓰기보다 먼저 등록하지 않으면, 서버 ack 가 등록을 앞질러 도착했을 때 그 ack 는
+	// 주인을 찾지 못해 버려지고 뒤늦게 등록된 배치는 영구 고아가 된다 — 호출자가 무기한 막힌다.
+	// 실전에서 이 창은 "쓰기와 잠금 획득 사이의 선점"이라 매우 좁아 부하로는 잘 잡히지 않는다.
+	// 그래서 쓰기 직후에 훅을 걸어 ack 가 반드시 먼저 처리되도록 창을 강제로 벌린다:
+	// 등록이 쓰기 뒤로 밀린 구현이라면 이 테스트는 확률이 아니라 항상 실패한다.
+	ts := newTestServer(t)
+	settled := make(chan struct{})
+	var once sync.Once
+	s := newTestStream(t, ts,
+		WithCoalesceDelay(time.Millisecond),
+		withAfterDeclareWrite(func() {
+			// 서버가 ack 를 보내고 readLoop 이 그것을 처리하기까지 넉넉히 기다린다.
+			time.Sleep(150 * time.Millisecond)
+			once.Do(func() { close(settled) })
+		}),
+	)
+	waitFor(t, "connection", func() bool { return ts.connCount() >= 1 })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := s.Declare(ctx, Trade(tosstypes.MarketCountryKR, "005930")); err != nil {
+		t.Fatalf("Declare: %v — 쓰기 직후 도착한 ack 가 등록을 앞질러 배치가 고아가 됐다", err)
+	}
+	<-settled // 훅이 실제로 실행됐는지(=창이 벌어졌는지) 확인한다
+	if n := s.pendingBatchCountForTest(); n != 0 {
+		t.Errorf("대기 배치 %d 개가 남았다", n)
+	}
+}
+
+func TestDeclare_ConcurrentCallersAllReturn(t *testing.T) {
+	// 동시에 두드려도 대기자를 잃지 않는지 본다(교착·유실 카나리아).
+	// 이 경합의 결정적 검증은 TestDeclare_RegistersWaiterBatchBeforeWrite 가 맡는다.
 	ts := newTestServer(t)
 	s := newTestStream(t, ts, WithCoalesceDelay(time.Millisecond))
 	waitFor(t, "connection", func() bool { return ts.connCount() >= 1 })
 
-	const workers, iters = 8, 60
+	const workers = 8
+	deadline := time.Now().Add(300 * time.Millisecond)
 	var wg sync.WaitGroup
-	var stuck atomic.Int32
+	var stuck, total atomic.Int64
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
-			for i := 0; i < iters; i++ {
+			for i := 0; time.Now().Before(deadline); i++ {
 				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-				err := s.Declare(ctx, Trade(tosstypes.MarketCountryKR, fmt.Sprintf("%06d", w*iters+i)))
+				err := s.Declare(ctx, Trade(tosstypes.MarketCountryKR, fmt.Sprintf("%03d%05d", w, i)))
+				total.Add(1)
 				if errors.Is(err, context.DeadlineExceeded) {
 					stuck.Add(1)
 				}
@@ -652,10 +688,10 @@ func TestDeclare_ConcurrentFloodAlwaysReturns(t *testing.T) {
 		}(w)
 	}
 	wg.Wait()
+
 	if n := stuck.Load(); n > 0 {
-		t.Errorf("%d 건이 ack 를 받지 못하고 대기했다 — 배치 등록이 ack 보다 늦다", n)
+		t.Errorf("%d/%d 건이 ack 를 받지 못하고 대기했다", n, total.Load())
 	}
-	// 정지 상태에서는 남은 배치가 없어야 한다
 	waitFor(t, "no orphan batches", func() bool { return s.pendingBatchCountForTest() == 0 })
 }
 
