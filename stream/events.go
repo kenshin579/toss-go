@@ -32,8 +32,8 @@ import (
 
 // TradeEvent 는 실시간 체결 1건.
 type TradeEvent struct {
-	Market    tosstypes.MarketCountry // topic 에서 파싱
-	Symbol    string                  // topic 에서 파싱
+	Market    tosstypes.MarketCountry // 이 이벤트가 속한 시장
+	Symbol    string                  // 종목 심볼
 	Price     decimal.Decimal         // 체결가
 	Volume    decimal.Decimal         // 체결 수량
 	Timestamp time.Time               // 체결 시각
@@ -42,8 +42,8 @@ type TradeEvent struct {
 
 // Level 은 호가 한 단계.
 type Level struct {
-	Price  decimal.Decimal
-	Volume decimal.Decimal
+	Price  decimal.Decimal `json:"price"`
+	Volume decimal.Decimal `json:"volume"`
 }
 
 // OrderbookEvent 는 실시간 호가 스냅샷.
@@ -119,7 +119,8 @@ func (e *ConnectError) Unwrap() error { return e.Err }
 
 // DeclareError 는 구독 선언 전체가 실패했을 때의 error 프레임.
 // 기존 구독은 유지된다. Code 는 wrong-format·no-type·invalid-type·no-codes·too-many-topics·
-// too-many·rate-limit-exceeded·internal-error 중 하나이며 unknown 값도 올 수 있다.
+// too-many·rate-limit-exceeded·internal-error·server-shutdown 중 하나이며 unknown 값도 올 수 있다.
+// 단 server-shutdown 은 SDK 가 에러로 취급하지 않고 재연결 사유(ReconnectServerShutdown)로 처리한다.
 type DeclareError struct {
 	ID      string // 요청에 id 를 보냈을 때만 채워진다
 	Code    string

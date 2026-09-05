@@ -76,8 +76,8 @@ func TestSubscriptionConstructors(t *testing.T) {
 		t.Errorf("Orderbook = %+v", got)
 	}
 	// personal:order 의 codes 는 종목이 아니라 accountSeq 문자열이다
-	if got := Order(3, 7); got.Type != "personal:order" || got.Codes[0] != "3" || got.Codes[1] != "7" {
-		t.Errorf("Order = %+v", got)
+	if got := PersonalOrder(3, 7); got.Type != "personal:order" || got.Codes[0] != "3" || got.Codes[1] != "7" {
+		t.Errorf("PersonalOrder = %+v", got)
 	}
 }
 
@@ -117,12 +117,16 @@ func TestSubscriptionSet_AddRemoveDeclare(t *testing.T) {
 		t.Errorf("merged codes = %v (%s)", seen, body)
 	}
 
-	s.remove(Trade(tosstypes.MarketCountryKR, "005930"))
+	if err := s.remove(Trade(tosstypes.MarketCountryKR, "005930")); err != nil {
+		t.Fatal(err)
+	}
 	if n := s.count(); n != 2 {
 		t.Errorf("after remove count = %d", n)
 	}
 	// 마지막 code 를 지우면 type 자체가 사라진다
-	s.remove(Orderbook(tosstypes.MarketCountryKR, "005930"))
+	if err := s.remove(Orderbook(tosstypes.MarketCountryKR, "005930")); err != nil {
+		t.Fatal(err)
+	}
 	body, _ = s.declaration("d-2")
 	_ = json.Unmarshal(body, &arr)
 	for _, e := range arr[1:] {
@@ -140,6 +144,10 @@ func TestSubscriptionSet_EmptyDeclarationIsArray(t *testing.T) {
 	}
 	if string(body) != `[]` {
 		t.Errorf("empty declaration = %s, want []", body)
+	}
+	// 전체 해제는 id 유무와 무관하게 항상 []여야 한다 — 토스는 []만 전체 구독 해제로 해석한다.
+	if body, err := s.declaration("d-1"); err != nil || string(body) != `[]` {
+		t.Errorf("빈 집합은 id 가 있어도 [] 여야 한다: %s %v", body, err)
 	}
 }
 
@@ -194,7 +202,7 @@ func TestSubscriptionSet_RejectRemoves(t *testing.T) {
 
 func TestSubscriptionSet_Snapshot(t *testing.T) {
 	s := newSubscriptionSet()
-	_ = s.add(Trade(tosstypes.MarketCountryKR, "005930"), Order(3))
+	_ = s.add(Trade(tosstypes.MarketCountryKR, "005930"), PersonalOrder(3))
 	got := s.snapshot()
 	if len(got) != 2 {
 		t.Fatalf("snapshot = %+v", got)
@@ -204,6 +212,39 @@ func TestSubscriptionSet_Snapshot(t *testing.T) {
 	body, _ := s.declaration("")
 	if strings.Contains(string(body), "999999") {
 		t.Error("snapshot 은 복사본이어야 한다")
+	}
+}
+
+func TestSubscriptionSet_Replace(t *testing.T) {
+	s := newSubscriptionSet()
+	if err := s.add(Trade(tosstypes.MarketCountryKR, "005930")); err != nil {
+		t.Fatal(err)
+	}
+	// replace 는 집합을 통째로 바꾼다 — 기존 구독은 새 목록에 없으면 사라진다.
+	if err := s.replace(Orderbook(tosstypes.MarketCountryUS, "AAPL"), PersonalOrder(3)); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := s.declaration("")
+	if strings.Contains(string(body), "005930") {
+		t.Errorf("replace 후 이전 구독이 남아있으면 안 된다: %s", body)
+	}
+	if !strings.Contains(string(body), "AAPL") || !strings.Contains(string(body), "orderbook:us") {
+		t.Errorf("replace 로 넣은 구독이 있어야 한다: %s", body)
+	}
+	if n := s.count(); n != 2 {
+		t.Errorf("count = %d, want 2", n)
+	}
+
+	// 상한을 넘는 replace 는 기존 집합을 그대로 둔다.
+	codes := make([]string, MaxTopics+1)
+	for i := range codes {
+		codes[i] = fmt.Sprintf("%06d", i)
+	}
+	if err := s.replace(Subscription{Type: "trade:kr", Codes: codes}); err == nil || !strings.Contains(err.Error(), "too many") {
+		t.Errorf("상한 초과 replace 는 거부해야 한다: %v", err)
+	}
+	if n := s.count(); n != 2 {
+		t.Errorf("실패한 replace 는 기존 집합을 보존해야 한다: count = %d, want 2", n)
 	}
 }
 EOF
@@ -249,8 +290,8 @@ import (
 
 // TradeEvent 는 실시간 체결 1건.
 type TradeEvent struct {
-	Market    tosstypes.MarketCountry // topic 에서 파싱
-	Symbol    string                  // topic 에서 파싱
+	Market    tosstypes.MarketCountry // 이 이벤트가 속한 시장
+	Symbol    string                  // 종목 심볼
 	Price     decimal.Decimal         // 체결가
 	Volume    decimal.Decimal         // 체결 수량
 	Timestamp time.Time               // 체결 시각
@@ -259,8 +300,8 @@ type TradeEvent struct {
 
 // Level 은 호가 한 단계.
 type Level struct {
-	Price  decimal.Decimal
-	Volume decimal.Decimal
+	Price  decimal.Decimal `json:"price"`
+	Volume decimal.Decimal `json:"volume"`
 }
 
 // OrderbookEvent 는 실시간 호가 스냅샷.
@@ -336,7 +377,8 @@ func (e *ConnectError) Unwrap() error { return e.Err }
 
 // DeclareError 는 구독 선언 전체가 실패했을 때의 error 프레임.
 // 기존 구독은 유지된다. Code 는 wrong-format·no-type·invalid-type·no-codes·too-many-topics·
-// too-many·rate-limit-exceeded·internal-error 중 하나이며 unknown 값도 올 수 있다.
+// too-many·rate-limit-exceeded·internal-error·server-shutdown 중 하나이며 unknown 값도 올 수 있다.
+// 단 server-shutdown 은 SDK 가 에러로 취급하지 않고 재연결 사유(ReconnectServerShutdown)로 처리한다.
 type DeclareError struct {
 	ID      string // 요청에 id 를 보냈을 때만 채워진다
 	Code    string
@@ -392,7 +434,7 @@ const (
 	typePersonalOrder = "personal:order"
 )
 
-// Subscription 은 구독 선언의 원소 하나다. 생성자(Trade·Orderbook·Order)를 쓴다.
+// Subscription 은 구독 선언의 원소 하나다. 생성자(Trade·Orderbook·PersonalOrder)를 쓴다.
 type Subscription struct {
 	Type  string   // 예: trade:kr, orderbook:us, personal:order
 	Codes []string // 시세는 종목 symbol, personal:order 는 accountSeq 문자열
@@ -408,9 +450,9 @@ func Orderbook(market tosstypes.MarketCountry, symbols ...string) Subscription {
 	return Subscription{Type: marketType("orderbook", market), Codes: append([]string(nil), symbols...)}
 }
 
-// Order 는 본인 계좌의 주문 이벤트 구독을 만든다.
+// PersonalOrder 는 본인 계좌의 주문 이벤트 구독을 만든다(와이어 type: personal:order).
 // codes 에 들어가는 값은 종목이 아니라 계좌 accountSeq 다(Client.Accounts 로 조회).
-func Order(accountSeqs ...int64) Subscription {
+func PersonalOrder(accountSeqs ...int64) Subscription {
 	codes := make([]string, len(accountSeqs))
 	for i, seq := range accountSeqs {
 		codes[i] = strconv.FormatInt(seq, 10)
@@ -451,6 +493,8 @@ func (s Subscription) validate() error {
 }
 
 // subscriptionSet 은 현재 구독 전체를 들고 있다. 프로토콜이 full-replace 라 부분 전송이 없다.
+// 같은 code 를 두 번 넣어도 1건이다(프로토콜이 topic 집합이라 참조 카운트가 없다) — 두 번
+// 구독한 뒤 한 번 해제하면 완전히 빠진다.
 type subscriptionSet struct {
 	mu sync.Mutex
 	m  map[string]map[string]struct{} // type -> code set
@@ -471,17 +515,8 @@ func (s *subscriptionSet) add(subs ...Subscription) error {
 	defer s.mu.Unlock()
 	// 먼저 결과 크기를 계산해 상한을 검사한다(부분 적용 방지).
 	next := s.cloneLocked()
-	for _, sub := range subs {
-		codes := next[sub.Type]
-		if codes == nil {
-			codes = map[string]struct{}{}
-			next[sub.Type] = codes
-		}
-		for _, c := range sub.Codes {
-			codes[c] = struct{}{}
-		}
-	}
-	if n := countLocked(next); n > MaxTopics {
+	mergeInto(next, subs)
+	if n := countTopics(next); n > MaxTopics {
 		return fmt.Errorf("toss: too many topics: %d (max %d)", n, MaxTopics)
 	}
 	s.m = next
@@ -489,7 +524,13 @@ func (s *subscriptionSet) add(subs ...Subscription) error {
 }
 
 // remove 는 구독을 집합에서 뺀다. 마지막 code 가 빠지면 type 자체를 지운다.
-func (s *subscriptionSet) remove(subs ...Subscription) {
+// 오타 난 Unsubscribe 가 조용히 무시되지 않도록 형식도 검증한다.
+func (s *subscriptionSet) remove(subs ...Subscription) error {
+	for _, sub := range subs {
+		if err := sub.validate(); err != nil {
+			return err
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, sub := range subs {
@@ -504,9 +545,10 @@ func (s *subscriptionSet) remove(subs ...Subscription) {
 			delete(s.m, sub.Type)
 		}
 	}
+	return nil
 }
 
-// replace 는 집합을 통째로 바꾼다(Declare).
+// replace 는 집합을 통째로 바꾼다(Declare). 상한을 넘으면 기존 집합을 그대로 둔다.
 func (s *subscriptionSet) replace(subs ...Subscription) error {
 	for _, sub := range subs {
 		if err := sub.validate(); err != nil {
@@ -514,17 +556,8 @@ func (s *subscriptionSet) replace(subs ...Subscription) error {
 		}
 	}
 	next := map[string]map[string]struct{}{}
-	for _, sub := range subs {
-		codes := next[sub.Type]
-		if codes == nil {
-			codes = map[string]struct{}{}
-			next[sub.Type] = codes
-		}
-		for _, c := range sub.Codes {
-			codes[c] = struct{}{}
-		}
-	}
-	if n := countLocked(next); n > MaxTopics {
+	mergeInto(next, subs)
+	if n := countTopics(next); n > MaxTopics {
 		return fmt.Errorf("toss: too many topics: %d (max %d)", n, MaxTopics)
 	}
 	s.mu.Lock()
@@ -554,7 +587,7 @@ func (s *subscriptionSet) reject(target string) {
 func (s *subscriptionSet) count() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return countLocked(s.m)
+	return countTopics(s.m)
 }
 
 // snapshot 은 현재 집합의 복사본을 돌려준다.
@@ -568,20 +601,22 @@ func (s *subscriptionSet) snapshot() []Subscription {
 	return out
 }
 
-// declaration 은 현재 집합 전체를 선언 배열(JSON)로 만든다. id 가 비어 있지 않으면 첫 원소로 넣는다.
-// 집합이 비어 있으면 `[]` — 전체 구독 해제를 뜻한다.
+// declaration 은 현재 집합 전체를 선언 배열(JSON)로 만든다.
+// 집합이 비어 있으면 id 와 무관하게 `[]` 를 돌려준다 — 토스는 빈 배열만 전체 구독 해제로 해석하며,
+// id 만 담긴 배열의 의미는 정의돼 있지 않다(대신 그 선언은 ack 를 짝지을 수 없다).
+// id 가 비어 있지 않고 구독이 있으면 첫 원소로 넣어 ack·error 프레임에서 echo 받는다.
 func (s *subscriptionSet) declaration(id string) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.m) == 0 {
+		return []byte("[]"), nil
+	}
 	arr := make([]any, 0, len(s.m)+1)
 	if id != "" {
 		arr = append(arr, map[string]string{"id": id})
 	}
 	for _, typ := range sortedKeys(s.m) {
 		arr = append(arr, map[string]any{"type": typ, "codes": sortedCodes(s.m[typ])})
-	}
-	if len(arr) == 0 {
-		return []byte("[]"), nil
 	}
 	b, err := json.Marshal(arr)
 	if err != nil {
@@ -602,7 +637,22 @@ func (s *subscriptionSet) cloneLocked() map[string]map[string]struct{} {
 	return out
 }
 
-func countLocked(m map[string]map[string]struct{}) int {
+// mergeInto 는 구독들을 type→code 집합에 병합한다.
+func mergeInto(dst map[string]map[string]struct{}, subs []Subscription) {
+	for _, sub := range subs {
+		codes := dst[sub.Type]
+		if codes == nil {
+			codes = map[string]struct{}{}
+			dst[sub.Type] = codes
+		}
+		for _, c := range sub.Codes {
+			codes[c] = struct{}{}
+		}
+	}
+}
+
+// countTopics 는 잠금과 무관한 순수 함수로, 구독 수(채널×종목 조합)를 센다.
+func countTopics(m map[string]map[string]struct{}) int {
 	n := 0
 	for _, codes := range m {
 		n += len(codes)
@@ -640,7 +690,7 @@ func splitTopic(topic string) (typ, code string, ok bool) {
 EOF
 gofmt -w stream && go vet ./stream/ && go test ./stream/ -race -v 2>&1 | grep -cE '^--- PASS'
 ```
-Expected: `7`.
+Expected: `8`.
 
 - [ ] **Step 4: 커밋**
 
@@ -1748,7 +1798,9 @@ func (s *Stream) Unsubscribe(ctx context.Context, subs ...Subscription) error {
 	if s.closed.Load() {
 		return errStreamClosed
 	}
-	s.subs.remove(subs...)
+	if err := s.subs.remove(subs...); err != nil {
+		return err
+	}
 	s.requestDeclare()
 	return nil
 }
@@ -2084,7 +2136,7 @@ func main() {
 	// 본인 주문 이벤트를 함께 받으려면 계좌 accountSeq 로 구독한다(부작용 없는 조회성 구독이다).
 	//
 	//	accts, _ := c.Accounts(ctx)
-	//	s.Subscribe(ctx, stream.Order(accts[0].AccountSeq))
+	//	s.Subscribe(ctx, stream.PersonalOrder(accts[0].AccountSeq))
 
 	timeout := time.After(30 * time.Second)
 	for {
@@ -2210,7 +2262,7 @@ defer s.Close()
 
 s.Subscribe(ctx,
     stream.Trade(tosstypes.MarketCountryKR, "005930"),
-    stream.Order(accountSeq), // codes 는 종목이 아니라 계좌 accountSeq
+    stream.PersonalOrder(accountSeq), // codes 는 종목이 아니라 계좌 accountSeq
 )
 
 for {

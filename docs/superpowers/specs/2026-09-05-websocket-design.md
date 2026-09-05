@@ -122,7 +122,7 @@ func (s *Stream) Errors() <-chan error
 // 구독 생성자
 func Trade(market tosstypes.MarketCountry, symbols ...string) Subscription
 func Orderbook(market tosstypes.MarketCountry, symbols ...string) Subscription
-func Order(accountSeqs ...int64) Subscription
+func PersonalOrder(accountSeqs ...int64) Subscription
 ```
 
 - 모든 채널은 `Close()` 또는 자동 재연결을 포기했을 때 닫힌다. 소비자는 `for ... range` 또는 `select` 로 읽는다.
@@ -139,6 +139,7 @@ func Order(accountSeqs ...int64) Subscription
   쓰되, `personal:order` 의 codes 는 accountSeq(양수)로 검증한다.
 - **선언 빈도 제어**: 5회/초 한도가 있으므로 짧은 코얼레싱 창(기본 100ms)을 두고 연속 호출을 한 번의 선언으로
   묶는다. `rate-limit-exceeded` 를 받으면 1초 후 1회 재선언한다.
+- 집합이 비면 id 와 무관하게 `[]` 를 보낸다(토스는 빈 배열만 전체 해제로 해석한다).
 
 ### 연결·재연결
 

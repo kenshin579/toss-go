@@ -24,7 +24,7 @@ const (
 	typePersonalOrder = "personal:order"
 )
 
-// Subscription 은 구독 선언의 원소 하나다. 생성자(Trade·Orderbook·Order)를 쓴다.
+// Subscription 은 구독 선언의 원소 하나다. 생성자(Trade·Orderbook·PersonalOrder)를 쓴다.
 type Subscription struct {
 	Type  string   // 예: trade:kr, orderbook:us, personal:order
 	Codes []string // 시세는 종목 symbol, personal:order 는 accountSeq 문자열
@@ -40,9 +40,9 @@ func Orderbook(market tosstypes.MarketCountry, symbols ...string) Subscription {
 	return Subscription{Type: marketType("orderbook", market), Codes: append([]string(nil), symbols...)}
 }
 
-// Order 는 본인 계좌의 주문 이벤트 구독을 만든다.
+// PersonalOrder 는 본인 계좌의 주문 이벤트 구독을 만든다(와이어 type: personal:order).
 // codes 에 들어가는 값은 종목이 아니라 계좌 accountSeq 다(Client.Accounts 로 조회).
-func Order(accountSeqs ...int64) Subscription {
+func PersonalOrder(accountSeqs ...int64) Subscription {
 	codes := make([]string, len(accountSeqs))
 	for i, seq := range accountSeqs {
 		codes[i] = strconv.FormatInt(seq, 10)
@@ -83,6 +83,8 @@ func (s Subscription) validate() error {
 }
 
 // subscriptionSet 은 현재 구독 전체를 들고 있다. 프로토콜이 full-replace 라 부분 전송이 없다.
+// 같은 code 를 두 번 넣어도 1건이다(프로토콜이 topic 집합이라 참조 카운트가 없다) — 두 번
+// 구독한 뒤 한 번 해제하면 완전히 빠진다.
 type subscriptionSet struct {
 	mu sync.Mutex
 	m  map[string]map[string]struct{} // type -> code set
@@ -103,17 +105,8 @@ func (s *subscriptionSet) add(subs ...Subscription) error {
 	defer s.mu.Unlock()
 	// 먼저 결과 크기를 계산해 상한을 검사한다(부분 적용 방지).
 	next := s.cloneLocked()
-	for _, sub := range subs {
-		codes := next[sub.Type]
-		if codes == nil {
-			codes = map[string]struct{}{}
-			next[sub.Type] = codes
-		}
-		for _, c := range sub.Codes {
-			codes[c] = struct{}{}
-		}
-	}
-	if n := countLocked(next); n > MaxTopics {
+	mergeInto(next, subs)
+	if n := countTopics(next); n > MaxTopics {
 		return fmt.Errorf("toss: too many topics: %d (max %d)", n, MaxTopics)
 	}
 	s.m = next
@@ -121,7 +114,13 @@ func (s *subscriptionSet) add(subs ...Subscription) error {
 }
 
 // remove 는 구독을 집합에서 뺀다. 마지막 code 가 빠지면 type 자체를 지운다.
-func (s *subscriptionSet) remove(subs ...Subscription) {
+// 오타 난 Unsubscribe 가 조용히 무시되지 않도록 형식도 검증한다.
+func (s *subscriptionSet) remove(subs ...Subscription) error {
+	for _, sub := range subs {
+		if err := sub.validate(); err != nil {
+			return err
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, sub := range subs {
@@ -136,9 +135,10 @@ func (s *subscriptionSet) remove(subs ...Subscription) {
 			delete(s.m, sub.Type)
 		}
 	}
+	return nil
 }
 
-// replace 는 집합을 통째로 바꾼다(Declare).
+// replace 는 집합을 통째로 바꾼다(Declare). 상한을 넘으면 기존 집합을 그대로 둔다.
 func (s *subscriptionSet) replace(subs ...Subscription) error {
 	for _, sub := range subs {
 		if err := sub.validate(); err != nil {
@@ -146,17 +146,8 @@ func (s *subscriptionSet) replace(subs ...Subscription) error {
 		}
 	}
 	next := map[string]map[string]struct{}{}
-	for _, sub := range subs {
-		codes := next[sub.Type]
-		if codes == nil {
-			codes = map[string]struct{}{}
-			next[sub.Type] = codes
-		}
-		for _, c := range sub.Codes {
-			codes[c] = struct{}{}
-		}
-	}
-	if n := countLocked(next); n > MaxTopics {
+	mergeInto(next, subs)
+	if n := countTopics(next); n > MaxTopics {
 		return fmt.Errorf("toss: too many topics: %d (max %d)", n, MaxTopics)
 	}
 	s.mu.Lock()
@@ -186,7 +177,7 @@ func (s *subscriptionSet) reject(target string) {
 func (s *subscriptionSet) count() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return countLocked(s.m)
+	return countTopics(s.m)
 }
 
 // snapshot 은 현재 집합의 복사본을 돌려준다.
@@ -200,20 +191,22 @@ func (s *subscriptionSet) snapshot() []Subscription {
 	return out
 }
 
-// declaration 은 현재 집합 전체를 선언 배열(JSON)로 만든다. id 가 비어 있지 않으면 첫 원소로 넣는다.
-// 집합이 비어 있으면 `[]` — 전체 구독 해제를 뜻한다.
+// declaration 은 현재 집합 전체를 선언 배열(JSON)로 만든다.
+// 집합이 비어 있으면 id 와 무관하게 `[]` 를 돌려준다 — 토스는 빈 배열만 전체 구독 해제로 해석하며,
+// id 만 담긴 배열의 의미는 정의돼 있지 않다(대신 그 선언은 ack 를 짝지을 수 없다).
+// id 가 비어 있지 않고 구독이 있으면 첫 원소로 넣어 ack·error 프레임에서 echo 받는다.
 func (s *subscriptionSet) declaration(id string) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.m) == 0 {
+		return []byte("[]"), nil
+	}
 	arr := make([]any, 0, len(s.m)+1)
 	if id != "" {
 		arr = append(arr, map[string]string{"id": id})
 	}
 	for _, typ := range sortedKeys(s.m) {
 		arr = append(arr, map[string]any{"type": typ, "codes": sortedCodes(s.m[typ])})
-	}
-	if len(arr) == 0 {
-		return []byte("[]"), nil
 	}
 	b, err := json.Marshal(arr)
 	if err != nil {
@@ -234,7 +227,22 @@ func (s *subscriptionSet) cloneLocked() map[string]map[string]struct{} {
 	return out
 }
 
-func countLocked(m map[string]map[string]struct{}) int {
+// mergeInto 는 구독들을 type→code 집합에 병합한다.
+func mergeInto(dst map[string]map[string]struct{}, subs []Subscription) {
+	for _, sub := range subs {
+		codes := dst[sub.Type]
+		if codes == nil {
+			codes = map[string]struct{}{}
+			dst[sub.Type] = codes
+		}
+		for _, c := range sub.Codes {
+			codes[c] = struct{}{}
+		}
+	}
+}
+
+// countTopics 는 잠금과 무관한 순수 함수로, 구독 수(채널×종목 조합)를 센다.
+func countTopics(m map[string]map[string]struct{}) int {
 	n := 0
 	for _, codes := range m {
 		n += len(codes)

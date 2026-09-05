@@ -20,8 +20,8 @@ func TestSubscriptionConstructors(t *testing.T) {
 		t.Errorf("Orderbook = %+v", got)
 	}
 	// personal:order 의 codes 는 종목이 아니라 accountSeq 문자열이다
-	if got := Order(3, 7); got.Type != "personal:order" || got.Codes[0] != "3" || got.Codes[1] != "7" {
-		t.Errorf("Order = %+v", got)
+	if got := PersonalOrder(3, 7); got.Type != "personal:order" || got.Codes[0] != "3" || got.Codes[1] != "7" {
+		t.Errorf("PersonalOrder = %+v", got)
 	}
 }
 
@@ -61,12 +61,16 @@ func TestSubscriptionSet_AddRemoveDeclare(t *testing.T) {
 		t.Errorf("merged codes = %v (%s)", seen, body)
 	}
 
-	s.remove(Trade(tosstypes.MarketCountryKR, "005930"))
+	if err := s.remove(Trade(tosstypes.MarketCountryKR, "005930")); err != nil {
+		t.Fatal(err)
+	}
 	if n := s.count(); n != 2 {
 		t.Errorf("after remove count = %d", n)
 	}
 	// 마지막 code 를 지우면 type 자체가 사라진다
-	s.remove(Orderbook(tosstypes.MarketCountryKR, "005930"))
+	if err := s.remove(Orderbook(tosstypes.MarketCountryKR, "005930")); err != nil {
+		t.Fatal(err)
+	}
 	body, _ = s.declaration("d-2")
 	_ = json.Unmarshal(body, &arr)
 	for _, e := range arr[1:] {
@@ -84,6 +88,10 @@ func TestSubscriptionSet_EmptyDeclarationIsArray(t *testing.T) {
 	}
 	if string(body) != `[]` {
 		t.Errorf("empty declaration = %s, want []", body)
+	}
+	// 전체 해제는 id 유무와 무관하게 항상 []여야 한다 — 토스는 []만 전체 구독 해제로 해석한다.
+	if body, err := s.declaration("d-1"); err != nil || string(body) != `[]` {
+		t.Errorf("빈 집합은 id 가 있어도 [] 여야 한다: %s %v", body, err)
 	}
 }
 
@@ -138,7 +146,7 @@ func TestSubscriptionSet_RejectRemoves(t *testing.T) {
 
 func TestSubscriptionSet_Snapshot(t *testing.T) {
 	s := newSubscriptionSet()
-	_ = s.add(Trade(tosstypes.MarketCountryKR, "005930"), Order(3))
+	_ = s.add(Trade(tosstypes.MarketCountryKR, "005930"), PersonalOrder(3))
 	got := s.snapshot()
 	if len(got) != 2 {
 		t.Fatalf("snapshot = %+v", got)
@@ -148,5 +156,38 @@ func TestSubscriptionSet_Snapshot(t *testing.T) {
 	body, _ := s.declaration("")
 	if strings.Contains(string(body), "999999") {
 		t.Error("snapshot 은 복사본이어야 한다")
+	}
+}
+
+func TestSubscriptionSet_Replace(t *testing.T) {
+	s := newSubscriptionSet()
+	if err := s.add(Trade(tosstypes.MarketCountryKR, "005930")); err != nil {
+		t.Fatal(err)
+	}
+	// replace 는 집합을 통째로 바꾼다 — 기존 구독은 새 목록에 없으면 사라진다.
+	if err := s.replace(Orderbook(tosstypes.MarketCountryUS, "AAPL"), PersonalOrder(3)); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := s.declaration("")
+	if strings.Contains(string(body), "005930") {
+		t.Errorf("replace 후 이전 구독이 남아있으면 안 된다: %s", body)
+	}
+	if !strings.Contains(string(body), "AAPL") || !strings.Contains(string(body), "orderbook:us") {
+		t.Errorf("replace 로 넣은 구독이 있어야 한다: %s", body)
+	}
+	if n := s.count(); n != 2 {
+		t.Errorf("count = %d, want 2", n)
+	}
+
+	// 상한을 넘는 replace 는 기존 집합을 그대로 둔다.
+	codes := make([]string, MaxTopics+1)
+	for i := range codes {
+		codes[i] = fmt.Sprintf("%06d", i)
+	}
+	if err := s.replace(Subscription{Type: "trade:kr", Codes: codes}); err == nil || !strings.Contains(err.Error(), "too many") {
+		t.Errorf("상한 초과 replace 는 거부해야 한다: %v", err)
+	}
+	if n := s.count(); n != 2 {
+		t.Errorf("실패한 replace 는 기존 집합을 보존해야 한다: count = %d, want 2", n)
 	}
 }
