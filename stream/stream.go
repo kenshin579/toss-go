@@ -32,11 +32,14 @@ type Stream struct {
 	done   chan struct{}
 	closed atomic.Bool
 
-	mu   sync.Mutex
-	conn *websocket.Conn // 현재 연결. 쓰기 전에 잠근다
+	mu            sync.Mutex
+	conn          *websocket.Conn // 현재 연결. 쓰기 전에 잠근다
+	lastDeclareID string          // 마지막으로 보낸 선언의 id. 낡은 ack 를 걸러내는 데 쓴다
 }
 
 // New 는 스트림을 만들고 연결한다. 보통은 toss.Client.Stream 을 쓴다.
+//
+// ctx 는 최초 연결에만 쓰인다. 이후 스트림은 ctx 취소와 무관하게 살아 있으며 Close 로만 끝난다.
 func New(ctx context.Context, token TokenFunc, opts ...Option) (*Stream, error) {
 	cfg := defaultConfig()
 	for _, o := range opts {
@@ -161,7 +164,7 @@ func (s *Stream) run(ctx context.Context, conn *websocket.Conn) {
 		wg.Add(3)
 		go func() { defer wg.Done(); s.readLoop(connCtx, conn, causeCh); connCancel() }()
 		go func() { defer wg.Done(); _ = pingLoop(connCtx, conn, s.cfg.pingInterval); connCancel() }()
-		go func() { defer wg.Done(); s.declareLoop(connCtx, conn) }()
+		go func() { defer wg.Done(); s.declareLoop(connCtx) }()
 		wg.Wait()
 
 		// 재연결 전에 반드시 기존 연결을 닫는다(계정당 2개 한도).
@@ -181,16 +184,25 @@ func (s *Stream) run(ctx context.Context, conn *websocket.Conn) {
 			return
 		}
 
-		attempt++
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff(attempt, s.cfg.backoffMin, s.cfg.backoffMax)):
-		}
-		next, err := dial(ctx, s.url, s.token)
-		if err != nil {
-			s.emitErr(err)
-			continue
+		// dial 에 성공할 때까지 재시도한다. 실패한 dial 시도는 cause 를 덮지 않는다 —
+		// 이 연결이 왜 끊겼는지(backpressure 등)를 재연결 성공 때까지 그대로 들고 있어야 한다.
+		// (readLoop/pingLoop 를 죽은 conn 으로 다시 돌리면 즉시 read-error 가 나서 cause 를
+		// 덮어써 버리므로, dial 재시도는 별도 루프로 두고 연결 루프를 다시 시작하지 않는다.)
+		var next *websocket.Conn
+		for {
+			attempt++
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff(attempt, s.cfg.backoffMin, s.cfg.backoffMax)):
+			}
+			c, err := dial(ctx, s.url, s.token)
+			if err != nil {
+				s.emitErr(err)
+				continue
+			}
+			next = c
+			break
 		}
 		s.mu.Lock()
 		s.conn = next
@@ -229,6 +241,14 @@ func (s *Stream) readLoop(ctx context.Context, conn *websocket.Conn, causeCh cha
 		}
 		switch f.kind {
 		case frameSubscriptions:
+			// 낡은 선언의 ack 는 무시한다 — 그 사이 사용자가 다시 넣은 구독을 지울 수 있다.
+			// id 가 없는 ack(서버가 echo 하지 않은 경우)는 그대로 적용한다.
+			s.mu.Lock()
+			stale := f.id != "" && s.lastDeclareID != "" && f.id != s.lastDeclareID
+			s.mu.Unlock()
+			if stale {
+				continue
+			}
 			for _, r := range f.rejected {
 				s.subs.reject(r.Target)
 				s.emitErr(&RejectedError{Target: r.Target, Code: r.Code, Message: r.Message})
@@ -239,6 +259,12 @@ func (s *Stream) readLoop(ctx context.Context, conn *websocket.Conn, causeCh cha
 				continue // 곧 연결이 끊긴다 — 에러가 아니라 재연결 사유다
 			}
 			s.emitErr(&DeclareError{ID: f.id, Code: f.errCode, Message: f.errMessage})
+			if f.errCode == "rate-limit-exceeded" {
+				// 선언 빈도(5회/초)에 걸린 선언은 반영되지 않았다. 대기 후 한 번 다시 선언한다
+				// (토스는 Retry-After 를 주지 않는다). 재시도 자체가 또 걸리면 다음 Subscribe 나
+				// 재연결 때 어차피 전체 집합이 다시 선언된다.
+				s.retryDeclareAfter(ctx, s.cfg.rateLimitRetry)
+			}
 		case frameMessage:
 			if !s.dispatch(f) {
 				select {
@@ -301,7 +327,7 @@ func pushLossy[T any](ch chan T, ev T) {
 }
 
 // declareLoop 는 코얼레싱된 선언 요청을 처리한다.
-func (s *Stream) declareLoop(ctx context.Context, conn *websocket.Conn) {
+func (s *Stream) declareLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -327,6 +353,7 @@ func (s *Stream) declareLoop(ctx context.Context, conn *websocket.Conn) {
 			}
 			s.mu.Lock()
 			c := s.conn
+			s.lastDeclareID = id
 			s.mu.Unlock()
 			if c == nil {
 				continue
@@ -337,6 +364,19 @@ func (s *Stream) declareLoop(ctx context.Context, conn *websocket.Conn) {
 			}
 		}
 	}
+}
+
+// retryDeclareAfter 는 d 후에 선언을 한 번 더 요청한다. 연결이 끝나면 취소된다.
+func (s *Stream) retryDeclareAfter(ctx context.Context, d time.Duration) {
+	go func() {
+		t := time.NewTimer(d)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+		case <-t.C:
+			s.requestDeclare()
+		}
+	}()
 }
 
 func (s *Stream) emitErr(err error) {

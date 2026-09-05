@@ -135,6 +135,8 @@ func PersonalOrder(accountSeqs ...int64) Subscription
   뒤 **전체를 다시 선언**한다(프로토콜이 full-replace 이므로 부분 전송이 없다).
 - 선언마다 `id` 를 채워 보내고(예: `d-7`), 같은 `id` 의 `subscriptions` ack 를 기다려 결과를 확정한다.
   ack 의 `rejected[]` 는 집합에서 제거하고 `Errors()` 로 사유를 전달한다.
+  마지막으로 보낸 선언과 `id` 가 다른(낡은) ack 는 무시한다 — 코얼레싱·재연결로 선언이 여러 번 나가면
+  낡은 ack 가 그 사이 사용자가 다시 넣은 구독을 지울 수 있기 때문이다. `id` 가 없는 ack 는 그대로 적용한다.
 - **사전 검사**: 총 codes 합이 100 초과면 요청 전에 에러. 심볼 형식은 REST 와 같은 `params.Symbol` 규칙을
   쓰되, `personal:order` 의 codes 는 accountSeq(양수)로 검증한다.
 - **선언 빈도 제어**: 5회/초 한도가 있으므로 짧은 코얼레싱 창(기본 100ms)을 두고 연속 호출을 한 번의 선언으로
@@ -192,7 +194,7 @@ type OrderEvent struct {
     Order      order.Order // REST 와 동일 구조. 단 Execution.FilledAt 은 항상 nil
 }
 
-type ReconnectCause string // "server-shutdown", "backpressure", "read-error", "idle"
+type ReconnectCause string // "server-shutdown", "backpressure", "read-error"(idle 타임아웃 포함 — 와이어에서 구분되지 않는다)
 
 type Reconnect struct {
     Attempt int

@@ -4,35 +4,38 @@ import "time"
 
 // 기본값.
 const (
-	DefaultPingInterval  = 60 * time.Second // 서버는 클라이언트 송신이 180초 없으면 끊는다
-	DefaultTradeBuffer   = 1024
-	DefaultOrderBuffer   = 256
-	defaultDiagBuffer    = 16
-	defaultBackoffMin    = time.Second
-	defaultBackoffMax    = 30 * time.Second
-	defaultCoalesceDelay = 100 * time.Millisecond // 선언 5회/초 한도 대응
+	DefaultPingInterval   = 60 * time.Second // 서버는 클라이언트 송신이 180초 없으면 끊는다
+	DefaultTradeBuffer    = 1024
+	DefaultOrderBuffer    = 256
+	defaultDiagBuffer     = 16
+	defaultBackoffMin     = time.Second
+	defaultBackoffMax     = 30 * time.Second
+	defaultCoalesceDelay  = 100 * time.Millisecond // 선언 5회/초 한도 대응
+	defaultRateLimitRetry = time.Second            // rate-limit-exceeded 수신 뒤 재선언까지 대기
 )
 
 type config struct {
-	pingInterval  time.Duration
-	tradeBuffer   int
-	orderBuffer   int
-	backoffMin    time.Duration
-	backoffMax    time.Duration
-	coalesceDelay time.Duration
-	autoReconnect bool
-	baseURL       string // 테스트용 ws:// 오버라이드
+	pingInterval   time.Duration
+	tradeBuffer    int
+	orderBuffer    int
+	backoffMin     time.Duration
+	backoffMax     time.Duration
+	coalesceDelay  time.Duration
+	rateLimitRetry time.Duration
+	autoReconnect  bool
+	baseURL        string // 테스트용 ws:// 오버라이드
 }
 
 func defaultConfig() config {
 	return config{
-		pingInterval:  DefaultPingInterval,
-		tradeBuffer:   DefaultTradeBuffer,
-		orderBuffer:   DefaultOrderBuffer,
-		backoffMin:    defaultBackoffMin,
-		backoffMax:    defaultBackoffMax,
-		coalesceDelay: defaultCoalesceDelay,
-		autoReconnect: true,
+		pingInterval:   DefaultPingInterval,
+		tradeBuffer:    DefaultTradeBuffer,
+		orderBuffer:    DefaultOrderBuffer,
+		backoffMin:     defaultBackoffMin,
+		backoffMax:     defaultBackoffMax,
+		coalesceDelay:  defaultCoalesceDelay,
+		rateLimitRetry: defaultRateLimitRetry,
+		autoReconnect:  true,
 	}
 }
 
@@ -65,3 +68,8 @@ func WithBaseURL(u string) Option { return func(c *config) { c.baseURL = u } }
 // WithCoalesceDelay 는 연속된 구독 변경을 하나의 선언으로 묶는 대기 시간을 바꾼다(기본 100ms).
 // 토스는 선언을 초당 5회로 제한한다.
 func WithCoalesceDelay(d time.Duration) Option { return func(c *config) { c.coalesceDelay = d } }
+
+// WithRateLimitRetryDelay 는 rate-limit-exceeded 를 받은 뒤 재선언까지의 대기 시간을 바꾼다(기본 1초).
+func WithRateLimitRetryDelay(d time.Duration) Option {
+	return func(c *config) { c.rateLimitRetry = d }
+}

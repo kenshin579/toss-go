@@ -157,6 +157,28 @@ func TestStream_AckRejectRemovesFromSet(t *testing.T) {
 	})
 }
 
+func TestStream_StaleAckIsIgnored(t *testing.T) {
+	ts := newTestServer(t)
+	s := newTestStream(t, ts)
+	ctx := context.Background()
+	_ = s.Subscribe(ctx, Trade(tosstypes.MarketCountryUS, "AAPL"))
+	waitFor(t, "declare", func() bool { return len(declares(ts)) >= 1 })
+	// 지나간 선언 id 로 온 ack 는 무시돼야 한다
+	ts.push(`{"type":"subscriptions","id":"d-999","subscribed":[],"rejected":[{"target":"trade:us:AAPL","code":"stock-not-found","message":"stale"}]}`)
+	time.Sleep(50 * time.Millisecond)
+	found := false
+	for _, sub := range s.Subscriptions() {
+		for _, c := range sub.Codes {
+			if c == "AAPL" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Error("낡은 ack 로 구독이 제거됐다")
+	}
+}
+
 func TestStream_ErrorFrame(t *testing.T) {
 	ts := newTestServer(t)
 	s := newTestStream(t, ts)
@@ -171,6 +193,33 @@ func TestStream_ErrorFrame(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("error frame 미수신")
 	}
+}
+
+func TestStream_RateLimitTriggersRedeclare(t *testing.T) {
+	ts := newTestServer(t)
+	s := newTestStream(t, ts, WithRateLimitRetryDelay(10*time.Millisecond))
+	ctx := context.Background()
+	if err := s.Subscribe(ctx, Trade(tosstypes.MarketCountryKR, "005930")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "first declare", func() bool { return len(declares(ts)) >= 1 })
+	before := len(declares(ts))
+	ts.push(`{"type":"error","error":{"code":"rate-limit-exceeded","message":"too fast"}}`)
+	// 에러는 사용자에게 전달되고
+	select {
+	case err := <-s.Errors():
+		var de *DeclareError
+		if !asDeclare(err, &de) || de.Code != "rate-limit-exceeded" {
+			t.Errorf("err = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("rate-limit 에러 미수신")
+	}
+	// 잠시 뒤 같은 집합이 다시 선언돼야 한다
+	waitFor(t, "redeclare after rate limit", func() bool {
+		d := declares(ts)
+		return len(d) > before && strings.Contains(d[len(d)-1], "005930")
+	})
 }
 
 func TestStream_ReconnectsAndRedeclares(t *testing.T) {
@@ -260,6 +309,31 @@ func TestStream_OrderBackpressureReconnects(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("backpressure 재연결 미수신")
+	}
+}
+
+func TestStream_ClosesOldConnBeforeReconnect(t *testing.T) {
+	// 계정당 동시 연결은 2개다. 재연결 전에 기존 연결을 닫지 않으면 새 연결이 자기 자신을 밀어내
+	// 끊김이 반복된다. 클라이언트가 먼저 끊는 경로(백프레셔)로 여러 번 재연결시켜 확인한다.
+	ts := newTestServer(t)
+	s := newTestStream(t, ts, WithOrderBuffer(1))
+	waitFor(t, "connection", func() bool { return ts.connCount() >= 1 })
+	ev := `{"type":"message","topic":"personal:order:3","data":{"event":"PENDING","accountSeq":"3","order":{"orderId":"o-1","symbol":"005930","side":"BUY","orderType":"LIMIT","timeInForce":"DAY","status":"PENDING","quantity":"1","currency":"KRW","orderedAt":"2026-03-28T09:30:00+09:00","execution":{"filledQuantity":"0","averageFilledPrice":null,"filledAmount":null,"commission":null,"tax":null,"settlementDate":null}}}}`
+	for reconnects := 0; reconnects < 3; reconnects++ {
+		for i := 0; i < 4; i++ { // 소비하지 않아 버퍼를 넘긴다
+			ts.push(ev)
+		}
+		select {
+		case <-s.Reconnects():
+		case <-time.After(3 * time.Second):
+			t.Fatalf("재연결 %d 회차 미수신", reconnects+1)
+		}
+	}
+	if got := ts.maxConcurrent(); got > 1 {
+		t.Errorf("동시 연결 %d — 재연결 전에 기존 연결을 닫지 않았다", got)
+	}
+	if ts.connCount() < 4 {
+		t.Errorf("총 연결 %d, 재연결이 실제로 일어났는지 확인 필요", ts.connCount())
 	}
 }
 

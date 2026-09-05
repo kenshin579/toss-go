@@ -1278,14 +1278,14 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Create: `stream/options.go`, `stream/conn.go`, `stream/stream.go`, `stream/testserver_test.go`, `stream/stream_test.go`
 - Modify: `go.mod`, `go.sum`, `client.go`
 
-- [ ] **Step 1: 의존성 추가**
+- [x] **Step 1: 의존성 추가**
 
 ```bash
 go get github.com/coder/websocket@v1.8.14 && grep coder go.mod
 ```
 Expected: `github.com/coder/websocket v1.8.14`.
 
-- [ ] **Step 2: 옵션 작성**
+- [x] **Step 2: 옵션 작성**
 
 ```bash
 cat > stream/options.go << 'EOF'
@@ -1295,35 +1295,38 @@ import "time"
 
 // 기본값.
 const (
-	DefaultPingInterval  = 60 * time.Second // 서버는 클라이언트 송신이 180초 없으면 끊는다
-	DefaultTradeBuffer   = 1024
-	DefaultOrderBuffer   = 256
-	defaultDiagBuffer    = 16
-	defaultBackoffMin    = time.Second
-	defaultBackoffMax    = 30 * time.Second
-	defaultCoalesceDelay = 100 * time.Millisecond // 선언 5회/초 한도 대응
+	DefaultPingInterval   = 60 * time.Second // 서버는 클라이언트 송신이 180초 없으면 끊는다
+	DefaultTradeBuffer    = 1024
+	DefaultOrderBuffer    = 256
+	defaultDiagBuffer     = 16
+	defaultBackoffMin     = time.Second
+	defaultBackoffMax     = 30 * time.Second
+	defaultCoalesceDelay  = 100 * time.Millisecond // 선언 5회/초 한도 대응
+	defaultRateLimitRetry = time.Second            // rate-limit-exceeded 수신 뒤 재선언까지 대기
 )
 
 type config struct {
-	pingInterval  time.Duration
-	tradeBuffer   int
-	orderBuffer   int
-	backoffMin    time.Duration
-	backoffMax    time.Duration
-	coalesceDelay time.Duration
-	autoReconnect bool
-	baseURL       string // 테스트용 ws:// 오버라이드
+	pingInterval   time.Duration
+	tradeBuffer    int
+	orderBuffer    int
+	backoffMin     time.Duration
+	backoffMax     time.Duration
+	coalesceDelay  time.Duration
+	rateLimitRetry time.Duration
+	autoReconnect  bool
+	baseURL        string // 테스트용 ws:// 오버라이드
 }
 
 func defaultConfig() config {
 	return config{
-		pingInterval:  DefaultPingInterval,
-		tradeBuffer:   DefaultTradeBuffer,
-		orderBuffer:   DefaultOrderBuffer,
-		backoffMin:    defaultBackoffMin,
-		backoffMax:    defaultBackoffMax,
-		coalesceDelay: defaultCoalesceDelay,
-		autoReconnect: true,
+		pingInterval:   DefaultPingInterval,
+		tradeBuffer:    DefaultTradeBuffer,
+		orderBuffer:    DefaultOrderBuffer,
+		backoffMin:     defaultBackoffMin,
+		backoffMax:     defaultBackoffMax,
+		coalesceDelay:  defaultCoalesceDelay,
+		rateLimitRetry: defaultRateLimitRetry,
+		autoReconnect:  true,
 	}
 }
 
@@ -1356,10 +1359,15 @@ func WithBaseURL(u string) Option { return func(c *config) { c.baseURL = u } }
 // WithCoalesceDelay 는 연속된 구독 변경을 하나의 선언으로 묶는 대기 시간을 바꾼다(기본 100ms).
 // 토스는 선언을 초당 5회로 제한한다.
 func WithCoalesceDelay(d time.Duration) Option { return func(c *config) { c.coalesceDelay = d } }
+
+// WithRateLimitRetryDelay 는 rate-limit-exceeded 를 받은 뒤 재선언까지의 대기 시간을 바꾼다(기본 1초).
+func WithRateLimitRetryDelay(d time.Duration) Option {
+	return func(c *config) { c.rateLimitRetry = d }
+}
 EOF
 ```
 
-- [ ] **Step 3: 스텁 서버 작성**
+- [x] **Step 3: 스텁 서버 작성**
 
 ```bash
 cat > stream/testserver_test.go << 'EOF'
@@ -1389,6 +1397,8 @@ type testServer struct {
 	authHdr  []string      // 연결별 Authorization 헤더
 	pushCh   chan string   // 서버 → 클라이언트로 밀어 넣을 프레임
 	closeCh  chan struct{} // 현재 연결을 강제 종료하라는 신호
+	live     int           // 현재 살아 있는 연결 수
+	maxLive  int           // 관측된 최대 동시 연결 수
 }
 
 func newTestServer(t *testing.T) *testServer {
@@ -1402,7 +1412,16 @@ func newTestServer(t *testing.T) *testServer {
 		ts.mu.Lock()
 		ts.conns++
 		ts.authHdr = append(ts.authHdr, r.Header.Get("Authorization"))
+		ts.live++
+		if ts.live > ts.maxLive {
+			ts.maxLive = ts.live
+		}
 		ts.mu.Unlock()
+		defer func() {
+			ts.mu.Lock()
+			ts.live--
+			ts.mu.Unlock()
+		}()
 
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
@@ -1464,6 +1483,13 @@ func (ts *testServer) authHeaders() []string {
 	return append([]string(nil), ts.authHdr...)
 }
 
+// maxConcurrent 는 지금까지 관측된 최대 동시 연결 수다(재연결 전에 기존 연결을 닫는지 검증용).
+func (ts *testServer) maxConcurrent() int {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	return ts.maxLive
+}
+
 // waitFor 는 조건이 참이 될 때까지 최대 2초 기다린다.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
@@ -1484,7 +1510,7 @@ func staticToken(tok string) func(context.Context) (string, error) {
 EOF
 ```
 
-- [ ] **Step 4: 공개 Stream 테스트 작성**
+- [x] **Step 4: 공개 Stream 테스트 작성**
 
 ```bash
 cat > stream/stream_test.go << 'EOF'
@@ -1647,6 +1673,28 @@ func TestStream_AckRejectRemovesFromSet(t *testing.T) {
 	})
 }
 
+func TestStream_StaleAckIsIgnored(t *testing.T) {
+	ts := newTestServer(t)
+	s := newTestStream(t, ts)
+	ctx := context.Background()
+	_ = s.Subscribe(ctx, Trade(tosstypes.MarketCountryUS, "AAPL"))
+	waitFor(t, "declare", func() bool { return len(declares(ts)) >= 1 })
+	// 지나간 선언 id 로 온 ack 는 무시돼야 한다
+	ts.push(`{"type":"subscriptions","id":"d-999","subscribed":[],"rejected":[{"target":"trade:us:AAPL","code":"stock-not-found","message":"stale"}]}`)
+	time.Sleep(50 * time.Millisecond)
+	found := false
+	for _, sub := range s.Subscriptions() {
+		for _, c := range sub.Codes {
+			if c == "AAPL" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Error("낡은 ack 로 구독이 제거됐다")
+	}
+}
+
 func TestStream_ErrorFrame(t *testing.T) {
 	ts := newTestServer(t)
 	s := newTestStream(t, ts)
@@ -1661,6 +1709,33 @@ func TestStream_ErrorFrame(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("error frame 미수신")
 	}
+}
+
+func TestStream_RateLimitTriggersRedeclare(t *testing.T) {
+	ts := newTestServer(t)
+	s := newTestStream(t, ts, WithRateLimitRetryDelay(10*time.Millisecond))
+	ctx := context.Background()
+	if err := s.Subscribe(ctx, Trade(tosstypes.MarketCountryKR, "005930")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "first declare", func() bool { return len(declares(ts)) >= 1 })
+	before := len(declares(ts))
+	ts.push(`{"type":"error","error":{"code":"rate-limit-exceeded","message":"too fast"}}`)
+	// 에러는 사용자에게 전달되고
+	select {
+	case err := <-s.Errors():
+		var de *DeclareError
+		if !asDeclare(err, &de) || de.Code != "rate-limit-exceeded" {
+			t.Errorf("err = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("rate-limit 에러 미수신")
+	}
+	// 잠시 뒤 같은 집합이 다시 선언돼야 한다
+	waitFor(t, "redeclare after rate limit", func() bool {
+		d := declares(ts)
+		return len(d) > before && strings.Contains(d[len(d)-1], "005930")
+	})
 }
 
 func TestStream_ReconnectsAndRedeclares(t *testing.T) {
@@ -1753,6 +1828,31 @@ func TestStream_OrderBackpressureReconnects(t *testing.T) {
 	}
 }
 
+func TestStream_ClosesOldConnBeforeReconnect(t *testing.T) {
+	// 계정당 동시 연결은 2개다. 재연결 전에 기존 연결을 닫지 않으면 새 연결이 자기 자신을 밀어내
+	// 끊김이 반복된다. 클라이언트가 먼저 끊는 경로(백프레셔)로 여러 번 재연결시켜 확인한다.
+	ts := newTestServer(t)
+	s := newTestStream(t, ts, WithOrderBuffer(1))
+	waitFor(t, "connection", func() bool { return ts.connCount() >= 1 })
+	ev := `{"type":"message","topic":"personal:order:3","data":{"event":"PENDING","accountSeq":"3","order":{"orderId":"o-1","symbol":"005930","side":"BUY","orderType":"LIMIT","timeInForce":"DAY","status":"PENDING","quantity":"1","currency":"KRW","orderedAt":"2026-03-28T09:30:00+09:00","execution":{"filledQuantity":"0","averageFilledPrice":null,"filledAmount":null,"commission":null,"tax":null,"settlementDate":null}}}}`
+	for reconnects := 0; reconnects < 3; reconnects++ {
+		for i := 0; i < 4; i++ { // 소비하지 않아 버퍼를 넘긴다
+			ts.push(ev)
+		}
+		select {
+		case <-s.Reconnects():
+		case <-time.After(3 * time.Second):
+			t.Fatalf("재연결 %d 회차 미수신", reconnects+1)
+		}
+	}
+	if got := ts.maxConcurrent(); got > 1 {
+		t.Errorf("동시 연결 %d — 재연결 전에 기존 연결을 닫지 않았다", got)
+	}
+	if ts.connCount() < 4 {
+		t.Errorf("총 연결 %d, 재연결이 실제로 일어났는지 확인 필요", ts.connCount())
+	}
+}
+
 func TestStream_MaxTopicsRejectedBeforeSend(t *testing.T) {
 	ts := newTestServer(t)
 	s := newTestStream(t, ts)
@@ -1803,7 +1903,7 @@ go test ./stream/ 2>&1 | head -5
 ```
 Expected: 컴파일 에러(`undefined: New`, `undefined: Stream` 등) — `WithCoalesceDelay` 는 이미 Step 2 의 `options.go` 에 포함돼 있다.
 
-- [ ] **Step 5: 구현**
+- [x] **Step 5: 구현**
 
 ```bash
 cat > stream/conn.go << 'EOF'
@@ -1924,11 +2024,14 @@ type Stream struct {
 	done   chan struct{}
 	closed atomic.Bool
 
-	mu   sync.Mutex
-	conn *websocket.Conn // 현재 연결. 쓰기 전에 잠근다
+	mu            sync.Mutex
+	conn          *websocket.Conn // 현재 연결. 쓰기 전에 잠근다
+	lastDeclareID string          // 마지막으로 보낸 선언의 id. 낡은 ack 를 걸러내는 데 쓴다
 }
 
 // New 는 스트림을 만들고 연결한다. 보통은 toss.Client.Stream 을 쓴다.
+//
+// ctx 는 최초 연결에만 쓰인다. 이후 스트림은 ctx 취소와 무관하게 살아 있으며 Close 로만 끝난다.
 func New(ctx context.Context, token TokenFunc, opts ...Option) (*Stream, error) {
 	cfg := defaultConfig()
 	for _, o := range opts {
@@ -2053,7 +2156,7 @@ func (s *Stream) run(ctx context.Context, conn *websocket.Conn) {
 		wg.Add(3)
 		go func() { defer wg.Done(); s.readLoop(connCtx, conn, causeCh); connCancel() }()
 		go func() { defer wg.Done(); _ = pingLoop(connCtx, conn, s.cfg.pingInterval); connCancel() }()
-		go func() { defer wg.Done(); s.declareLoop(connCtx, conn) }()
+		go func() { defer wg.Done(); s.declareLoop(connCtx) }()
 		wg.Wait()
 
 		// 재연결 전에 반드시 기존 연결을 닫는다(계정당 2개 한도).
@@ -2073,16 +2176,25 @@ func (s *Stream) run(ctx context.Context, conn *websocket.Conn) {
 			return
 		}
 
-		attempt++
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff(attempt, s.cfg.backoffMin, s.cfg.backoffMax)):
-		}
-		next, err := dial(ctx, s.url, s.token)
-		if err != nil {
-			s.emitErr(err)
-			continue
+		// dial 에 성공할 때까지 재시도한다. 실패한 dial 시도는 cause 를 덮지 않는다 —
+		// 이 연결이 왜 끊겼는지(backpressure 등)를 재연결 성공 때까지 그대로 들고 있어야 한다.
+		// (readLoop/pingLoop 를 죽은 conn 으로 다시 돌리면 즉시 read-error 가 나서 cause 를
+		// 덮어써 버리므로, dial 재시도는 별도 루프로 두고 연결 루프를 다시 시작하지 않는다.)
+		var next *websocket.Conn
+		for {
+			attempt++
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff(attempt, s.cfg.backoffMin, s.cfg.backoffMax)):
+			}
+			c, err := dial(ctx, s.url, s.token)
+			if err != nil {
+				s.emitErr(err)
+				continue
+			}
+			next = c
+			break
 		}
 		s.mu.Lock()
 		s.conn = next
@@ -2121,6 +2233,14 @@ func (s *Stream) readLoop(ctx context.Context, conn *websocket.Conn, causeCh cha
 		}
 		switch f.kind {
 		case frameSubscriptions:
+			// 낡은 선언의 ack 는 무시한다 — 그 사이 사용자가 다시 넣은 구독을 지울 수 있다.
+			// id 가 없는 ack(서버가 echo 하지 않은 경우)는 그대로 적용한다.
+			s.mu.Lock()
+			stale := f.id != "" && s.lastDeclareID != "" && f.id != s.lastDeclareID
+			s.mu.Unlock()
+			if stale {
+				continue
+			}
 			for _, r := range f.rejected {
 				s.subs.reject(r.Target)
 				s.emitErr(&RejectedError{Target: r.Target, Code: r.Code, Message: r.Message})
@@ -2131,6 +2251,12 @@ func (s *Stream) readLoop(ctx context.Context, conn *websocket.Conn, causeCh cha
 				continue // 곧 연결이 끊긴다 — 에러가 아니라 재연결 사유다
 			}
 			s.emitErr(&DeclareError{ID: f.id, Code: f.errCode, Message: f.errMessage})
+			if f.errCode == "rate-limit-exceeded" {
+				// 선언 빈도(5회/초)에 걸린 선언은 반영되지 않았다. 대기 후 한 번 다시 선언한다
+				// (토스는 Retry-After 를 주지 않는다). 재시도 자체가 또 걸리면 다음 Subscribe 나
+				// 재연결 때 어차피 전체 집합이 다시 선언된다.
+				s.retryDeclareAfter(ctx, s.cfg.rateLimitRetry)
+			}
 		case frameMessage:
 			if !s.dispatch(f) {
 				select {
@@ -2193,7 +2319,7 @@ func pushLossy[T any](ch chan T, ev T) {
 }
 
 // declareLoop 는 코얼레싱된 선언 요청을 처리한다.
-func (s *Stream) declareLoop(ctx context.Context, conn *websocket.Conn) {
+func (s *Stream) declareLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -2219,6 +2345,7 @@ func (s *Stream) declareLoop(ctx context.Context, conn *websocket.Conn) {
 			}
 			s.mu.Lock()
 			c := s.conn
+			s.lastDeclareID = id
 			s.mu.Unlock()
 			if c == nil {
 				continue
@@ -2229,6 +2356,19 @@ func (s *Stream) declareLoop(ctx context.Context, conn *websocket.Conn) {
 			}
 		}
 	}
+}
+
+// retryDeclareAfter 는 d 후에 선언을 한 번 더 요청한다. 연결이 끝나면 취소된다.
+func (s *Stream) retryDeclareAfter(ctx context.Context, d time.Duration) {
+	go func() {
+		t := time.NewTimer(d)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+		case <-t.C:
+			s.requestDeclare()
+		}
+	}()
 }
 
 func (s *Stream) emitErr(err error) {
@@ -2260,6 +2400,8 @@ EOF
 // Stream 은 실시간 웹소켓 스트림을 연다(체결·호가·본인 주문 이벤트).
 // 연결마다 이 클라이언트의 access token 을 쓰므로 별도 인증이 필요 없다.
 //
+// ctx 는 최초 연결에만 쓰인다. 이후 스트림은 ctx 취소와 무관하게 살아 있으며 Close 로만 끝난다.
+//
 //	s, err := c.Stream(ctx)
 //	defer s.Close()
 //	s.Subscribe(ctx, stream.Trade(tosstypes.MarketCountryKR, "005930"))
@@ -2271,9 +2413,9 @@ func (c *Client) Stream(ctx context.Context, opts ...stream.Option) (*stream.Str
 ```bash
 gofmt -w . && go vet ./... && go test ./stream/ -race -count=1 -v 2>&1 | grep -cE '^--- PASS'
 ```
-Expected: `39` (Task 1 의 8 + Task 2 의 16 + 이번 15 — `grep -cE '^--- PASS'` 는 앞에 공백이 붙는 서브테스트 줄을 세지 않는다). 실행 결과로 확인하고 모두 PASS 인지만 본다.
+Expected: `42` (Task 1 의 8 + Task 2 의 16 + 이번 18 — `grep -cE '^--- PASS'` 는 앞에 공백이 붙는 서브테스트 줄을 세지 않는다. 15 + rate-limit 재선언·재연결 전 종료·낡은 ack 무시 리뷰 테스트 3개 = 18). 실행 결과로 확인하고 모두 PASS 인지만 본다.
 
-- [ ] **Step 6: 커밋**
+- [x] **Step 6: 커밋**
 
 ```bash
 go mod tidy && git add stream client.go go.mod go.sum && git commit -m "feat(stream): 연결·PING·재연결·백프레셔 + 공개 Stream API
@@ -2529,9 +2671,9 @@ git push -u origin feature/websocket && gh pr create --title "feat: WebSocket �
 - 거부된 구독 항목은 고치기 전엔 재선언해도 계속 거부되므로 SDK 가 집합에서 자동 제거한다.
 
 ## Test plan
-- [x] `go build ./... && go vet ./... && go vet -tags integration ./... && go test ./... -race` 통과
-- [x] 스텁 웹소켓 서버로 선언 직렬화·ack·프레임 디스패치·PING·재연결/재선언·백프레셔·상한 검증
-- [x] `go test -tags integration -run TestIntegration_Stream` — 연결·구독 ack 확인(장 시간 밖에서는 데이터 미도착이 정상)
+- [ ] `go build ./... && go vet ./... && go vet -tags integration ./... && go test ./... -race` 통과
+- [ ] 스텁 웹소켓 서버로 선언 직렬화·ack·프레임 디스패치·PING·재연결/재선언·백프레셔·상한 검증
+- [ ] `go test -tags integration -run TestIntegration_Stream` — 연결·구독 ack 확인(장 시간 밖에서는 데이터 미도착이 정상)
 - [ ] 머지 후 `./scripts/release.sh v0.3.0`
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)

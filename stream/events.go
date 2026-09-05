@@ -92,7 +92,7 @@ const (
 	// ReconnectBackpressure 는 Orders() 를 소비하지 않아 SDK 가 연결을 끊은 경우.
 	// 주문 이벤트가 유실됐을 수 있으니 REST 로 재동기화한다.
 	ReconnectBackpressure ReconnectCause = "backpressure"
-	// ReconnectReadError 는 읽기 실패·비정상 종료.
+	// ReconnectReadError 는 읽기 실패·비정상 종료(서버 idle 타임아웃 포함 — 와이어에서 구분되지 않는다).
 	ReconnectReadError ReconnectCause = "read-error"
 )
 

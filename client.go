@@ -75,6 +75,8 @@ func (c *Client) AccessToken(ctx context.Context) (string, error) {
 // Stream 은 실시간 웹소켓 스트림을 연다(체결·호가·본인 주문 이벤트).
 // 연결마다 이 클라이언트의 access token 을 쓰므로 별도 인증이 필요 없다.
 //
+// ctx 는 최초 연결에만 쓰인다. 이후 스트림은 ctx 취소와 무관하게 살아 있으며 Close 로만 끝난다.
+//
 //	s, err := c.Stream(ctx)
 //	defer s.Close()
 //	s.Subscribe(ctx, stream.Trade(tosstypes.MarketCountryKR, "005930"))

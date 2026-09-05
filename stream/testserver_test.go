@@ -24,6 +24,8 @@ type testServer struct {
 	authHdr  []string      // 연결별 Authorization 헤더
 	pushCh   chan string   // 서버 → 클라이언트로 밀어 넣을 프레임
 	closeCh  chan struct{} // 현재 연결을 강제 종료하라는 신호
+	live     int           // 현재 살아 있는 연결 수
+	maxLive  int           // 관측된 최대 동시 연결 수
 }
 
 func newTestServer(t *testing.T) *testServer {
@@ -37,7 +39,16 @@ func newTestServer(t *testing.T) *testServer {
 		ts.mu.Lock()
 		ts.conns++
 		ts.authHdr = append(ts.authHdr, r.Header.Get("Authorization"))
+		ts.live++
+		if ts.live > ts.maxLive {
+			ts.maxLive = ts.live
+		}
 		ts.mu.Unlock()
+		defer func() {
+			ts.mu.Lock()
+			ts.live--
+			ts.mu.Unlock()
+		}()
 
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
@@ -97,6 +108,13 @@ func (ts *testServer) authHeaders() []string {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	return append([]string(nil), ts.authHdr...)
+}
+
+// maxConcurrent 는 지금까지 관측된 최대 동시 연결 수다(재연결 전에 기존 연결을 닫는지 검증용).
+func (ts *testServer) maxConcurrent() int {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	return ts.maxLive
 }
 
 // waitFor 는 조건이 참이 될 때까지 최대 2초 기다린다.
