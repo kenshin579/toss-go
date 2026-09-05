@@ -4,6 +4,7 @@ package toss_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/kenshin579/toss-go/marketdata"
 	"github.com/kenshin579/toss-go/order"
 	"github.com/kenshin579/toss-go/stockinfo"
+	"github.com/kenshin579/toss-go/stream"
 	"github.com/kenshin579/toss-go/tosstypes"
 )
 
@@ -160,6 +162,61 @@ func TestIntegration_AccountReadOnly(t *testing.T) {
 		time.Sleep(300 * time.Millisecond)
 		if _, err := a.ConditionalOrder.Get(ctx, cpage.ConditionalOrders[0].ConditionalOrderID); err != nil {
 			t.Errorf("ConditionalOrder.Get: %v", err)
+		}
+	}
+}
+
+// TestIntegration_Stream 은 실시간 스트림 연결과 구독 ack 까지만 검증한다.
+// 장 시간이 아니면 체결·호가 이벤트가 오지 않으므로 데이터 도착은 요구하지 않는다.
+// 주문 이벤트는 실제 주문을 내야 발생하므로 여기서 검증하지 않는다.
+func TestIntegration_Stream(t *testing.T) {
+	c := newIntegrationClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	s, err := c.Stream(ctx)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.Subscribe(ctx, stream.Trade(tosstypes.MarketCountryKR, "005930")); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	// 존재하지 않는 심볼은 rejected 로 돌아온다 — ack 경로가 살아 있다는 증거로 쓴다.
+	// Subscribe 는 ack 를 기다렸다 반환하므로 거부는 보통 반환값(*RejectedError)으로 오지만,
+	// 선언 코얼레싱·재선언 타이밍에 따라 Errors() 로만 관측될 수도 있다 — 둘 다 성공으로 본다.
+	var re *stream.RejectedError
+	if err := s.Subscribe(ctx, stream.Trade(tosstypes.MarketCountryKR, "999999")); err != nil && !errors.As(err, &re) {
+		t.Fatalf("Subscribe(bad): %v", err)
+	}
+	if re == nil {
+		select {
+		case err := <-s.Errors():
+			if !errors.As(err, &re) {
+				t.Fatalf("에러 = %v", err)
+			}
+		case ev := <-s.Trades():
+			t.Logf("체결 수신: %s %s @ %s", ev.Symbol, ev.Volume, ev.Price)
+		case <-ctx.Done():
+			t.Fatal("ack 도 데이터도 받지 못했다")
+		}
+	}
+	if re == nil {
+		return // 거부 없이 체결만 받은 경우 — 연결·구독 경로는 이미 확인됐다
+	}
+	if re.Target != "trade:kr:999999" || re.Code == "" {
+		t.Errorf("rejected = %+v", re)
+	}
+	t.Logf("구독 거부 확인: %s (%s)", re.Target, re.Code)
+
+	// 거부된 항목은 집합에서 자동으로 빠진다
+	for _, sub := range s.Subscriptions() {
+		for _, code := range sub.Codes {
+			if code == "999999" {
+				t.Error("거부된 항목이 집합에 남아 있다")
+			}
 		}
 	}
 }
